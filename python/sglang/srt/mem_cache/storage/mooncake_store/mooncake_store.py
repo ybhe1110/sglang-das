@@ -603,22 +603,50 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
-        # A logical "page" may map to multiple physical objects in storage.
-        # - INDEXER: one key per page
-        # - MAMBA  : one temporal key + N conv keys per page
-        # key_multiplier records how many component keys are generated per page.
-        name = transfer.name
+        host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+        if host_pool is None:
+            raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
+
+        pool_name = transfer.name
         suffixes = []
-        if name == PoolName.INDEXER:
-            suffixes = [f"_{self.mla_suffix}_{PoolName.INDEXER}"]
-        elif name == PoolName.MAMBA:
-            pools = getattr(self, "registered_pools", {})
-            mamba_pool = pools.get(PoolName.MAMBA)
-            conv_num = len(getattr(mamba_pool, "conv_buffer", None) or [])
-            base_suffix = f"_{self.mha_suffix}"
-            suffixes = [f"{base_suffix}_temporal"] + [
-                f"{base_suffix}_conv_{i}" for i in range(conv_num)
-            ]
+        if pool_name == PoolName.KV:
+            suffixes = [f"_{self.mla_suffix}_k"]
+        elif pool_name == PoolName.MAMBA:
+            # Mamba stores one temporal object plus one object per conv state.
+            # conv-only models have no ssm state; drop the 0-element temporal
+            # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
+            # its temporal pointer under the same condition to stay aligned.
+            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
+            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
+                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+        elif pool_name in (
+            PoolName.INDEXER,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        ):
+            # DSA indexer and DeepSeek V4 side pools are page-packed
+            # single-object pools.
+            suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+        elif pool_name == PoolName.SWA:
+            if not self.is_mla_backend and hasattr(host_pool, "v_buffer"):
+                # Ordinary MHA SWA mirrors a K/V pool.
+                suffixes = [
+                    f"_{self.mha_suffix}_{pool_name}_k",
+                    f"_{self.mha_suffix}_{pool_name}_v",
+                ]
+            elif self.is_mla_backend:
+                suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+
+        if not suffixes:
+            raise ValueError(
+                f"Unsupported Mooncake hybrid pool name: {pool_name}, "
+                f"host_pool={type(host_pool)}"
+            )
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
