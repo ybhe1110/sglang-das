@@ -692,6 +692,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
+            if len(ptr_list) != len(key_strs):
+                ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                    key_strs, ptr_list, element_size_list
+                )
 
             if is_set:
                 exist_result = self._batch_exist(key_strs)

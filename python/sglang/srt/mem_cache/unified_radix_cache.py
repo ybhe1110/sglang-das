@@ -41,6 +41,11 @@ from sglang.srt.mem_cache.unified_cache_components import (
     TreeComponent,
     get_and_increase_time_counter,
 )
+from sglang.srt.mem_cache.unified_cache_connector_mixin import (
+    UnifiedCacheConnectorMixin,
+    UnifiedTreeConnector,
+)
+from sglang.srt.mem_cache.utils import compute_node_hash_values
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
@@ -72,6 +77,7 @@ class UnifiedTreeNode:
         )
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
+        self.connector_offloaded: bool = False
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -198,7 +204,7 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 
 
-class UnifiedRadixCache(BasePrefixCache):
+class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
     def __init__(
         self,
         params: CacheInitParams,
@@ -244,6 +250,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller = None
         self.write_through_threshold = 256
+        self.connector: Optional["UnifiedTreeConnector"] = None
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -279,6 +286,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_storage = False
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
+        self._reset_connector_state()
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -338,6 +346,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
 
+    def release_host_resources(self) -> None:
+        self._close_connector()
+        if getattr(self, "host_pool_group", None) is not None:
+            self.host_pool_group.destroy()
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
@@ -357,13 +370,16 @@ class UnifiedRadixCache(BasePrefixCache):
             best_match_device_node,
             best_match_device_value_len,
         ) = self._match_prefix_helper(key)
-        return self._match_post_processor(
+        result = self._match_post_processor(
             params,
             value,
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
         )
+        if self.connector is not None and params.req is not None:
+            result = self._match_connector(key, params.req, result)
+        return result
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -729,6 +745,8 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
+        new_node.hit_count = child.hit_count
+        new_node.connector_offloaded = child.connector_offloaded
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -768,6 +786,8 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
+        if self.enable_storage or self.connector is not None:
+            new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
@@ -881,7 +901,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 result=result,
             )
         if is_new_leaf:
-            self._inc_hit_count(target_node, params.chunked)
+            while target_node is not node:
+                self._inc_hit_count(target_node, params.chunked)
+                target_node = target_node.parent
         return result
 
     # ---- Evict Helpers ----
@@ -1347,15 +1369,31 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""
-        if self.cache_controller is None:
+        if self.cache_controller is None and self.connector is None:
             return
         if node.evicted or chunked:
             return
-        if self.cache_controller.write_policy == "write_back":
+        if (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        ):
             return
         node.hit_count += 1
-        if not node.backuped and node.hit_count >= self.write_through_threshold:
+        if (
+            self.cache_controller is not None
+            and not node.backuped
+            and node.hit_count >= self.write_through_threshold
+        ):
             self.write_backup(node)
+        elif (
+            self.connector is not None
+            and not node.connector_offloaded
+            and node.hit_count >= self.write_through_threshold
+        ):
+            self._offload_connector_node(node)
+
+    def release_aborted_request(self, rid: str) -> None:
+        self._release_connector_request(rid)
 
     # ---- HiCache: Async Event Management ----
 
@@ -1429,6 +1467,13 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> tuple[torch.Tensor, UnifiedTreeNode]:
         """Prepare KV cache loading from host to device.
         Returns (device_indices, last_node) tuple."""
+        if (
+            self.connector is not None
+            and params.req is not None
+            and params.req.rid in self._connector_markers
+        ):
+            return self._load_connector(params.req)
+
         best_match_node = params.best_match_node
         mem_quota = params.mem_quota
         req = params.req

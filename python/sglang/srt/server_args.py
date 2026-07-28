@@ -727,6 +727,7 @@ class ServerArgs:
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
+    enable_unified_tree_connector: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
@@ -3738,6 +3739,19 @@ class ServerArgs:
         3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
         4) Re-run step (1) if step (3) changed I/O backend.
         """
+        if self.enable_unified_tree_connector:
+            if self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--enable-unified-tree-connector and "
+                    "--enable-hierarchical-cache are mutually exclusive."
+                )
+            if self.hicache_storage_backend is not None:
+                raise ValueError(
+                    "--enable-unified-tree-connector does not use "
+                    "--hicache-storage-backend."
+                )
+            return
+
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             self.enable_hierarchical_cache
