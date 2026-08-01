@@ -250,7 +250,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller = None
         self.write_through_threshold = 256
-        self.connector: Optional["UnifiedTreeConnector"] = None
+        self.connector: Optional[UnifiedTreeConnector] = None
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -260,6 +260,8 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if self.connector is not None:
+            self.connector.reset()
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.key = RadixKey([], None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
@@ -1524,7 +1526,9 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         self.writing_check()
 
     def ready_to_load_host_cache(self) -> int:
-        """Notify the cache controller to start the KV cache loading."""
+        """Start the queued layer-wise load for the next prefill batch."""
+        if self.connector is not None:
+            return self.connector.start_layer_wise_loading()
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
