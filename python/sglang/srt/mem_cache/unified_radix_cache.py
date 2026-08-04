@@ -288,7 +288,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         self.enable_storage = False
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
-        self._reset_connector_state()
+        self.reset_connector_state()
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -349,7 +349,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
-        self._close_connector()
+        self.close_connector()
         if getattr(self, "host_pool_group", None) is not None:
             self.host_pool_group.destroy()
 
@@ -380,7 +380,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             best_match_device_value_len,
         )
         if self.connector is not None and params.req is not None:
-            result = self._match_connector(key, params.req, result)
+            result = self.match_connector(key, params.req, result)
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -1392,10 +1392,10 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             and not node.connector_offloaded
             and node.hit_count >= self.write_through_threshold
         ):
-            self._offload_connector_node(node)
+            self.offload_connector_node(node)
 
     def release_aborted_request(self, rid: str) -> None:
-        self._release_connector_request(rid)
+        self.release_connector_request(rid)
 
     # ---- HiCache: Async Event Management ----
 
@@ -1474,7 +1474,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             and params.req is not None
             and params.req.rid in self._connector_markers
         ):
-            return self._load_connector(params.req)
+            return self.load_connector(params.req)
 
         best_match_node = params.best_match_node
         mem_quota = params.mem_quota
@@ -1518,11 +1518,13 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self.drain_connector_offloads()
         self.writing_check()
         self.loading_check()
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
+        self.drain_connector_offloads()
         self.writing_check()
 
     def ready_to_load_host_cache(self) -> int:
