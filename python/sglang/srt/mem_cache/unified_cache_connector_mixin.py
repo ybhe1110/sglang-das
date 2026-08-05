@@ -166,14 +166,6 @@ class UnifiedCacheConnectorMixin:
             return result
         hit_tokens = hit_pages * page
 
-        swa_transfer = by_pool.get(PoolName.SWA)
-        swa_host_hit_length = (
-            min(len(swa_transfer.keys), hit_pages) * page
-            if swa_transfer is not None
-            else 0
-        )
-        mamba_host_hit_length = int(PoolName.MAMBA in by_pool)
-
         self._connector_markers[req.rid] = ConnectorMarker(
             key=key[: device_hit_len + hit_tokens],
             keys=list(keys[:hit_pages]),
@@ -182,10 +174,6 @@ class UnifiedCacheConnectorMixin:
         return result._replace(
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
-            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
-            mamba_host_hit_length=max(
-                result.mamba_host_hit_length, mamba_host_hit_length
-            ),
         )
 
     def _sync_connector_hit_pages(
@@ -215,9 +203,15 @@ class UnifiedCacheConnectorMixin:
                 # Without the anchor the tail would hash as if it started at the
                 # sequence head, yielding keys that can never match.
                 return []
-        return get_hash_str(
-            key.token_ids[device_hit_len:], last_hash, page_size=self.page_size
-        )
+        tail = key.token_ids[device_hit_len:]
+        hashes = []
+        for start in range(0, len(tail), self.page_size):
+            last_hash = get_hash_str(
+                tail[start : start + self.page_size],
+                last_hash,
+            )
+            hashes.append(last_hash)
+        return hashes
 
     # ---- init_load_back: remote -> device, then insert ----
 
@@ -285,17 +279,13 @@ class UnifiedCacheConnectorMixin:
                     else None
                 ),
                 prev_prefix_len=device_hit_len,
-                swa_evicted_seqlen=(
-                    req.kv.swa_evicted_seqlen if req.kv is not None else 0
-                ),
+                swa_evicted_seqlen=req.swa_evicted_seqlen,
                 chunked=True,
                 priority=getattr(req, "priority", 0) or 0,
             )
         )
         if mamba_transfer is not None and insert_result.mamba_exist:
-            self.req_to_token_pool.mamba_allocator.free(
-                mamba_transfer.device_indices[:1]
-            )
+            self.req_to_token_pool.mamba_pool.free(mamba_transfer.device_indices[:1])
 
         # Rematch
         loaded = self.match_prefix(MatchPrefixParams(key=marker.key))

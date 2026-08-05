@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -550,15 +550,7 @@ class SWAComponent(TreeComponent):
         page = self.cache.page_size
         window = ((self.sliding_window_size + page - 1) // page) * page
         boundary = max(0, prefix_len - window)
-        if req.kv is None:
-            from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-            req.kv = ReqKvInfo(
-                kv_allocated_len=prefix_len,
-                swa_evicted_seqlen=boundary,
-            )
-        else:
-            req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
+        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, boundary)
 
     def commit_hicache_transfer(
         self,

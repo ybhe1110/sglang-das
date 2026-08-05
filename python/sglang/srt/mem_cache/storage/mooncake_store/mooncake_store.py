@@ -8,6 +8,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
@@ -27,6 +28,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.observability.metrics_collector import StorageMetrics
 from sglang.srt.utils import get_bool_env_var
+
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
@@ -295,7 +297,7 @@ class MooncakeBaseStore:
             size_v = tensor[1].numel() * tensor[1].element_size()
             ret_code_k = self.store.register_buffer(ptr_k, size_k)
             ret_code_v = self.store.register_buffer(ptr_v, size_v)
-            ret_code = ret_code_k if ret_code_k != 0 else ret_code_v 
+            ret_code = ret_code_k if ret_code_k != 0 else ret_code_v
         else:
             ptr = tensor.data_ptr()
             size = tensor.numel() * tensor.element_size()
@@ -760,6 +762,34 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ) -> dict:
         return self._batch_io_v2(transfers, is_set=True)
 
+    @staticmethod
+    def _uses_multi_buffer(buffer_ptrs: List[Any]) -> bool:
+        return bool(buffer_ptrs) and isinstance(buffer_ptrs[0], Sequence)
+
+    @staticmethod
+    def _pack_multi_buffer_meta(
+        key_strs: List[str],
+        ptr_list: List[int],
+        element_size_list: List[int],
+    ) -> Tuple[List[Any], List[Any]]:
+        if len(ptr_list) == len(key_strs):
+            return ptr_list, element_size_list
+        if not key_strs or len(ptr_list) != len(element_size_list):
+            raise ValueError("Invalid Mooncake multi-buffer metadata.")
+        if len(ptr_list) % len(key_strs):
+            raise ValueError(
+                "Mooncake buffer count must be divisible by the object-key count."
+            )
+
+        buffers_per_key = len(ptr_list) // len(key_strs)
+        return [
+            ptr_list[index : index + buffers_per_key]
+            for index in range(0, len(ptr_list), buffers_per_key)
+        ], [
+            element_size_list[index : index + buffers_per_key]
+            for index in range(0, len(element_size_list), buffers_per_key)
+        ]
+
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
             self.mem_pool_host.get_split_heads_page_buffer_meta(
@@ -1064,13 +1094,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.store.remove_all()
 
     def _put_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
+        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
+        if self._uses_multi_buffer(buffer_ptrs):
+            return self.store.batch_put_from_multi_buffers(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
         return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
+        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
+        if self._uses_multi_buffer(buffer_ptrs):
+            return self.store.batch_get_into_multi_buffers(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:

@@ -888,6 +888,8 @@ class Scheduler(
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
         )
@@ -908,7 +910,10 @@ class Scheduler(
 
                 logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
-            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+            elif (
+                envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
+                or server_args.enable_unified_tree_connector
+            ):
                 from sglang.srt.mem_cache.unified_cache_components import (
                     ComponentType,
                 )
@@ -928,6 +933,13 @@ class Scheduler(
                     self.tp_worker.register_hicache_layer_transfer_counter(
                         self.tree_cache.cache_controller.layer_done_counter
                     )
+                elif server_args.enable_unified_tree_connector:
+                    self.tree_cache.init_connector(server_args, params)
+                    counter = self.tree_cache.connector.layer_done_counter
+                    self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_counter(
+                        counter
+                    )
+                    self.tp_worker.register_hicache_layer_transfer_counter(counter)
             elif self.enable_hierarchical_cache:
                 if self.is_hybrid_ssm:
                     from sglang.srt.mem_cache.hi_mamba_radix_cache import (

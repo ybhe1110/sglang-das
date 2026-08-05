@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.unified_cache_connector_mixin import (
     UnifiedCacheConnectorMixin,
     UnifiedTreeConnector,
 )
-from sglang.srt.mem_cache.utils import compute_node_hash_values
+from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
@@ -241,6 +241,8 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         self.session = StreamingSession(inner=self)
 
         self.tp_group = params.tp_cache_group
+        self.attn_cp_group = params.attn_cp_cache_group
+        self.attn_tp_group = params.attn_tp_cache_group
         self.tp_world_size = (
             1
             if self.tp_group is None
@@ -254,6 +256,15 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
+
+    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op) -> None:
+        reduced = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(tensor, op=op, group=group)
+                reduced = True
+        if not reduced and self.tp_world_size > 1:
+            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
     def reset(self) -> None:
         self._reset_full()
@@ -749,6 +760,9 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.connector_offloaded = child.connector_offloaded
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 

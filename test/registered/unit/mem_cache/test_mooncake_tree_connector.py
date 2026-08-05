@@ -323,7 +323,7 @@ def test_swa_connector_finish_maps_or_releases_slots():
         token_to_kv_pool_allocator=allocator,
     )
     component.sliding_window_size = 128
-    req = SimpleNamespace(kv=SimpleNamespace(swa_evicted_seqlen=0))
+    req = SimpleNamespace(swa_evicted_seqlen=0)
     full = PoolTransfer(name=PoolName.KV, device_indices=torch.tensor([1, 2, 3, 4]))
     swa = PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([20, 21]))
 
@@ -331,7 +331,7 @@ def test_swa_connector_finish_maps_or_releases_slots():
     mapped_full, mapped_swa = swa_allocator.mapping[0]
     assert mapped_full.tolist() == [3, 4]
     assert mapped_swa.tolist() == [20, 21]
-    assert req.kv.swa_evicted_seqlen == 128
+    assert req.swa_evicted_seqlen == 128
 
     component.finish_connector_load(req, full, swa, prefix_len=256, success=False)
     assert swa_allocator.freed[0].tolist() == [20, 21]
@@ -339,7 +339,7 @@ def test_swa_connector_finish_maps_or_releases_slots():
 
 def test_mamba_connector_load_allocates_cache_and_request_slots():
     allocator = _Allocator(slots=torch.tensor([7, 8]))
-    req_pool = SimpleNamespace(mamba_allocator=allocator, mamba_ckpt_pool=None)
+    req_pool = SimpleNamespace(mamba_pool=allocator)
     component = MambaComponent.__new__(MambaComponent)
     component.cache = SimpleNamespace(
         req_to_token_pool=req_pool,
@@ -353,16 +353,10 @@ def test_mamba_connector_load_allocates_cache_and_request_slots():
     assert transfer.keys == ["b", "b"]
     assert transfer.device_indices.tolist() == [7, 8]
 
-    req = SimpleNamespace(
-        mamba_pool_idx=None,
-        mamba_cow_src_index=torch.tensor([99]),
-        mamba_needs_clear=True,
-    )
+    req = SimpleNamespace(mamba_pool_idx=None)
     full = PoolTransfer(name=PoolName.KV, device_indices=torch.tensor([1]))
     component.finish_connector_load(req, full, transfer, prefix_len=2, success=True)
     assert req.mamba_pool_idx.item() == 8
-    assert req.mamba_cow_src_index is None
-    assert not req.mamba_needs_clear
 
     failed = PoolTransfer(name=PoolName.MAMBA, device_indices=torch.tensor([9, 10]))
     component.finish_connector_load(req, full, failed, prefix_len=2, success=False)

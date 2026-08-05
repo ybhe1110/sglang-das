@@ -6579,6 +6579,14 @@ class ServerArgs:
             help="Enable hierarchical cache",
         )
         parser.add_argument(
+            "--enable-unified-tree-connector",
+            action="store_true",
+            help=(
+                "Enable direct external storage through UnifiedRadixCache "
+                "without a host cache tier."
+            ),
+        )
+        parser.add_argument(
             "--hicache-ratio",
             type=float,
             default=ServerArgs.hicache_ratio,

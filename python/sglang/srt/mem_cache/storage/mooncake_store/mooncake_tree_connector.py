@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 from concurrent.futures import Future
 from dataclasses import replace
@@ -16,15 +18,46 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    HybridCacheController,
-)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache_connector_mixin import UnifiedTreeConnector
 
 logger = logging.getLogger(__name__)
+
+
+def _load_storage_extra_config(value: str | None) -> dict:
+    if not value:
+        return {}
+    if value.startswith("@"):
+        path = value[1:]
+        extension = os.path.splitext(path)[1].lower()
+        with open(path, "rb" if extension == ".toml" else "r") as file:
+            if extension == ".json":
+                config = json.load(file)
+            elif extension == ".toml":
+                import tomllib
+
+                config = tomllib.load(file)
+            elif extension in (".yaml", ".yml"):
+                import yaml
+
+                config = yaml.safe_load(file)
+            else:
+                raise ValueError(f"Unsupported storage config format: {extension}")
+    else:
+        config = json.loads(value)
+
+    config = dict(config or {})
+    for key in (
+        "prefetch_threshold",
+        "prefetch_timeout_base",
+        "prefetch_timeout_per_ki_token",
+        "prefetch_timeout_max",
+        "hicache_storage_pass_prefix_keys",
+    ):
+        config.pop(key, None)
+    return config
 
 
 class LayerWiseLoadCounter:
@@ -91,7 +124,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         tp_rank = 0
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
-        extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
+        extra_config = _load_storage_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
         storage_config = HiCacheStorageConfig(
@@ -148,6 +181,8 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
 
     def _validate_range_api(self) -> None:
         required = (
+            "batch_put_from_multi_buffers",
+            "batch_get_into_multi_buffers",
             "batch_get_session_start",
             "batch_get_into_multi_buffer_ranges",
             "batch_get_session_end",

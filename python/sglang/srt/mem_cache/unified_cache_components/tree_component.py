@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 from abc import ABC, abstractmethod
 from enum import Enum, IntFlag
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import torch
 from numpy import float64

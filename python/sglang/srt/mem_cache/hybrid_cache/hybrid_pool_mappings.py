@@ -223,8 +223,8 @@ def resolve_hybrid_device_pool_group(
         HiSparseC4DevicePool,
     )
     from sglang.srt.mem_cache.memory_pool import (
-        DSATokenToKVPool,
         HybridLinearKVPool,
+        NSATokenToKVPool,
     )
 
     if isinstance(kvcache, DeepSeekV4TokenToKVPool):
@@ -335,21 +335,29 @@ def resolve_hybrid_device_pool_group(
             page_size=1,
             rows_are_pages=True,
             packed=False,
-            index_mapper=req_to_token_pool.translate_mamba_indices,
+            index_mapper=None,
         )
         mamba.temporal_state_elem_size = temporal_size
         mamba.conv_buffer = list(state.conv)
         return DevicePoolGroup([kv, mamba], mappings.num_layers, page_size)
 
-    if not isinstance(kvcache, DSATokenToKVPool):
+    if not isinstance(kvcache, NSATokenToKVPool):
         raise TypeError(
-            "Direct Mooncake supports DSA, DeepSeek V4, and hybrid linear KV pools."
+            "Direct Mooncake supports NSA, DeepSeek V4, and hybrid linear KV pools."
         )
     if kvcache.page_size != page_size:
         raise ValueError(
             "DSA KV page size must match the tree page size: "
             f"{kvcache.page_size} != {page_size}."
         )
+
+    index_buffers = (
+        kvcache.index_k_with_scale_buffer
+        if kvcache.index_k_with_scale_buffer is not None
+        else kvcache.index_k_buffer
+    )
+    if index_buffers is None:
+        raise ValueError("NSA connector requires an indexer cache buffer.")
 
     num_layers = len(kvcache.kv_buffer)
     identity = {layer: layer for layer in range(num_layers)}
@@ -367,7 +375,7 @@ def resolve_hybrid_device_pool_group(
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.index_k_with_scale_buffer],
+            components=[index_buffers],
             layer_mapping=identity,
             page_size=page_size,
             rows_are_pages=True,

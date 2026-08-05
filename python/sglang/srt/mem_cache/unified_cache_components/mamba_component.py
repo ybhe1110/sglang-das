@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -368,6 +368,17 @@ class MambaComponent(TreeComponent):
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
 
+    def _alloc_mamba_slot(self) -> torch.Tensor:
+        slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+        if slot is None:
+            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+            assert slot is not None, "Can not alloc mamba cache"
+        return slot
+
+    def _free_mamba_value(self, value: torch.Tensor) -> None:
+        self.cache.req_to_token_pool.mamba_pool.free(value)
+
     def finish_connector_load(
         self,
         req: Req,
@@ -382,12 +393,8 @@ class MambaComponent(TreeComponent):
             return
 
         if req.mamba_pool_idx is not None:
-            self.cache.req_to_token_pool.mamba_allocator.free(
-                req.mamba_pool_idx.view(-1)
-            )
+            self.cache.req_to_token_pool.mamba_pool.free(req.mamba_pool_idx.view(-1))
         req.mamba_pool_idx = transfer.device_indices[1]
-        req.mamba_cow_src_index = None
-        req.mamba_needs_clear = False
 
     # ---- HiCache Hooks ----
 

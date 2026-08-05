@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import heapq
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_radix_cache import (
         UnifiedTreeNode,
     )
