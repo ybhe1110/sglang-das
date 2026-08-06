@@ -13,7 +13,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     DevicePoolEntry,
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import (
+    LayerWiseLoadCounter,
     MooncakeTreeConnector,
 )
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
@@ -26,6 +28,10 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
 )
 from sglang.srt.mem_cache.unified_cache_connector_mixin import (
     UnifiedCacheConnectorMixin,
+)
+from sglang.srt.mem_cache.unified_radix_cache import (
+    UnifiedRadixCache,
+    UnifiedTreeNode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -53,6 +59,102 @@ class _Allocator:
 
     def set_full_to_swa_mapping(self, full, swa):
         self.mapping.append((full.clone(), swa.clone()))
+
+
+def test_connector_tail_hashes_follow_radix_key_semantics():
+    mixin = UnifiedCacheConnectorMixin()
+    mixin.page_size = 2
+    no_device_hit = SimpleNamespace(last_device_node=None)
+
+    regular = RadixKey([1, 2, 3, 4])
+    regular_hashes = mixin._connector_tail_keys(regular, no_device_hit, 0)
+    first_regular = regular.hash_page(0, 2)
+    assert regular_hashes == [
+        first_regular,
+        regular.hash_page(2, 4, first_regular),
+    ]
+
+    # A bigram page hashes overlapping pairs, not a plain raw-token slice.
+    bigram = RadixKey([1, 2, 3, 4, 5], is_bigram=True)
+    first_bigram = bigram.hash_page(0, 2)
+    anchored = SimpleNamespace(
+        last_device_node=SimpleNamespace(
+            get_last_hash_value=lambda: first_bigram,
+        )
+    )
+    assert mixin._connector_tail_keys(bigram, anchored, 2) == [
+        bigram.hash_page(2, 4, first_bigram)
+    ]
+
+    salted_a = RadixKey([1, 2], extra_key="adapter-a")
+    salted_b = RadixKey([1, 2], extra_key="adapter-b")
+    assert mixin._connector_tail_keys(salted_a, no_device_hit, 0) != (
+        mixin._connector_tail_keys(salted_b, no_device_hit, 0)
+    )
+
+
+def test_unified_tree_node_exposes_hash_chain():
+    components = (ComponentType.FULL,)
+    root = UnifiedTreeNode(components)
+    root.hash_value = []
+    parent = UnifiedTreeNode(components)
+    parent.parent = root
+    parent.hash_value = ["a", "b"]
+    child = UnifiedTreeNode(components)
+    child.parent = parent
+    child.hash_value = ["c"]
+
+    assert root.get_last_hash_value() is None
+    assert child.get_last_hash_value() == "c"
+    assert child.get_prefix_hash_values(parent) == ["a", "b"]
+
+
+def test_connector_reduction_includes_pipeline_group(monkeypatch):
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.attn_cp_group = object()
+    cache.attn_tp_group = object()
+    cache.pp_group = object()
+    cache.tp_group = object()
+    cache.tp_world_size = 2
+    calls = []
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_world_size",
+        lambda group: 2,
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op, group: calls.append(group),
+    )
+
+    cache._all_reduce_attn_groups(
+        torch.tensor([1]), torch.distributed.ReduceOp.MIN
+    )
+    assert calls == [cache.attn_cp_group, cache.attn_tp_group, cache.pp_group]
+
+
+def test_connector_reduction_keeps_tp_fallback_with_pipeline_group(monkeypatch):
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.attn_cp_group = None
+    cache.attn_tp_group = None
+    cache.pp_group = object()
+    cache.tp_group = object()
+    cache.tp_world_size = 2
+    calls = []
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op, group: calls.append(group),
+    )
+
+    cache._all_reduce_attn_groups(
+        torch.tensor([1]), torch.distributed.ReduceOp.MIN
+    )
+    assert calls == [cache.tp_group, cache.pp_group]
 
 
 def test_sparse_multi_component_layer_ranges():
@@ -115,6 +217,54 @@ def test_lookup_returns_sparse_mamba_boundaries():
         ],
     )
     assert valid == [2, 4]
+
+
+def test_layerwise_load_reports_session_end_failure():
+    class _Store:
+        def batch_get_session_start(self, keys):
+            return [0] * len(keys)
+
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            return [sum(item) for item in sizes]
+
+        def batch_get_session_end(self, keys):
+            return [1] * len(keys)
+
+    pool = SimpleNamespace(
+        prepare_locations=lambda indices: [0],
+        get_prepared_layer_range_meta=lambda locations, layer: (
+            [[1]],
+            [[4]],
+            [[0]],
+        ),
+    )
+    connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
+    connector.num_layers = 1
+    connector.pools = {PoolName.KV: pool}
+    connector.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+    )
+    connector.layer_done_counter = LayerWiseLoadCounter(1)
+    counter_index = connector.layer_done_counter.update_producer()
+
+    connector._run_layer_wise_batch(
+        counter_index,
+        [
+            [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    keys=["page"],
+                    host_indices=torch.tensor([0]),
+                )
+            ]
+        ],
+    )
+
+    future = connector.layer_done_counter.futures[counter_index][0]
+    assert future.done()
+    assert isinstance(future.exception(), RuntimeError)
 
 
 def test_offload_runs_on_background_thread():
@@ -208,6 +358,20 @@ def test_async_offload_pins_node_until_completion():
     mixin.drain_connector_offloads()
     assert not node.connector_offloaded
     assert unlocks == [(node, lock_params)]
+
+
+def test_release_connector_request_cancels_queued_load():
+    cancelled = []
+    mixin = UnifiedCacheConnectorMixin()
+    mixin.connector = SimpleNamespace(
+        cancel_queued_load=lambda rid: cancelled.append(rid)
+    )
+    mixin._connector_markers = {"rid": object()}
+
+    mixin.release_connector_request("rid")
+
+    assert "rid" not in mixin._connector_markers
+    assert cancelled == ["rid"]
 
 
 def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
