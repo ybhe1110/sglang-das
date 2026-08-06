@@ -347,7 +347,7 @@ def resolve_hybrid_device_pool_group(
         )
     if kvcache.page_size != page_size:
         raise ValueError(
-            "DSA KV page size must match the tree page size: "
+            "NSA KV page size must match the tree page size: "
             f"{kvcache.page_size} != {page_size}."
         )
 

@@ -4597,6 +4597,18 @@ class ServerArgs:
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if self.enable_unified_tree_connector and self.disable_radix_cache:
+            raise ValueError(
+                "--enable-unified-tree-connector requires radix cache; "
+                "it cannot be combined with --disable-radix-cache."
+            )
+
+        if self.enable_unified_tree_connector and self.enable_lmcache:
+            raise ValueError(
+                "--enable-unified-tree-connector and --enable-lmcache are "
+                "mutually exclusive."
+            )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "

@@ -868,6 +868,12 @@ class Scheduler(
         if self.model_config.is_multimodal and uses_transformers_backend:
             effective_chunked_prefill_size = None
 
+        if server_args.enable_unified_tree_connector and self.disable_radix_cache:
+            raise ValueError(
+                "Unified tree connector requires radix cache, but radix cache "
+                "was disabled by the resolved runtime configuration."
+            )
+
         params = CacheInitParams(
             disable=self.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
@@ -904,7 +910,10 @@ class Scheduler(
 
                 self.tree_cache = SWAChunkCache(params)
         else:
-            if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
+            if (
+                envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get()
+                and not server_args.enable_unified_tree_connector
+            ):
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 

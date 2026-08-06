@@ -19,6 +19,7 @@ intersection, IO outcome agreement) is decided on the tree side, here.
 
 from __future__ import annotations
 
+import hashlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -36,7 +37,6 @@ from sglang.srt.mem_cache.unified_cache_components import (
     ConnectorTransferPhase,
     TreeComponent,
 )
-from sglang.srt.mem_cache.utils import get_hash_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -154,7 +154,6 @@ class UnifiedCacheConnectorMixin:
             if transfer is None:
                 return result
             transfers.append(transfer)
-        by_pool = {transfer.name: transfer for transfer in transfers}
 
         # Tail-relative: page 0 of `keys` is the first uncached page.
         hit_pages = self._sync_connector_hit_pages(
@@ -203,14 +202,25 @@ class UnifiedCacheConnectorMixin:
                 # Without the anchor the tail would hash as if it started at the
                 # sequence head, yielding keys that can never match.
                 return []
-        tail = key.token_ids[device_hit_len:]
+        return self._connector_page_hashes(key, device_hit_len, last_hash)
+
+    def _connector_page_hashes(
+        self, key: RadixKey, start: int, prior_hash: Optional[str]
+    ) -> list[str]:
+        if prior_hash is None and key.extra_key is not None:
+            namespace = hashlib.sha256()
+            namespace.update(b"sglang-tree-connector-extra-key-v1\0")
+            namespace.update(key.extra_key.encode("utf-8"))
+            prior_hash = namespace.hexdigest()
+
         hashes = []
-        for start in range(0, len(tail), self.page_size):
-            last_hash = get_hash_str(
-                tail[start : start + self.page_size],
-                last_hash,
+        for page_start in range(start, len(key), self.page_size):
+            prior_hash = key.hash_page(
+                page_start,
+                min(page_start + self.page_size, len(key)),
+                prior_hash,
             )
-            hashes.append(last_hash)
+            hashes.append(prior_hash)
         return hashes
 
     # ---- init_load_back: remote -> device, then insert ----
@@ -244,6 +254,8 @@ class UnifiedCacheConnectorMixin:
                     component.finish_connector_load(
                         req, full, transfer, prefix_len, False
                     )
+            req.host_hit_length = 0
+            req.storage_hit_length = 0
             return empty, req.last_node
 
         full = component_transfers[0][1]
@@ -257,6 +269,8 @@ class UnifiedCacheConnectorMixin:
         for component, transfer in component_transfers:
             component.finish_connector_load(req, full, transfer, prefix_len, success)
         if not success:
+            req.host_hit_length = 0
+            req.storage_hit_length = 0
             return empty, req.last_node
 
         # Insert the newly loaded tail into the tree.
@@ -299,6 +313,9 @@ class UnifiedCacheConnectorMixin:
         while node is not req.last_node:
             node.connector_offloaded = True
             node = node.parent
+        req.storage_hit_length = max(
+            getattr(req, "storage_hit_length", 0), num_tokens
+        )
         return canonical_full_indices, loaded.last_device_node
 
     def _retarget_connector_load(
@@ -390,6 +407,7 @@ class UnifiedCacheConnectorMixin:
     def release_connector_request(self, rid: str) -> None:
         if self.connector is not None:
             self._connector_markers.pop(rid, None)
+            self.connector.cancel_queued_load(rid)
 
     def close_connector(self) -> None:
         if self.connector is not None:

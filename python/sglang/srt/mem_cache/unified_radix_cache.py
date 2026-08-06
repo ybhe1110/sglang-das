@@ -98,6 +98,16 @@ class UnifiedTreeNode:
     def __lt__(self, other: UnifiedTreeNode):
         return self.last_access_time < other.last_access_time
 
+    def get_last_hash_value(self) -> Optional[str]:
+        if not self.hash_value:
+            return None
+        return self.hash_value[-1]
+
+    def get_prefix_hash_values(self, node: Optional[UnifiedTreeNode]) -> list[str]:
+        if node is None or node.hash_value is None:
+            return []
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
+
 
 class UnifiedLRUList:
     def __init__(
@@ -213,7 +223,6 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
         self.disable = params.disable
-        self.is_eagle = params.is_eagle
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -225,6 +234,9 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        self.is_eagle = (
+            params.is_eagle and ComponentType.MAMBA not in self.tree_components
+        )
         self.components: dict[ComponentType, TreeComponent] = {
             ct: COMPONENT_REGISTRY[ct](self, params) for ct in self.tree_components
         }
@@ -243,6 +255,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
         self.attn_tp_group = params.attn_tp_cache_group
+        self.pp_group = params.pp_cache_group
         self.tp_world_size = (
             1
             if self.tp_group is None
@@ -265,6 +278,11 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
                 reduced = True
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+        if (
+            self.pp_group is not None
+            and torch.distributed.get_world_size(group=self.pp_group) > 1
+        ):
+            torch.distributed.all_reduce(tensor, op=op, group=self.pp_group)
 
     def reset(self) -> None:
         self._reset_full()
@@ -802,7 +820,13 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
-        if self.enable_storage or self.connector is not None:
+        if self.connector is not None:
+            new_node.hash_value = self._connector_page_hashes(
+                new_node.key,
+                0,
+                parent.get_last_hash_value(),
+            )
+        elif self.enable_storage:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
         self._update_evictable_leaf_sets(new_node)

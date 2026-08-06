@@ -36,7 +36,10 @@ def _load_storage_extra_config(value: str | None) -> dict:
             if extension == ".json":
                 config = json.load(file)
             elif extension == ".toml":
-                import tomllib
+                try:
+                    import tomllib
+                except ModuleNotFoundError:
+                    import tomli as tomllib
 
                 config = tomllib.load(file)
             elif extension in (".yaml", ".yml"):
@@ -384,6 +387,8 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
         started: list[tuple[PoolName, list[str]]] = []
+        load_succeeded = False
+        cleanup_succeeded = True
         try:
             plans = self._build_range_plans(request_transfers)
             if not plans:
@@ -432,7 +437,9 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                     raise ValueError(
                         f"Layer-wise Mooncake load has no pool for layer {layer}."
                     )
-                self.layer_done_counter.complete(counter_index, layer)
+                if layer + 1 < self.num_layers:
+                    self.layer_done_counter.complete(counter_index, layer)
+            load_succeeded = True
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
@@ -445,8 +452,11 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                             f"Mooncake session end failed for pool {name}: {result}"
                         )
                 except BaseException as error:
+                    cleanup_succeeded = False
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+            if load_succeeded and cleanup_succeeded:
+                self.layer_done_counter.complete(counter_index, self.num_layers - 1)
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self._expand(transfers, allow_partial=True)
