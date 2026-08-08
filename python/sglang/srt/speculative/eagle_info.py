@@ -15,6 +15,7 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import List, Optional, Tuple
 
 import torch
@@ -35,7 +36,10 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    ScheduleBatch,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -494,13 +498,39 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     req.update_reasoning_tokens(id, think_end_id)
                 req.check_finished()
                 if not req.finished() and req.grammar is not None:
+                    # Stop accepting once the grammar terminates: the
+                    # over-drafted suffix is dropped (never committed to KV nor
+                    # emitted). Mirrors _accept_grammar_tokens on the spec-v2
+                    # path (#28682) so spec-v1 behaves the same way.
                     try:
                         req.grammar.accept_token(id)
                     except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                        # The normal (non-overlap) loop is fully serial, so the
+                        # verify mask cannot lag the FSM here -- a reject means
+                        # a real grammar/model divergence. Do not drop the token
+                        # and continue (the KV context keeps it while the output
+                        # stream skips it, producing torn JSON); un-emit it and
+                        # abort via FINISH_ABORT (raising here would kill the
+                        # whole scheduler, #21171).
+                        if req.output_ids and req.output_ids[-1] == id:
+                            req.output_ids.pop()
+                        # Un-count the rejected token: its accept_index slot is
+                        # cleared below so its KV slot gets evicted with the
+                        # other non-accepted draft tokens.
+                        num_accept_tokens -= 1
+                        logger.error(
+                            f"Grammar accept_token failed for req {req.rid} with "
+                            f"token {id}: {e}"
                         )
-                        raise e
+                        req.to_finish = FINISH_ABORT(
+                            f"Grammar accept_token failed for req {req.rid} with token {id}: {e}",
+                            HTTPStatus.BAD_REQUEST,
+                            "BadRequestError",
+                        )
+                        req.check_finished()
+                        has_finished = True
+                        accept_index[i, j:] = -1
+                        break
                     req.check_finished()
                 if req.finished():
                     has_finished = True
