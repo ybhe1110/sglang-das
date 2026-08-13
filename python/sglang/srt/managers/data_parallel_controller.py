@@ -38,6 +38,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
+from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -154,9 +155,19 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
+        self.refresh_load_budget_on_dispatch = self.load_balance_method in (
+            LoadBalanceMethod.TOTAL_REQUESTS,
+            LoadBalanceMethod.TOTAL_TOKENS,
+        )
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            server_args,
+            port_args,
+            caller="DataParallelController",
+        )
+        self._last_refresh_time = 0.0
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -208,10 +219,32 @@ class DataParallelController:
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
 
+    def drain_load_snapshots(self):
+        """Drain zmq load snapshots into SHM when this controller owns the PULL socket.
+
+        Multi-node DP attention names the DataParallelController as the
+        zmq->SHM owner for load-aware balancing methods; the tokenizer-side
+        load reporter reads SHM on node 0, so the controller must keep it
+        fresh. The 20 ms throttle mirrors upstream refresh_load_budget() and
+        lets a dispatch burst complete on speculative counters between
+        drains. DPBudget keeps its existing WatchLoadUpdateReq feed, so this
+        method intentionally does not touch the budget.
+
+        Returns:
+            None.
+        """
+        now = time.perf_counter()
+        if now - self._last_refresh_time < 0.02:
+            return
+        self._last_refresh_time = now
+        self.load_snapshot_reader.read_all()
+
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status
 
     def dispatching_with_trace(self, req: Req):
+        if self.refresh_load_budget_on_dispatch:
+            self.drain_load_snapshots()
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
         req.time_stats.set_dp_dispatch_time()
@@ -251,6 +284,7 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.instance_id = port_args.instance_id
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -501,6 +535,7 @@ class DataParallelController:
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
+                    rank_port_args.instance_id = port_args.instance_id
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (

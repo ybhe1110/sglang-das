@@ -88,6 +88,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_writer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -583,6 +584,101 @@ class Scheduler(
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
+
+        # Load snapshot SHM writer: only the rank-0 scheduler of each DP rank
+        # publishes its slot. This fork predates SchedulerLoadInquirer, so the
+        # producer-side snapshot assembly lives in _build_load_snapshot() while
+        # the SHM transport (load_snapshot.py) stays upstream-identical.
+        self.load_snapshot_writer = None
+        if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            dp_rank = self.dp_rank if self.dp_rank is not None else 0
+            try:
+                self.load_snapshot_writer = create_load_snapshot_writer(
+                    self.server_args,
+                    port_args,
+                    self.dp_size,
+                    dp_rank,
+                    publish_interval=self.server_args.load_snapshot_publish_interval,
+                )
+            except Exception as e:
+                logger.warning("load snapshot writer init failed: %s", e)
+
+    def publish_load_snapshot(self, force: bool = False):
+        """Publish this scheduler's load snapshot to SHM for the load reporter.
+
+        Args:
+            force: Publish immediately, bypassing the publish-interval counter.
+                Prefill and idle transitions always publish immediately.
+
+        Returns:
+            None.
+        """
+        writer = self.load_snapshot_writer
+        if writer is None:
+            return
+        if not force:
+            writer.publish_counter += 1
+            if writer.publish_counter < writer.publish_interval:
+                return
+        writer.publish_counter = 0
+        try:
+            writer.write(self._build_load_snapshot())
+        except Exception as e:
+            logger.warning("load snapshot publish failed: %s", e)
+
+    def _build_load_snapshot(self) -> LoadSnapshot:
+        """Assemble the LoadSnapshot wire payload from this scheduler's state.
+
+        The upstream producer (SchedulerLoadInquirer) postdates this fork's
+        v0.5.12 base, so this method re-computes the same core metrics from
+        the fork's existing scheduler fields. Optional sections are omitted
+        because the load reporter only consumes validated core metrics.
+
+        Returns:
+            LoadSnapshot for this scheduler's DP rank, ready for SHM encoding.
+        """
+        waiting_queues = [self.waiting_queue]
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
+            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
+            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
+
+        num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
+        num_used_tokens, kv_token_usage = self.get_pool_stats().get_kv_token_stats()
+        num_total_tokens = num_used_tokens + sum(
+            req.seqlen for queue in waiting_queues for req in queue
+        )
+
+        # Uncached tokens still waiting for prefill compute.
+        num_waiting_uncached_tokens = 0
+        if self.disaggregation_mode != DisaggregationMode.DECODE:
+            num_waiting_uncached_tokens = sum(
+                max(0, req.seqlen - len(req.prefix_indices))
+                for req in self.waiting_queue
+            )
+            if self.chunked_req is not None:
+                chunked_req = self.chunked_req
+                num_waiting_uncached_tokens += max(
+                    0, chunked_req.seqlen - len(chunked_req.prefix_indices)
+                )
+
+        return LoadSnapshot(
+            timestamp=time.time(),
+            dp_rank=self.dp_rank if self.dp_rank is not None else 0,
+            num_running_reqs=len(self.running_batch.reqs),
+            num_waiting_reqs=num_waiting_reqs,
+            num_waiting_uncached_tokens=num_waiting_uncached_tokens,
+            num_used_tokens=num_used_tokens,
+            num_total_tokens=num_total_tokens,
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_running_requests=self.max_running_requests,
+            token_usage=round(kv_token_usage, 4),
+            gen_throughput=round(self.stats.gen_throughput, 2),
+            cache_hit_rate=round(self.stats.cache_hit_rate, 4),
+            utilization=round(self.stats.utilization, 4),
+        )
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -3357,6 +3453,7 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self.publish_load_snapshot(force=batch.forward_mode.is_extend())
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():

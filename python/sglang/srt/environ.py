@@ -195,6 +195,9 @@ class Envs:
     SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
+    # Load snapshot backend
+    SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
+
     # Constrained Decoding (Grammar)
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)

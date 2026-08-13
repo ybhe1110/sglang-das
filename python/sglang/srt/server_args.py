@@ -29,6 +29,7 @@ import logging
 import os
 import random
 import tempfile
+import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
@@ -558,6 +559,8 @@ class ServerArgs:
     generation_tokens_buckets: Optional[List[str]] = None
     gc_warning_threshold_secs: float = 0.0
     decode_log_interval: int = 40
+    load_snapshot_publish_interval: int = 15
+    load_reporter_port: Optional[int] = None
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
     enable_forward_pass_metrics: bool = False
@@ -932,6 +935,7 @@ class ServerArgs:
 
         self._maybe_download_model_for_runai()
 
+        self._handle_load_reporter_config()
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
 
@@ -1107,6 +1111,16 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _handle_load_reporter_config(self):
+        """Validate the reporter port range; transport and staleness knobs live in the reporter, not ServerArgs."""
+        if self.load_reporter_port is not None and not (
+            1 <= self.load_reporter_port <= 65535
+        ):
+            raise ValueError(
+                f"--load-reporter-port must be between 1 and 65535 "
+                f"(got {self.load_reporter_port})."
+            )
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
@@ -5677,6 +5691,18 @@ class ServerArgs:
             help="The log and metrics reporting interval (in decode iterations) for decode batches.",
         )
         parser.add_argument(
+            "--load-snapshot-publish-interval",
+            type=int,
+            default=ServerArgs.load_snapshot_publish_interval,
+            help="Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",
+        )
+        parser.add_argument(
+            "--load-reporter-port",
+            type=int,
+            default=ServerArgs.load_reporter_port,
+            help="Port on which this worker listens for load reporter gRPC connections. None (default) disables load reporting.",
+        )
+        parser.add_argument(
             "--enable-request-time-stats-logging",
             action="store_true",
             default=ServerArgs.enable_request_time_stats_logging,
@@ -8145,6 +8171,14 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # zmq address for load snapshot PUSH/PULL (dp-attention TCP mode only;
+    # empty when IPC mode derives the address from instance_id).
+    load_collector_ipc_name: str = ""
+
+    # Stable token shared by all processes in one server instance, used to
+    # derive the /dev/shm path for load snapshots.
+    instance_id: str = ""
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -8163,6 +8197,8 @@ class PortArgs:
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
+        instance_id = uuid.uuid4().hex[:12]
+
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -8173,6 +8209,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                instance_id=instance_id,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -8194,6 +8231,10 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
+            # DataParallelController binds the zmq PULL socket that collects
+            # load snapshots from remote nodes.
+            load_collector_port = port_base + 5
+
             try:
                 if dp_rank is None:
                     wait_port_available(dist_init_port, "dist_init_port")
@@ -8202,6 +8243,7 @@ class PortArgs:
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
+                    wait_port_available(load_collector_port, "load_collector_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -8224,6 +8266,10 @@ class PortArgs:
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                load_collector_ipc_name=NetworkAddress(
+                    dist_init_host, load_collector_port
+                ).to_tcp(),
+                instance_id=instance_id,
             )
 
 

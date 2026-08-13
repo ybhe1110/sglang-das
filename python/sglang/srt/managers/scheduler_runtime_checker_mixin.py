@@ -576,6 +576,9 @@ class SchedulerRuntimeCheckerMixin:
         # reset device timer window so idle time isn't counted
         self.reset_device_timer_window()
 
+        # Publish the idle state so the load reporter does not see stale load.
+        self.publish_load_snapshot(force=True)
+
         # sleep until next event
         self.maybe_sleep_on_idle()
 
