@@ -1110,7 +1110,7 @@ class Req(ReqDllmMixin):
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
-    def tail_str(self) -> str:
+    def tail_str(self, end_len: Optional[int] = None) -> str:
         # Check stop strings and stop regex patterns together
         if (
             len(self.sampling_params.stop_strs) == 0
@@ -1123,8 +1123,12 @@ class Req(ReqDllmMixin):
             self.sampling_params.stop_regex_max_len + 1,
         )
 
-        tail_len = min(max_len_tail_str, len(self.output_ids))
-        return self.tokenizer.decode(self.output_ids[-tail_len:])
+        # `end_len` bounds the window on the right so a caller can ask what the
+        # tail looked like at an earlier token boundary of the same step.
+        if end_len is None:
+            end_len = len(self.output_ids)
+        tail_len = min(max_len_tail_str, end_len)
+        return self.tokenizer.decode(self.output_ids[end_len - tail_len : end_len])
 
     def check_match_stop_str_prefix(self) -> bool:
         """
@@ -1179,28 +1183,45 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_str_based_finish(self):
+    def _check_str_based_finish(self, new_accepted_len: int = 1):
         if (
-            len(self.sampling_params.stop_strs) > 0
-            or len(self.sampling_params.stop_regex_strs) > 0
+            len(self.sampling_params.stop_strs) == 0
+            and len(self.sampling_params.stop_regex_strs) == 0
         ):
-            tail_str = self.tail_str()
+            return False
+
+        # A step can accept several tokens (speculative decoding), and the stop
+        # match may complete on any of them. Walk the newly accepted tokens in
+        # order instead of only looking at the end of the step: a single
+        # tail_str() over the whole step misses a match that already scrolled
+        # out of the tail window, and cannot say which token to stop at, so the
+        # over-drafted suffix after the stop string keeps streaming out.
+        first_new = max(len(self.output_ids) - new_accepted_len, 0) + 1
+        for end_len in range(first_new, len(self.output_ids) + 1):
+            tail_str = self.tail_str(end_len)
 
             # Check stop strings
-            if len(self.sampling_params.stop_strs) > 0:
-                for stop_str in self.sampling_params.stop_strs:
-                    if stop_str in tail_str or stop_str in self.decoded_text:
-                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        return True
+            for stop_str in self.sampling_params.stop_strs:
+                if stop_str in tail_str:
+                    self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                    self.finished_len = end_len
+                    return True
 
             # Check stop regex
-            if len(self.sampling_params.stop_regex_strs) > 0:
-                for stop_regex_str in self.sampling_params.stop_regex_strs:
-                    if re.search(stop_regex_str, tail_str):
-                        self.finished_reason = FINISHED_MATCHED_REGEX(
-                            matched=stop_regex_str
-                        )
-                        return True
+            for stop_regex_str in self.sampling_params.stop_regex_strs:
+                if re.search(stop_regex_str, tail_str):
+                    self.finished_reason = FINISHED_MATCHED_REGEX(
+                        matched=stop_regex_str
+                    )
+                    self.finished_len = end_len
+                    return True
+
+        # decoded_text holds the incrementally detokenized prefix, so a match
+        # there cannot be pinned to a token boundary; leave finished_len unset.
+        for stop_str in self.sampling_params.stop_strs:
+            if stop_str in self.decoded_text:
+                self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                return True
 
         return False
 
@@ -1236,20 +1257,47 @@ class Req(ReqDllmMixin):
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
-        if self.grammar is not None:
-            if self.grammar.is_terminated():
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-                return
-
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
-        if self._check_token_based_finish(new_accepted_tokens):
-            return
-
+        # Sanitize out-of-range / NaN token ids before any decode.
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
-        if self._check_str_based_finish():
+        # A step can accept several tokens at once (speculative decoding), so a
+        # stop string and an EOS / stop token can both match inside the same
+        # step. Each check only trims back to its own boundary, so running them
+        # in a fixed order leaks whatever follows the earlier boundary: with the
+        # token check first, the text after the stop string is still emitted
+        # (#28802). Evaluate both and keep whichever boundary comes first.
+        orig_reason, orig_len = self.finished_reason, self.finished_len
+
+        str_finished = self._check_str_based_finish(new_accepted_len)
+        str_reason, str_len = self.finished_reason, self.finished_len
+
+        self.finished_reason, self.finished_len = orig_reason, orig_len
+        token_finished = self._check_token_based_finish(new_accepted_tokens)
+        token_reason, token_len = self.finished_reason, self.finished_len
+
+        # Neither matched: leave the request exactly as it came in.
+        self.finished_reason, self.finished_len = orig_reason, orig_len
+
+        if str_finished and token_finished:
+            # A None finished_len means "no token boundary" (matched via
+            # decoded_text), so prefer the side that pinned one.
+            if str_len is None or (token_len is not None and token_len < str_len):
+                self.finished_reason, self.finished_len = token_reason, token_len
+            else:
+                self.finished_reason, self.finished_len = str_reason, str_len
+            return
+        if str_finished:
+            self.finished_reason, self.finished_len = str_reason, str_len
+            return
+        if token_finished:
+            self.finished_reason, self.finished_len = token_reason, token_len
+            return
+
+        if self.grammar is not None and self.grammar.is_terminated():
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
     def reset_for_retract(self):

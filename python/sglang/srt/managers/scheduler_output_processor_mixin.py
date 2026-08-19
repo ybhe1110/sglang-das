@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -16,6 +17,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
+    FINISH_ABORT,
     Req,
     ScheduleBatch,
 )
@@ -430,28 +432,113 @@ class SchedulerOutputProcessorMixin:
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
         for i, req in enumerate(batch.reqs):
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
+            accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
             if req.is_retracted:
                 # reset_for_retract() already zeroes committed/allocated KV.
-                continue
-
-            if req.finished():
+                pass
+            elif req.finished():
                 # -1 because prepare_for_decode pre-claimed the bonus slot.
                 req.kv_committed_len -= 1
-                continue
+            else:
+                if req.grammar is not None:
+                    # Stop accepting once the grammar terminates, so the
+                    # over-drafted suffix is never committed to KV nor emitted.
+                    # This advances the grammar FSM; the result loop only syncs
+                    # grammar.finished.
+                    accept_tokens = self._accept_grammar_tokens(req, accept_tokens)
 
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
-            req.spec_verify_ct += 1
+                num_accept_tokens = len(accept_tokens)
+                # -1 because prepare_for_decode pre-claimed the bonus slot.
+                # An empty retained prefix (all tokens grammar-rejected) yields
+                # -1, correctly returning the pre-claimed slot for this round.
+                req.kv_committed_len += num_accept_tokens - 1
+                req.spec_verify_ct += 1
 
-            num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-            req.spec_num_correct_drafts += num_correct_drafts
-            req.update_spec_correct_drafts_histogram(num_correct_drafts)
+                num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
+                req.spec_num_correct_drafts += num_correct_drafts
+                req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+            predict_tokens.append(accept_tokens)
 
         return predict_tokens
+
+    def _accept_grammar_tokens(
+        self: Scheduler, req: Req, tokens: Union[int, List[int]]
+    ) -> List[int]:
+        """Advance the grammar over the accepted token(s), stopping at the token
+        that terminates it.
+
+        ``tokens`` is a single sampled token (normal decode) or the whole
+        verified run (spec decode). Returns the retained prefix; for spec the
+        suffix past grammar completion is dropped so it is never committed to KV
+        nor emitted. Advances the grammar FSM only -- ``grammar.finished`` is
+        synced by the caller once the finish state is updated.
+        """
+        if isinstance(tokens, int):
+            tokens = [tokens]
+        retained = []
+        try:
+            for token_id in tokens:
+                req.grammar.accept_token(token_id)
+                retained.append(token_id)
+                if req.grammar.is_terminated():
+                    break
+        except ValueError as e:
+            # accept_token raises ValueError when the sampled token is not
+            # legal for the current grammar state. Two cases:
+            #   1) The structured output is already complete: xgrammar's
+            #      is_terminated() only turns True after a stop token, so a
+            #      fully-closed JSON (e.g. schema {"type": "object"}) still
+            #      reports non-terminated while rejecting every non-EOS token.
+            #      Probe EOS; on success finish the request cleanly.
+            #   2) Anything else is a real FSM/model divergence. Do NOT drop
+            #      the token and continue: the model's KV context keeps the
+            #      rejected token while the emitted stream skips it, producing
+            #      torn JSON downstream. Abort via FINISH_ABORT so the running
+            #      batch is cleaned up (#21171).
+            if self._try_finish_grammar_via_eos(req):
+                logger.warning(
+                    f"Grammar accept_token failed for req {req.rid} with token "
+                    f"{tokens}: {e} -- structured output already complete, "
+                    f"finishing via EOS"
+                )
+            else:
+                logger.error(
+                    f"Grammar accept_token failed for req {req.rid} with token "
+                    f"{tokens}: {e}"
+                )
+                req.to_finish = FINISH_ABORT(
+                    f"Grammar accept_token failed for req {req.rid} with "
+                    f"token {tokens}: {e}",
+                    HTTPStatus.BAD_REQUEST,
+                    "BadRequestError",
+                )
+        return retained
+
+    def _try_finish_grammar_via_eos(self: Scheduler, req: Req) -> bool:
+        """Probe whether the grammar can terminate by accepting an EOS token.
+
+        xgrammar's is_terminated() only turns True after a stop token is
+        accepted, so a fully-closed JSON (e.g. schema {"type": "object"})
+        still reports non-terminated. If EOS is accepted here, the later
+        check_finished() sees is_terminated() and stops the request cleanly.
+        """
+        eos_ids = self.model_config.hf_eos_token_id or ()
+        for eos_id in eos_ids:
+            try:
+                req.grammar.accept_token(eos_id)
+            except ValueError:
+                continue
+            if req.grammar.is_terminated():
+                return True
+            # Accepted but not terminated (e.g. reasoner wrapper still in
+            # thinking phase swallowed it); undo the probe.
+            try:
+                req.grammar.rollback(1)
+            except Exception:
+                pass
+        return False
 
     def process_batch_result_idle(
         self: Scheduler,
@@ -554,7 +641,10 @@ class SchedulerOutputProcessorMixin:
                 req.output_ids.append(next_token_id)
             else:
                 req.output_ids.extend(next_token_id)
-                new_accepted_len = len(next_token_id)
+                # `or 1` guards the grammar-rejected-everything case: with 0,
+                # check_finished would slice output_ids[-0:] == the whole list
+                # and re-scan every past token for stop conditions.
+                new_accepted_len = len(next_token_id) or 1
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -603,22 +693,10 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None:
-                # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                try:
-                    if batch.spec_algorithm.is_none():
-                        # Normal decode: single token
-                        req.grammar.accept_token(next_token_id)
-                    elif batch.is_spec_v2:
-                        # Speculative decode: next_token_id is a list of accepted tokens
-                        for token_id in next_token_id:
-                            req.grammar.accept_token(token_id)
-                except ValueError as e:
-                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                    )
-                    self.abort_request(AbortReq(rid=req.rid))
+                if batch.spec_algorithm.is_none():
+                    # Normal decode advances the grammar for its single token
+                    # here; spec already advanced it in _resolve_spec_overlap_tokens.
+                    self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)

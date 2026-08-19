@@ -1717,6 +1717,23 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
+            # Overlap + spec + grammar is not supported. This mirrors
+            # is_disable_overlap_for_batch in the aggregated event loop, which
+            # this PD-decode loop bypasses. The spec-v2 verify bitmask is built
+            # inside run_batch from the current grammar FSM, so the pending
+            # result must be drained first, or the mask lags one round behind
+            # and the model samples grammar-illegal tokens.
+            need_grammar_sync = (
+                batch
+                and batch.is_spec_v2
+                and batch.has_grammar
+                and batch.forward_mode.is_decode()
+                and len(self.result_queue) > 0
+            )
+            if need_grammar_sync:
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+
             # Launch the current batch
             if batch:
                 result_seq_lens_cpu, result_seq_lens_sum = (
@@ -1732,8 +1749,9 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not need_grammar_sync:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.on_idle()
 
