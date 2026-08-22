@@ -392,10 +392,28 @@ async def lifespan(fast_api_app: FastAPI):
     )
     warmup_thread.start()
 
+    # Start load reporter if enabled (single-tokenizer mode only)
+    single_tokenizer = getattr(fast_api_app, "is_single_tokenizer_mode", False)
+    reporter_handle = None
+    if server_args.load_reporter_port is not None:
+        from sglang.srt.load_reporter import start_load_reporter
+        from sglang.srt.load_reporter.snapshot_source import ManagerLoadSnapshotSource
+
+        if single_tokenizer:
+            snapshot_source = ManagerLoadSnapshotSource(
+                _global_state.tokenizer_manager, range(server_args.dp_size)
+            )
+            reporter_handle = await start_load_reporter(
+                server_args,
+                snapshot_source,
+            )
+
     # Start the HTTP server
     try:
         yield
     finally:
+        if reporter_handle is not None:
+            reporter_handle.cancel()
         warmup_thread.join()
 
 

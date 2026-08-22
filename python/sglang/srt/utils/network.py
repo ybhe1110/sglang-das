@@ -37,6 +37,17 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
+def is_zmq_endpoint_ipv6(endpoint: str) -> bool:
+    """Return whether a ZMQ TCP endpoint contains a bracketed IPv6 host."""
+    prefix = "tcp://["
+    if not endpoint.startswith(prefix):
+        return False
+    end = endpoint.find("]", len(prefix))
+    if end == -1:
+        return False
+    return is_valid_ipv6_address(endpoint[len(prefix) : end])
+
+
 def find_process_using_port(port: int) -> Optional[psutil.Process]:
     for conn in psutil.net_connections(kind="inet"):
         if conn.laddr.port == port:

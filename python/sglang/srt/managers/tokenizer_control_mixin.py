@@ -847,6 +847,32 @@ class TokenizerControlMixin:
 
         return results
 
+    async def get_load_snapshots(
+        self: TokenizerManager,
+        include: Optional[List[str]] = None,
+        dp_rank: Optional[int] = None,
+    ) -> List:
+        """
+        Get load snapshots as LoadSnapshot objects for the load reporter.
+
+        This is a thin wrapper around get_loads() that converts GetLoadsReqOutput
+        to LoadSnapshot for the load reporter's consumption. The /v1/loads endpoint
+        continues to use get_loads() directly.
+
+        Args:
+            include: List of sections to include (forwarded to get_loads)
+            dp_rank: Optional filter for specific DP rank
+
+        Returns:
+            List of LoadSnapshot, one per scheduler (filtered by dp_rank if specified)
+        """
+        from sglang.srt.managers._load_snapshot_bridge import (
+            get_loads_output_to_snapshot,
+        )
+
+        outputs = await self.get_loads(include=include, dp_rank=dp_rank)
+        return [get_loads_output_to_snapshot(output) for output in outputs]
+
     async def open_session(
         self: TokenizerManager,
         obj: OpenSessionReqInput,

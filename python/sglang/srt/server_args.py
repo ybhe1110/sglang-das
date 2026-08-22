@@ -548,6 +548,7 @@ class ServerArgs:
     grpc_http_sidecar_port: Optional[int] = None
     enable_mfu_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
+    load_reporter_port: Optional[int] = None
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
     tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
     extra_metric_labels: Optional[Dict[str, str]] = None
@@ -1048,6 +1049,7 @@ class ServerArgs:
         self._handle_a2a_moe()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
+        self._handle_load_reporter_config()
         self._handle_elastic_ep()
 
         # Handle pipeline parallelism.
@@ -3634,6 +3636,16 @@ class ServerArgs:
                 self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
+
+    def _handle_load_reporter_config(self):
+        """Validate the load reporter port range."""
+        if self.load_reporter_port is not None and not (
+            1 <= self.load_reporter_port <= 65535
+        ):
+            raise ValueError(
+                f"--load-reporter-port must be between 1 and 65535 "
+                f"(got {self.load_reporter_port})."
+            )
 
     def _handle_pipeline_parallelism(self):
         if self.pp_size > 1:
