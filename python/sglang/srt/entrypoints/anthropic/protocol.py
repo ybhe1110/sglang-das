@@ -1,7 +1,7 @@
 """Pydantic models for Anthropic Messages API protocol"""
 
 import uuid
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -119,6 +119,12 @@ class AnthropicMessagesRequest(BaseModel):
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
+
+    # SGLang extension for PD disaggregation. External routers attach these
+    # fields before the request reaches the Anthropic compatibility endpoint.
+    bootstrap_host: Optional[Union[list[str], str]] = None
+    bootstrap_port: Optional[Union[list[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[list[int], int]] = None
 
     @field_validator("model")
     @classmethod

@@ -167,6 +167,29 @@ class TestAnthropicServer(CustomTestCase):
             "data:image/png;base64,abcd",
         )
 
+    def test_pd_bootstrap_fields_are_preserved_during_conversion(self):
+        """PD bootstrap fields attached by an external router must survive
+        the Anthropic -> ChatCompletion conversion."""
+        anthropic_request = AnthropicMessagesRequest(
+            model="test-model",
+            max_tokens=16,
+            stream=False,
+            messages=[{"role": "user", "content": "hello"}],
+            bootstrap_host="127.0.0.1",
+            bootstrap_port=9100,
+            bootstrap_room=123456789,
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+
+        self.assertEqual(anthropic_request.bootstrap_host, "127.0.0.1")
+        self.assertEqual(anthropic_request.bootstrap_port, 9100)
+        self.assertEqual(anthropic_request.bootstrap_room, 123456789)
+        self.assertEqual(chat_request.bootstrap_host, "127.0.0.1")
+        self.assertEqual(chat_request.bootstrap_port, 9100)
+        self.assertEqual(chat_request.bootstrap_room, 123456789)
+
     def test_simple_messages(self):
         """Test basic non-streaming message request."""
         payload = self._default_payload()
