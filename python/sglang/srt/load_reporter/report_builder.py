@@ -42,7 +42,7 @@ class ReportBuilder:
         oldest_age_ms = max(
             report_time_unix_ms - rank.snapshot_time_unix_ms for rank in ranks
         )
-        if oldest_age_ms > self._stale_after_ms:
+        if self._stale_after_ms > 0 and oldest_age_ms > self._stale_after_ms:
             status = pb.REPORT_STATUS_STALE
             error: Optional[str] = f"load snapshot stale by {oldest_age_ms} ms"
         else:

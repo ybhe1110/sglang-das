@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 
 if TYPE_CHECKING:
@@ -13,7 +14,21 @@ if TYPE_CHECKING:
 
 SNAPSHOT_PULL_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
-SNAPSHOT_STALE_AFTER_MS = 3000
+
+
+def get_snapshot_stale_after_ms() -> int:
+    """Return the configured snapshot stale threshold in milliseconds.
+
+    Returns:
+        A non-negative threshold; zero disables age-based stale classification.
+
+    Raises:
+        ValueError: If the configured threshold is negative.
+    """
+    stale_after_ms = envs.SGLANG_LOAD_SNAPSHOT_STALE_AFTER_MS.get()
+    if stale_after_ms < 0:
+        raise ValueError("SGLANG_LOAD_SNAPSHOT_STALE_AFTER_MS must be non-negative")
+    return stale_after_ms
 
 
 def validate_session_timing(
