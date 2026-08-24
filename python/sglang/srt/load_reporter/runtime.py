@@ -11,8 +11,8 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 from sglang.srt.load_reporter.config import (
     SHUTDOWN_TIMEOUT_SECONDS,
     SNAPSHOT_PULL_TIMEOUT_SECONDS,
-    SNAPSHOT_STALE_AFTER_MS,
     WorkerMetadata,
+    get_snapshot_stale_after_ms,
     validate_session_timing,
 )
 from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
@@ -143,7 +143,7 @@ class LoadReporterRuntime:
 
         self._builder = ReportBuilder(
             str(uuid.uuid4()),
-            SNAPSHOT_STALE_AFTER_MS,
+            get_snapshot_stale_after_ms(),
         )
         self._sessions: Dict[str, _RouterSession] = {}
         self._period_schedules: Dict[int, _PeriodSchedule] = {}
