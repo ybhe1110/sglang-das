@@ -146,29 +146,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     return _create_unified_radix_cache(ctx, server_args, params)
 
 
-def _create_external_cache_linker(
-    server_args: ServerArgs,
-    params: CacheInitParams,
-    components,
-):
-    """Construct the backend linker selected by --unified-cache-external-linker-backend."""
-    backend = server_args.unified_cache_external_linker_backend
-    if backend == "mooncake":
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
-            MooncakeDirectLinker,
-        )
-
-        return MooncakeDirectLinker(
-            server_args,
-            params,
-            components=components,
-        )
-    raise ValueError(
-        f"Unsupported --unified-cache-external-linker-backend={backend!r}. "
-        "Supported backends: mooncake."
-    )
-
-
 def _create_unified_radix_cache(
     ctx: TreeCacheBuildContext,
     server_args: ServerArgs,
@@ -220,10 +197,21 @@ def _create_unified_radix_cache(
             cache.cache_controller.layer_done_counter
         )
     elif server_args.enable_unified_cache_external_linker:
-        linker = _create_external_cache_linker(
-            server_args, params, set(tree_components)
+        backend = server_args.unified_cache_external_linker_backend
+        if backend == "mooncake":
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+                MooncakeDirectLinker,
+            )
+
+            linker_cls = MooncakeDirectLinker
+        else:
+            raise ValueError(
+                f"Unknown unified cache external linker backend: {backend!r}"
+            )
+
+        cache.init_cache_linker(
+            linker_cls(server_args, params, components=set(cache.components))
         )
-        cache.init_cache_linker(linker)
         counter = cache.linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)
