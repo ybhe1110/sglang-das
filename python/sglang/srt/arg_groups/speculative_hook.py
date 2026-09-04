@@ -348,7 +348,6 @@ def _is_supported_dspark_pd_prefill_cp(server_args: ServerArgs) -> bool:
     return (
         server_args.disaggregation_mode == "prefill"
         and server_args.disaggregation_transfer_backend == "mooncake"
-        and server_args.pp_size == 1
         and server_args.attn_cp_size > 1
         and attn_tp_size == 1
         and server_args.enable_prefill_cp
@@ -375,7 +374,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if server_args.attn_cp_size > 1 and not pd_prefill_cp:
         raise ValueError(
             "DSpark context parallel is only supported for DeepSeek-V4 PD prefill "
-            "with Mooncake, pp_size == 1, attn_tp_size == 1, and interleave "
+            "with Mooncake, attn_tp_size == 1, and interleave "
             f"(round-robin-split) CP; got disaggregation_mode="
             f"{server_args.disaggregation_mode!r}, pp_size={server_args.pp_size}, "
             f"attn_cp_size={server_args.attn_cp_size}, attn_tp_size="
@@ -398,7 +397,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "megamoe",
         ) or (
             server_args.moe_a2a_backend == "deepep"
-            and server_args.moe_runner_backend == "deep_gemm"
+            # and server_args.moe_runner_backend == "deep_gemm"
         )
         if not _is_npu and not supports_dspark_dp_moe:
             raise ValueError(
@@ -434,7 +433,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
         # 'megamoe' is official's DSpark-under-DP-attention draft path (#34844).
         supports_dspark_draft_moe = draft_a2a in ("none", "megamoe") or (
-            draft_a2a == "deepep" and draft_runner == "deep_gemm"
+            draft_a2a == "deepep" # and draft_runner == "deep_gemm"
         )
         if not supports_dspark_draft_moe:
             raise ValueError(
@@ -443,9 +442,13 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"runner={draft_runner!r}."
             )
 
-    if server_args.pp_size != 1:
+    if server_args.pp_size != 1 and server_args.disaggregation_mode not in (
+        "prefill",
+        "decode",
+    ):
         raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+            "DSpark with pipeline parallelism is only supported in PD "
+            "disaggregation mode."
         )
 
     if server_args.speculative_draft_model_path is None:
@@ -769,6 +772,10 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        # Qwen4-Exp MTP: the NEXTN draft layer ships inside the target
+        # checkpoint (model.mtp.*), so the draft model path defaults to
+        # the target model path.
+        "Qwen4ExpForConditionalGeneration",
     ]:
         if server_args.speculative_draft_model_path is None:
             declare_resolution(
