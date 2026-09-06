@@ -1887,6 +1887,7 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
+        aborted_reqs: List[Req] = []
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -1911,6 +1912,13 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+
+                if is_aborted(req):
+                    if self._retire_aborted_prefill_result(req):
+                        req.time_stats.set_completion_time()
+                        aborted_reqs.append(req)
+                    advance_logprob_pt(i, req)
+                    continue
 
                 # Test hook: exercise the release/requeue retry path.
                 if (
@@ -1959,6 +1967,24 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
+                if req.grammar is not None:
+                    try:
+                        req.grammar.accept_token(next_token_id)
+                    except ValueError as e:
+                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    req.grammar.finished = req.finished()
+                    if is_aborted(req):
+                        if self._retire_aborted_prefill_result(req):
+                            req.time_stats.set_completion_time()
+                            aborted_reqs.append(req)
+                        advance_logprob_pt(i, req)
+                        continue
+
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
@@ -1998,17 +2024,6 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
-                if req.grammar is not None:
-                    try:
-                        req.grammar.accept_token(next_token_id)
-                    except ValueError as e:
-                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        prepare_abort(
-                            req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                    req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
                 req.inflight_middle_chunks -= 1
@@ -2038,16 +2053,18 @@ class SchedulerDisaggregationPrefillMixin:
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
-                if req.pending_bootstrap and not still_chunking:
-                    self.optimistic_release_and_requeue(req)
+                # Abort is terminal. Do not requeue an aborted optimistic
+                # request merely because bootstrap is still pending.
+                if is_aborted(req):
+                    if self._retire_aborted_prefill_result(req):
+                        req.time_stats.set_completion_time()
+                        aborted_reqs.append(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
-                # Optimistic bootstrap can fail while this overlapped chunk is
-                # already running. Drop aborted chunks instead of sending KV.
-                if is_aborted(req):
-                    self.clear_pending_chunk_send(req)
+                if req.pending_bootstrap and not still_chunking:
+                    self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -2088,6 +2105,12 @@ class SchedulerDisaggregationPrefillMixin:
                 batch,
                 auxiliary_output,
                 auxiliary_output_starts,
+            )
+
+        if aborted_reqs:
+            self.output_streamer.stream_output(
+                aborted_reqs,
+                any(req.return_logprob for req in aborted_reqs),
             )
 
         can_run_cuda_graph = result.can_run_cuda_graph
@@ -2436,6 +2459,33 @@ class SchedulerDisaggregationPrefillMixin:
         for the process lifetime.
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+
+    def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
+        """Stop handoff, then let the rank-synchronized cleanup own retirement.
+
+        Unlike upstream's immediate release, this branch may have native source
+        reads and private FULL/SWA loads outstanding. Never bypass those owners.
+        Always enqueue before retrying cleanup, regardless of local readiness.
+        """
+        self.clear_pending_chunk_send(req)
+        if req.external_kv_cleanup_done:
+            return False
+        req.pending_bootstrap = False
+        if req is getattr(self, "chunked_req", None):
+            req.external_kv_abort_response_via_chunked = True
+            pending = getattr(self, "_external_kv_chunked_abort_reqs", None)
+            if pending is None:
+                pending = self._external_kv_chunked_abort_reqs = {}
+            pending[req.rid] = req
+            self._pending_chunked_abort_req = req
+        if req not in self.disagg_prefill_inflight_queue:
+            self.disagg_prefill_inflight_queue.append(req)
+        self.abort_external_kv_request(
+            req, forward_drained=False, sender_terminal=False,
+            is_insert=False, emit_response=False,
+        )
+        # The inflight/chunked cleanup owner emits exactly one response.
+        return False
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         error_message = (
