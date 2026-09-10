@@ -152,7 +152,10 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA
         # completes. The anchor is the request's node before the load, so a
-        # failed load can walk back exactly the chain it published.
+        # failed load can walk back exactly the chain it published. Under PP
+        # nothing is inserted, so endpoint and anchor are both req.last_node
+        # and the loaded slots stay request-owned until the normal
+        # post-prefill insert.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams, NodeId]] = {}
         # rid -> the chain a failed load published for it, endpoint-first.
         # The nodes hold no valid KV and are already cut out of the tree; the
@@ -181,6 +184,17 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
+        self.hit_markers.pop(req.rid, None)
+
+        known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
+        if known_hit_len is not None:
+            # PP0's absolute boundary also survives later local L1 rematches.
+            key = key[:known_hit_len]
+        elif cache.pp_size > 1:
+            req.external_cache_hit_length = 0
+            if cache.pp_rank != 0:
+                return result
+
         if device_hit_len >= len(key):
             return result
 
@@ -199,11 +213,16 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
+        if known_hit_len is None:
+            hit_pages = self._sync_restorable_prefix(
+                self.cache_linker.lookup(req.rid, lookup_transfers),
+                num_pages=len(tail_hashes),
+                device_hit_pages=0,
+            )
+            if cache.pp_size > 1 and hit_pages:
+                req.external_cache_hit_length = device_hit_len + hit_pages * page
+        else:
+            hit_pages = len(tail_hashes)
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -319,12 +338,34 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        self._update_load(
+        prepared_transfers = self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
             component_transfers,
             prefix_len,
         )
+
+        if cache.pp_size > 1:
+            # Load into request-owned slots. The existing PP result ring delays
+            # normal insert/dedup until every stage has completed this prefill.
+            # This branch publishes no chain, so the anchor is the endpoint
+            # itself and a failed load's detach walk is a no-op.
+            try:
+                self._queue_load(
+                    req.rid,
+                    req.last_node,
+                    prepared_transfers,
+                    anchor=req.last_node,
+                )
+            except BaseException:
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    req,
+                    component_transfers,
+                    prefix_len,
+                )
+                raise
+            return full_transfer.device_indices, req.last_node
 
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
