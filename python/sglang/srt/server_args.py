@@ -1274,6 +1274,11 @@ class ServerArgs:
         "Enable MiniMax M2 sequence-parallel prefill optimization over TP ranks.",
         NS("parallel"),
     ] = False
+    hy3_sp: A[
+        bool,
+        "Enable Hunyuan V3 sequence parallelism over TP ranks.",
+        NS("parallel"),
+    ] = False
     enable_p2p_check: A[
         bool,
         "Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
@@ -5744,6 +5749,28 @@ class ServerArgs:
                     f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
                 )
 
+        if self.hy3_sp:
+            if model_arch != "HYV3ForCausalLM":
+                raise ValueError(
+                    "--hy3-sp is only supported for HYV3ForCausalLM, "
+                    f"but the loaded architecture is {model_arch}."
+                )
+            if self.dp_size != 1 or self.enable_dp_attention:
+                raise ValueError(
+                    "--hy3-sp requires pure tensor parallelism: set --dp-size 1 "
+                    "and remove --enable-dp-attention."
+                )
+            if self.pp_size != 1:
+                raise ValueError("--hy3-sp does not support pipeline parallelism.")
+            if self.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "--hy3-sp requires --moe-a2a-backend deepep so routed experts "
+                    "can process sequence-sharded tokens."
+                )
+            if self.moe_dense_tp_size not in (None, 1):
+                raise ValueError("--hy3-sp requires --moe-dense-tp-size 1.")
+            self.moe_dense_tp_size = 1
+
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(model_arch=model_arch)
@@ -5949,15 +5976,9 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
             if is_hip():
-                if is_deepseek_dsa(hf_config):
-                    # The fused top-k v2 kernel (topk_transform_512_v2) is a
-                    # CUDA/Hopper-only path: its JIT source includes
-                    # <cooperative_groups.h> and uses cg::this_cluster()
-                    # (thread-block clusters), neither of which exists on ROCm,
-                    # so it fails to JIT-compile on gfx9xx during CUDA-graph
-                    # capture. DeepSeek-V4 already disables it on HIP; mirror that
-                    # here for the rest of the DSA family (DeepSeek-V3.2 /
-                    # GLM-5.x) that shares the same decode top-k path.
+                if is_deepseek_dsa(hf_config) and not is_hcu():
+                    # Generic ROCm keeps the registered top-k path; HCU uses
+                    # the HIP-compatible non-cluster TopK v2 implementation.
                     envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 if not self._resolved().enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
@@ -6007,7 +6028,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                if not is_hcu():
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
@@ -6386,6 +6408,10 @@ class ServerArgs:
                 if model_config.has_asymmetric_kv:
                     return "fa4"
                 return "trtllm_mha"
+            elif is_hcu():
+                # HCU is detected as HIP at the PyTorch level, but it uses its
+                # own kernels (LightOp/flashattention) rather than aiter.
+                return "fa3"
             elif is_hip():
                 return "aiter"
             elif is_mps():
@@ -6401,6 +6427,10 @@ class ServerArgs:
                 return "fa3"
             elif is_sm100_supported():
                 return "flashinfer"
+            elif is_hcu():
+                # HCU is detected as HIP at the PyTorch level, but it uses its
+                # own MLA kernels rather than aiter.
+                return "hcu_mla"
             elif is_hip():
                 head_num = model_config.get_num_kv_heads(self.tp_size)
                 # TODO current aiter only support head number 16 or 128 head number
