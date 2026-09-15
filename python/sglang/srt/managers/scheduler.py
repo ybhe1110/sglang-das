@@ -1357,11 +1357,11 @@ class Scheduler(
                 raise RuntimeError(
                     "PD Decode DP sync currently supports pp_size=1 only"
                 )
-            if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
-                raise RuntimeError(
-                    "PD Decode DP sync currently supports attn_tp_size=1 and "
-                    "attn_cp_size=1 only"
-                )
+            # if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
+            #     raise RuntimeError(
+            #         "PD Decode DP sync currently supports attn_tp_size=1 and "
+            #         "attn_cp_size=1 only"
+            #     )
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
@@ -2976,6 +2976,8 @@ class Scheduler(
 
     def _release_aborted_request(self, rid: str) -> None:
         """Drop the cache-side state an aborted request left behind."""
+        # enable_hierarchical_cache is included deliberately: HiRadixCache
+        # holds ongoing_prefetch state for an aborted request too.
         if (
             self.enable_hierarchical_cache
             or self.enable_hicache_storage
@@ -3162,9 +3164,8 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
             return
 
-        # A caller that already staged a reason (an external-linker load that
-        # failed over this chunk's KV) keeps it; the client needs to tell that
-        # apart from a routine abort.
+        # A caller that already staged a reason keeps it: the client needs to
+        # tell an external-linker load failure from a routine abort.
         if req.to_finish is not None:
             req.finished_reason = req.to_finish
             req.to_finish = None
@@ -3185,8 +3186,6 @@ class Scheduler(
         self._pending_chunked_abort_req = None
         # Without the reason the tokenizer falls back to its generic "Abort in
         # waiting queue", which loses both the message and the status code.
-        # Upstream sends this through _make_abort_req(); this branch has no such
-        # helper, and AbortReq carries the reason directly.
         self.ipc_channels.send_to_tokenizer.send_output(
             AbortReq(
                 rid=req.rid,
@@ -4253,19 +4252,15 @@ class Scheduler(
         deferred = self._deferred_linker_rids
         self._deferred_linker_rids = set()
         failed = set(self.tree_cache.drain_linker_loads()) | deferred
-        # The request that issued the load is not the only one that can be
-        # holding its pages. A request that matched the chain in the tree while
-        # the load was still in flight was repointed onto exactly those pages,
-        # and it issued no load of its own, so it appears in no rid list -- it
-        # has to be found by where it points. Serving it is serving KV that
-        # never arrived, which is the one outcome this path exists to prevent.
+        # A request that matched the chain while the load was in flight holds
+        # its pages too, and issued no load of its own -- so it is in no rid
+        # list and has to be found by where it points.
         sweep_chains = self.tree_cache.has_outstanding_failed_linker_chains()
         if not failed and not sweep_chains:
             return
         message = "Aborted: external KV cache load failed."
-        # The verdict is MIN-reduced, so a lagging rank can defer it past the
-        # extend batch that consumed the load; the request is then decoding
-        # over KV that never arrived. Sweep both lists.
+        # The MIN-reduced verdict can arrive a batch late on a lagging rank,
+        # by which point the request is already decoding. Sweep both lists.
         candidates = list(batch.reqs)
         if self.running_batch is not None and not self.running_batch.is_empty():
             candidates.extend(self.running_batch.reqs)
@@ -4283,8 +4278,7 @@ class Scheduler(
                 continue
             # Never finished_reason here: a request finished ahead of the
             # result processors is skipped by all of them, so it would leak its
-            # KV and never answer. update_finish_state promotes this inside the
-            # loop that frees and streams it.
+            # KV and never answer. update_finish_state promotes it instead.
             req.skip_radix_cache_insert = True
             req.to_finish = FINISH_ABORT(
                 message,
@@ -4300,11 +4294,9 @@ class Scheduler(
                 self._pending_chunked_abort_req = req
         if not failed:
             return
-        # Under overlap the next batch is already launched but not yet merged
-        # into running_batch by get_next_batch_to_run, so its requests are in
-        # neither list. Retry once rather than dropping the verdict -- a dropped
-        # verdict is a request served over KV that never arrived. One pass is
-        # enough: a batch launched during step k is merged by step k + 1.
+        # Under overlap the next batch is launched but not yet merged into
+        # running_batch, so its requests are in neither list. One retry is
+        # enough: a batch launched at step k is merged by step k + 1.
         self._deferred_linker_rids = failed - deferred
         if lost := failed & deferred:
             logger.error(

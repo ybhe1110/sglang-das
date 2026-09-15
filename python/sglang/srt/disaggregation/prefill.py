@@ -387,6 +387,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None
         )
         num_draft_entries = 0
+        num_main_kv_layers = len(kv_data_ptrs) // 2
         if draft_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -394,9 +395,23 @@ class PrefillBootstrapQueue:
                 draft_kv_pool.get_contiguous_buf_infos()
             )
             num_draft_entries = len(draft_kv_data_ptrs)
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
+            if self.is_mla_backend:
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
+            else:
+                # MHA transfer: keep half-split on K/V boundary by folding
+                # draft into each half, matching decode's normalization.
+                from sglang.srt.disaggregation.utils import normalize_mha_mtp_kv_infos
+                kv_data_ptrs = normalize_mha_mtp_kv_infos(
+                    kv_data_ptrs, draft_kv_data_ptrs
+                )
+                kv_data_lens = normalize_mha_mtp_kv_infos(
+                    kv_data_lens, draft_kv_data_lens
+                )
+                kv_item_lens = normalize_mha_mtp_kv_infos(
+                    kv_item_lens, draft_kv_item_lens
+                )
 
         kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
@@ -404,6 +419,31 @@ class PrefillBootstrapQueue:
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
+        if (
+            num_draft_entries
+            and not self.is_mla_backend
+            and len(kv_layer_ids) == len(kv_data_ptrs)
+        ):
+            # build_kv_layer_ids appends draft ids; mirror pointer normalization
+            # so ids stay aligned entry-wise.
+            from sglang.srt.disaggregation.utils import normalize_mha_mtp_kv_infos
+            kv_layer_ids = normalize_mha_mtp_kv_infos(
+                kv_layer_ids[:-num_draft_entries],
+                kv_layer_ids[-num_draft_entries:],
+            )
+
+        # Populate main/draft range fields for the MHA+MTP branch reader in
+        # common/conn.py:1015-1059. Without these it falls through to layout
+        # guessing which assumes draft is appended at tail and yields wrong V.
+        if num_draft_entries and not self.is_mla_backend:
+            kv_args.total_main_kv_layers = self.scheduler.model_config.num_hidden_layers
+            kv_args.total_draft_kv_layers = num_draft_entries // 2
+            kv_args.prefill_main_start_layer = kv_args.prefill_start_layer
+            kv_args.prefill_main_end_layer = (
+                kv_args.prefill_start_layer + num_main_kv_layers
+            )
+            kv_args.prefill_draft_start_layer = 0
+            kv_args.prefill_draft_end_layer = num_draft_entries // 2
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -1532,20 +1572,13 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
-                # An external-linker load that failed over the very KV this
-                # forward consumed must not have that KV sent, or the decode
-                # side serves pages that never arrived. Finish it here the way
-                # handle_bootstrap_failure does rather than queueing it for a
-                # transfer.
+                # KV this forward consumed never arrived, so it must not be
+                # sent on: finish here as handle_bootstrap_failure does. Kept
+                # narrower than is_aborted() because a user abort already
+                # reaches decode via its own AbortReq.
                 #
-                # Deliberately narrower than is_aborted(): a user abort reaches
-                # the decode node through its own AbortReq, so it needs no drop
-                # here, and widening this would change PD abort semantics well
-                # outside the linker path. A linker failure has no such second
-                # path -- it is an internal decision of this node.
-                #
-                # Must precede the is_aborted() drop below: a linker failure is a
-                # FINISH_ABORT, and that drop queues the request for KV transfer.
+                # Must precede the is_aborted() drop below, which queues the
+                # request for KV transfer instead of retiring it.
                 if is_external_kv_load_failure(req):
                     req.update_finish_state()
                     self.clear_pending_chunk_send(req)

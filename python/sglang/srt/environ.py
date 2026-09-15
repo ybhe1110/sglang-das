@@ -402,13 +402,10 @@ class Envs:
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
     # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
-    # External-cache linker: fail this fraction of layer-wise KV load batches.
-    # Per batch, not per range get -- see
-    # mem_cache/unified_cache/linker_fault_injection.py.
+    # External-cache linker: fail this fraction of layer-wise load batches.
     SGLANG_TEST_LINKER_LOAD_FAILURE_PROB = EnvFloat(0.0)
-    # Which TP ranks honour the above: unset/"all", or e.g. "0,3". A load
-    # failure is rank-local, so only an asymmetric case observes the MIN-reduce
-    # that turns one rank's failure into a group-wide abort.
+    # Ranks honouring the above: unset/"all", or e.g. "0,3". An asymmetric
+    # case is what exercises the MIN-reduce into a group-wide abort.
     SGLANG_TEST_LINKER_LOAD_FAILURE_RANKS = EnvStr(None)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
@@ -496,6 +493,8 @@ class Envs:
     # ===================================================================
     # DSpark speculative decoding
     # ===================================================================
+    # Opt in to Qwen DSPARK checkpoint and HCU MTP compatibility fixes.
+    SGLANG_USE_QWEN_DSPARK = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())

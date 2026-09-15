@@ -1326,11 +1326,10 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                req.host_loaded_length = len(new_indices)
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 # PP linker slots remain request-owned until post-prefill insert.
-                # Upstream reads req.kv.cache_protected_len; on this branch the
-                # field still lives directly on Req.
                 if req.external_cache_hit_length is None:
                     req.cache_protected_len = prefix_len
 
