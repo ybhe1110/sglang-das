@@ -197,6 +197,19 @@ class PrefillRankInfo:
 
 
 class CommonKVManager(BaseKVManager):
+    # Wire layout of the prefill->decode terminal status message. The legacy
+    # layout (mooncake, and ascend which inherits it) is three untagged frames
+    # ``[room, status, prefill_rank]``; backends whose control socket also
+    # carries tagged messages prefix a tag frame and may append a reason:
+    # ``[tag, room, status, prefill_rank, reason]``.
+    kv_status_msg_tag: Optional[bytes] = None
+    kv_status_msg_carries_reason: bool = False
+
+    # Used by decode when the prefill reported Failed without a reason frame.
+    DEFAULT_PREFILL_FAILURE_REASON = (
+        "Failed to get kvcache from prefill instance, it might be dead"
+    )
+
     def __init__(
         self,
         args: KVArgs,
@@ -277,7 +290,6 @@ class CommonKVManager(BaseKVManager):
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
-
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
             # participate in KV transfer; Otherwise only CP rank 0 sends.
@@ -308,6 +320,7 @@ class CommonKVManager(BaseKVManager):
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
+            self._staging_handler = None
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
@@ -329,6 +342,9 @@ class CommonKVManager(BaseKVManager):
             self.max_failures = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
             )
+            # Latch so _start_heartbeat_checker_thread spawns at most one
+            # thread per manager regardless of how often it is called.
+            self._heartbeat_checker_started = False
             # If a timeout happens on the decode side, it means decode instances
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
@@ -422,25 +438,232 @@ class CommonKVManager(BaseKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            # Do not resurrect a cleared entry with Failed: once clear() has
-            # popped the room from request_status, any late update_status(Failed)
-            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
-            # pollute a future request that reuses the same bootstrap_room.
-            if status == KVPoll.Failed:
-                return
-            self.request_status[bootstrap_room] = status
-        else:
-            if status == KVPoll.Failed:
-                self.request_status[bootstrap_room] = KVPoll.Failed
-            else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
+        current = self.request_status.get(bootstrap_room)
+        if current is None:
+            # The room does not exist yet, or clear() already popped it. Only a
+            # request's opening status may create it: Bootstrapping normally, or
+            # WaitingForInput for a dummy CP rank (see CommonKVSender.__init__).
+            # Anything else would resurrect a concluded room and pollute a later
+            # request that reuses the same bootstrap_room.
+            if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
+                self.request_status[bootstrap_room] = status
+            return
+        if status == KVPoll.Failed:
+            self.request_status[bootstrap_room] = KVPoll.Failed
+            return
+        if current == KVPoll.Failed:
+            # Failed is terminal. It also sorts lowest, so the max() below would
+            # happily promote it back to Transferring or Success.
+            return
+        self.request_status[bootstrap_room] = max(current, status)
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
+        infos = self.transfer_infos.get(bootstrap_room)
+        if not infos:
+            return []
+        # Every non-dummy endpoint, not just the one a caller failed on: the
+        # others never receive the room's remaining chunks either.
+        targets: List[Tuple[str, int]] = []
+        # Snapshot: the control thread can register a late peer for this room
+        # while we walk it, and iterating the live view would then raise.
+        for info in list(infos.values()):
+            if info.is_dummy:
+                continue
+            target = (info.endpoint, info.dst_port)
+            if target not in targets:
+                targets.append(target)
+        return targets
+
+    def _encode_kv_status_message(
+        self,
+        *,
+        bootstrap_room: int,
+        status: KVPoll,
+        failure_reason: Optional[str],
+    ) -> List[bytes]:
+        parts = [
+            str(bootstrap_room).encode("ascii"),
+            str(int(status)).encode("ascii"),
+            str(self._prefill_unique_rank()).encode("ascii"),
+        ]
+        if self.kv_status_msg_carries_reason:
+            parts.append((failure_reason or "").encode("utf-8"))
+        if self.kv_status_msg_tag is not None:
+            parts.insert(0, self.kv_status_msg_tag)
+        return parts
+
+    def parse_kv_status_message(
+        self, msg: List[bytes]
+    ) -> Optional[Tuple[int, int, int, Optional[str]]]:
+        """Decode a prefill status message, or None when it is not one."""
+        if self.kv_status_msg_tag is not None:
+            if not msg or msg[0] != self.kv_status_msg_tag:
+                return None
+            msg = msg[1:]
+        if len(msg) < 3:
+            logger.warning(
+                "Dropping malformed prefill status message with %d frames", len(msg)
+            )
+            return None
+        try:
+            bootstrap_room = int(msg[0].decode("ascii"))
+            status = int(msg[1].decode("ascii"))
+            prefill_rank = int(msg[2].decode("ascii"))
+        except (UnicodeDecodeError, ValueError):
+            logger.warning("Dropping unparsable prefill status message")
+            return None
+        failure_reason = (
+            msg[3].decode("utf-8", errors="replace")
+            if len(msg) > 3 and msg[3]
+            else None
+        )
+        return bootstrap_room, status, prefill_rank, failure_reason
+
+    def send_kv_status_message(
+        self,
+        *,
+        targets: List[Tuple[str, int]],
+        bootstrap_room: int,
+        status: KVPoll,
+        failure_reason: Optional[str] = None,
+    ) -> None:
+        """Push of a terminal transfer status to decode endpoints."""
+        if not targets:
+            return
+        parts = self._encode_kv_status_message(
+            bootstrap_room=bootstrap_room,
+            status=status,
+            failure_reason=failure_reason,
+        )
+        for endpoint, dst_port in targets:
+            na = NetworkAddress(endpoint, dst_port)
+            try:
+                self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to sync status {status} of room {bootstrap_room} to "
+                    f"{na.to_host_port_str()}: {e}"
+                )
+
+    def conclude_transfer(
+        self,
+        *,
+        bootstrap_room: int,
+        status: KVPoll,
+        targets: Optional[List[Tuple[str, int]]] = None,
+        failure_reason: Optional[str] = None,
+    ) -> Optional[KVPoll]:
+        """Returns the status emitted, or None for a cleared room.
+
+        Runs more than once for a room when a staging chunk is deferred past the
+        last one. ``targets`` defaults to the room's non-dummy decode endpoints.
+        """
+        if bootstrap_room not in self.request_status:
+            # The sender already cleared this room. Concluding now would
+            # re-create it in request_status and leave a failure record that a
+            # request reusing this bootstrap_room would adopt as its own.
+            return None
+        if status == KVPoll.Success:
+            with self.failure_lock:
+                recorded = self.failure_records.get(bootstrap_room)
+            if recorded is not None:
+                status = KVPoll.Failed
+                failure_reason = recorded
+            elif self.request_status.get(bootstrap_room) == KVPoll.Failed:
+                status = KVPoll.Failed
+                failure_reason = (
+                    failure_reason or "Room marked Failed before the transfer ended"
+                )
+        if status == KVPoll.Failed:
+            with self.failure_lock:
+                # Keep the first root cause; later callers see the symptom.
+                failure_reason = self.failure_records.setdefault(
+                    bootstrap_room, failure_reason or "KV transfer failed"
+                )
+
+        if targets is None:
+            targets = self._room_notify_targets(bootstrap_room)
+        self.update_status(bootstrap_room, status)
+        self.send_kv_status_message(
+            targets=targets,
+            bootstrap_room=bootstrap_room,
+            status=status,
+            failure_reason=failure_reason,
+        )
+        return status
+
+    def conclude_failure(
+        self,
+        *,
+        bootstrap_room: int,
+        failure_reason: str,
+        targets: Optional[List[Tuple[str, int]]] = None,
+    ) -> Optional[KVPoll]:
+        """Record the reason, mark the room Failed and tell decode."""
+        return self.conclude_transfer(
+            bootstrap_room=bootstrap_room,
+            status=KVPoll.Failed,
+            targets=targets,
+            failure_reason=failure_reason,
+        )
+
+    def apply_prefill_status(
+        self,
+        *,
+        bootstrap_room: int,
+        status: int,
+        prefill_rank: int,
+        failure_reason: Optional[str] = None,
+    ) -> None:
+        """Decode-side handling of one prefill rank's terminal status."""
+        if bootstrap_room not in self.request_status:
+            # The room concluded and was cleared. Recording a failure now would
+            # leave an entry that a later request reusing this bootstrap_room
+            # would pick up as its own root cause.
+            logger.debug("Dropping late status for cleared room %s", bootstrap_room)
+            return
+        if status == KVPoll.Success:
+            self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+            expected_response_num = self.required_prefill_response_num_table.get(
+                bootstrap_room
+            )
+            if expected_response_num is None:
+                logger.warning(
+                    "No expected prefill response count for room %s, prefill rank %s",
+                    bootstrap_room,
+                    prefill_rank,
+                )
+                return
+            if (
+                len(self.prefill_response_tracker[bootstrap_room])
+                < expected_response_num
+            ):
+                return
+            # Tell the staging handler no more chunks are coming, before any
+            # poller can see Success. Only mooncake gets here: NIXL arms the
+            # handler from its own notifications, mori has no staging.
+            if self.enable_staging and self._staging_handler is not None:
+                handler = self._staging_handler
+                if handler.is_staging_room(bootstrap_room):
+                    handler.submit_last_scatter_async(bootstrap_room)
+            self.update_status(bootstrap_room, KVPoll.Success)
+            return
+        if status == KVPoll.Failed:
+            self.record_failure(
+                bootstrap_room, failure_reason or self.DEFAULT_PREFILL_FAILURE_REASON
+            )
+            self.update_status(bootstrap_room, KVPoll.Failed)
+            return
+        logger.warning(
+            "Ignoring non-terminal status %s for room %s from prefill rank %s",
+            status,
+            bootstrap_room,
+            prefill_rank,
+        )
 
     def register_deferred_abort_room(self, bootstrap_room: int) -> None:
         """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
@@ -1478,50 +1701,68 @@ class CommonKVManager(BaseKVManager):
         return src_kv_ptrs, sliced_dst
 
     def _start_heartbeat_checker_thread(self):
-        """Start the heartbeat checker thread for Decode worker."""
+        """Start the heartbeat checker thread for Decode worker (at most once).
 
-        def heartbeat_checker():
-            while True:
-                time.sleep(self.heartbeat_interval)
-                with self.connection_lock:
-                    addresses = list(self.prefill_info_table.keys())
+        Runs as a daemon. Wraps the whole per-tick body in a try/except
+        so a bug in ``_handle_node_failure`` or an unexpected exception
+        outside the existing inner request try/except cannot kill the
+        thread and silently stop health monitoring.
 
-                for bootstrap_addr in addresses:
-                    session = None
-                    try:
-                        with self.session_pool_lock:
-                            session = self.session_pool[bootstrap_addr]
-                        response = session.get(
-                            f"http://{bootstrap_addr}/health",
-                            timeout=(2, 3),
-                            headers={"Connection": "keep-alive"},
-                        )
-                        if response.status_code == 200:
-                            self.heartbeat_failures[bootstrap_addr] = 0
-                            self._on_heartbeat_success(bootstrap_addr)
-                        else:
-                            logger.info(
-                                f"Attempting to reconnect to {bootstrap_addr}..."
-                            )
-                            self.heartbeat_failures[bootstrap_addr] = (
-                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                            )
-                    except Exception:
-                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
-                        self.heartbeat_failures[bootstrap_addr] = (
-                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                        )
+        Idempotent by design: this must run once per manager (from
+        ``start_decode_thread``), never from a per-message path. We have
+        measured the failure mode of a misplaced call site (invoked once
+        per KV-status message in a downstream build): decode schedulers
+        accumulated 600-1,600 immortal HTTP-probing threads under abort
+        waves, CPU/GIL starvation stretched ~20 ms decode steps to
+        seconds, and liveness probes killed the pods. The latch makes
+        that class of regression structurally impossible.
+        """
+        if self._heartbeat_checker_started:
+            return
+        self._heartbeat_checker_started = True
+        threading.Thread(target=self._run_heartbeat_checker_loop, daemon=True).start()
 
-                    if (
-                        self.heartbeat_failures.get(bootstrap_addr, 0)
-                        >= self.max_failures
-                    ):
-                        self._handle_node_failure(bootstrap_addr)
-                        with self.session_pool_lock:
-                            if bootstrap_addr in self.session_pool:
-                                del self.session_pool[bootstrap_addr]
+    def _run_heartbeat_checker_loop(self):
+        while True:
+            time.sleep(self.heartbeat_interval)
+            try:
+                self._run_one_heartbeat_pass()
+            except Exception:
+                logger.exception(
+                    "heartbeat_checker outer loop caught unexpected exception; "
+                    "continuing next tick"
+                )
 
-        threading.Thread(target=heartbeat_checker, daemon=True).start()
+    def _run_one_heartbeat_pass(self):
+        with self.connection_lock:
+            addresses = list(self.prefill_info_table.keys())
+
+        for bootstrap_addr in addresses:
+            self._probe_bootstrap_addr(bootstrap_addr)
+            if self.heartbeat_failures.get(bootstrap_addr, 0) >= self.max_failures:
+                self._handle_node_failure(bootstrap_addr)
+                with self.session_pool_lock:
+                    self.session_pool.pop(bootstrap_addr, None)
+
+    def _probe_bootstrap_addr(self, bootstrap_addr: str):
+        try:
+            with self.session_pool_lock:
+                session = self.session_pool[bootstrap_addr]
+            response = session.get(
+                f"http://{bootstrap_addr}/health",
+                timeout=(2, 3),
+                headers={"Connection": "keep-alive"},
+            )
+            if response.status_code == 200:
+                self.heartbeat_failures[bootstrap_addr] = 0
+                self._on_heartbeat_success(bootstrap_addr)
+                return
+            logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+        except Exception:
+            logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+        self.heartbeat_failures[bootstrap_addr] = (
+            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+        )
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""
@@ -2004,6 +2245,9 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
+            self.bootstrap_room
+        )
 
     def abort(self):
         self.kv_mgr.record_failure(

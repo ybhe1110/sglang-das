@@ -449,13 +449,8 @@ class PDHiddenEventManager:
             if self.owner.session_failures[session_id] >= 1:
                 self.owner.failed_sessions.add(session_id)
                 logger.error("Session %s failed.", session_id)
-        self.owner.record_failure(kv_chunk.room, failure_reason)
-        self.owner.update_status(kv_chunk.room, KVPoll.Failed)
-        self.wake_ack_waiters(kv_chunk.room)
-        self.owner.sync_status_to_decode_endpoint(
-            req.endpoint,
-            req.dst_port,
-            req.room,
-            KVPoll.Failed,
-            prefill_unique_rank,
+        self.owner.conclude_failure(
+            bootstrap_room=kv_chunk.room,
+            failure_reason=failure_reason,
         )
+        self.wake_ack_waiters(kv_chunk.room)

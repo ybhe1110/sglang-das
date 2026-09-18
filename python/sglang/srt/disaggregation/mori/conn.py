@@ -7,7 +7,7 @@ import struct
 import threading
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import msgspec
 import numpy as np
@@ -302,6 +302,11 @@ class _TransferChunk:
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
+    # The bootstrap socket carries several message kinds, so the status message
+    # is tagged. Mori has always shipped the failure reason with it.
+    kv_status_msg_tag = MORI_GUARD
+    kv_status_msg_carries_reason = True
+
     def __init__(
         self,
         args: KVArgs,
@@ -339,7 +344,6 @@ class MoriKVManager(CommonKVManager):
                 ).start()
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.room_to_bootstrap_addr: Dict[int, str] = {}
             self._start_decode_thread()
 
     def _init_engine(self) -> IOEngine:
@@ -416,19 +420,6 @@ class MoriKVManager(CommonKVManager):
                 component_descs.append(desc)
             self.state_mem_descs.append(component_descs)
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        current = self.request_status.get(bootstrap_room)
-        if current is None:
-            # Room not yet created or already cleared.
-            # Only allow initial creation: Bootstrapping (normal) or
-            # WaitingForInput (dummy CP rank, see CommonKVSender.__init__).
-            if status not in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
-                return
-        elif current == KVPoll.Failed and status != KVPoll.Failed:
-            # Failed is terminal — never overwrite with non-Failed.
-            return
-        super().update_status(bootstrap_room, status)
-
     def enqueue_transfer(self, task: _TransferChunk) -> None:
         self._transfer_queues[task.sender.bootstrap_room % self._num_shards].put(task)
 
@@ -456,6 +447,80 @@ class MoriKVManager(CommonKVManager):
                         )
                     except Exception:
                         pass
+
+    def _should_skip_transfer(self, room: int) -> bool:
+        if room not in self.request_status or self.check_status(room) == KVPoll.Failed:
+            logger.debug(
+                "Skipping chunk for room %s because it has already failed or been aborted",
+                room,
+            )
+            return True
+        return False
+
+    def _wait_transfer_completion(
+        self, statuses: List[TransferStatus]
+    ) -> Optional[str]:
+        if not statuses:
+            return None
+
+        start = time.perf_counter()
+        sla_ms = self._transfer_timeout_ms
+
+        while True:
+            rc = self.engine.wait_all(statuses, timeout_ms=self._wait_poll_ms)
+            if rc != StatusCode.IN_PROGRESS:
+                if rc == StatusCode.SUCCESS:
+                    return None
+                return self._collect_transfer_failure_reason(statuses)
+            if sla_ms > 0 and (time.perf_counter() - start) * 1000 >= sla_ms:
+                return f"KV transfer exceeded SLA {sla_ms}ms"
+
+    @staticmethod
+    def _collect_transfer_failure_reason(statuses: List[TransferStatus]) -> str:
+        for status in statuses:
+            if status.Failed():
+                return f"KV transfer failed: {status.Message()}"
+        return "KV transfer failed due to unknown reason"
+
+    def add_transfer_request(
+        self,
+        bootstrap_room: int,
+        kv_indices: npt.NDArray[np.int32],
+        index_slice: slice,
+        is_last_chunk: bool,
+        aux_index: Optional[int] = None,
+        state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
+        wait_event: Optional[object] = None,
+    ) -> None:
+        assert self.disaggregation_mode == DisaggregationMode.PREFILL
+        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
+
+        if (
+            bootstrap_room not in self.request_status
+            or self.check_status(bootstrap_room) == KVPoll.Failed
+        ):
+            logger.debug(
+                "Request with bootstrap_room=%s already failed", bootstrap_room
+            )
+            return
+
+        if bootstrap_room not in self.transfer_infos:
+            return
+
+        shard_idx = bootstrap_room % self._num_shards
+        self._transfer_queues[shard_idx].put(
+            TransferKVChunk(
+                room=bootstrap_room,
+                prefill_kv_indices=kv_indices,
+                index_slice=index_slice,
+                is_last_chunk=is_last_chunk,
+                prefill_aux_index=aux_index,
+                state_indices=state_indices,
+                num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
+            )
+        )
 
     def _connect_threadsafe(self, endpoint: str, is_ipv6: bool = False):
         """Thread-local ZMQ socket cache with shared Context.
@@ -571,15 +636,6 @@ class MoriKVManager(CommonKVManager):
 
         threading.Thread(target=bootstrap_worker, daemon=True).start()
 
-    def _cleanup_room_tracking(self, bootstrap_room: int) -> None:
-        bootstrap_addr = self.room_to_bootstrap_addr.pop(bootstrap_room, None)
-        if bootstrap_addr is not None:
-            rooms = self.addr_to_rooms_tracker.get(bootstrap_addr)
-            if rooms is not None:
-                rooms.discard(bootstrap_room)
-                if not rooms:
-                    self.addr_to_rooms_tracker.pop(bootstrap_addr, None)
-
     def _start_decode_thread(self) -> None:
         def decode_worker():
             while True:
@@ -589,90 +645,23 @@ class MoriKVManager(CommonKVManager):
                         self._handle_aux_data(msg)
                         continue
 
-                    if not msg or msg[0] != MORI_GUARD:
+                    parsed = self.parse_kv_status_message(msg)
+                    if parsed is None:
                         logger.warning(
                             "Received malformed status message on decode worker"
                         )
                         continue
-                    payload = msg[1:]
-                    if len(payload) < 3:
-                        logger.warning("Incomplete status payload received")
-                        continue
-                    bootstrap_room = int(payload[0].decode("ascii"))
-                    status_code = int(payload[1].decode("ascii"))
-                    prefill_rank = int(payload[2].decode("ascii"))
-                    failure_reason = (
-                        payload[3].decode("utf-8")
-                        if len(payload) > 3 and payload[3]
-                        else None
+                    room, status, prefill_rank, reason = parsed
+                    self.apply_prefill_status(
+                        bootstrap_room=room,
+                        status=status,
+                        prefill_rank=prefill_rank,
+                        failure_reason=reason,
                     )
-
-                    if status_code == KVPoll.Success:
-                        tracker = self.prefill_response_tracker[bootstrap_room]
-                        tracker.add(prefill_rank)
-                        expected = self.required_prefill_response_num_table.get(
-                            bootstrap_room, 1
-                        )
-                        if len(tracker) >= expected:
-                            self.prefill_response_tracker.pop(bootstrap_room, None)
-                            self.update_status(bootstrap_room, KVPoll.Success)
-                            self._cleanup_room_tracking(bootstrap_room)
-                    elif status_code == KVPoll.Failed:
-                        if failure_reason:
-                            self.record_failure(bootstrap_room, failure_reason)
-                        self.prefill_response_tracker.pop(bootstrap_room, None)
-                        self.update_status(bootstrap_room, KVPoll.Failed)
-                        self._cleanup_room_tracking(bootstrap_room)
-                    else:
-                        logger.warning(
-                            "Unknown status code %s received for room %s",
-                            status_code,
-                            bootstrap_room,
-                        )
                 except Exception:
                     logger.exception("Decode status worker failed")
 
         threading.Thread(target=decode_worker, daemon=True).start()
-
-    def _compute_prefill_unique_rank(self) -> int:
-        """Unique id per prefill sender, encoding TP/PP/CP ranks.
-        Must match Mooncake's formula so decode's response set size matches
-        expected_response_num when multiple CP ranks participate."""
-        return (
-            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
-            + self.pp_rank * self.attn_cp_size
-            + self.attn_cp_rank
-        )
-
-    def notify_decode_status(
-        self,
-        infos: List[TransferInfo],
-        bootstrap_room: int,
-        status: KVPoll,
-        failure_reason: Optional[str] = None,
-    ) -> None:
-        if not infos:
-            return
-        payload = [
-            MORI_GUARD,
-            str(bootstrap_room).encode("ascii"),
-            str(int(status)).encode("ascii"),
-            str(self._compute_prefill_unique_rank()).encode("ascii"),
-            failure_reason.encode("utf-8") if failure_reason else b"",
-        ]
-        for info in infos:
-            try:
-                na = NetworkAddress(info.endpoint, info.dst_port)
-                socket = self._connect_threadsafe(na.to_tcp(), is_ipv6=na.is_ipv6)
-                socket.send_multipart(payload)
-            except Exception:
-                logger.exception(
-                    "Failed to sync status %s to decode endpoint %s:%s for room %s",
-                    status,
-                    info.endpoint,
-                    info.dst_port,
-                    bootstrap_room,
-                )
 
     def _add_remote_peer(self, register_info: KVArgsRegisterInfo) -> None:
         engine_key = register_info.engine_key
@@ -1306,24 +1295,23 @@ class MoriKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[npt.NDArray[np.int32]]] = None,
-    ) -> Tuple[List[TransferStatus], Optional[List[TransferInfo]]]:
+    ) -> List[TransferStatus]:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
 
         if (
             bootstrap_room not in self.request_status
             or self.request_status.get(bootstrap_room) == KVPoll.Failed
         ):
-            return [], None
+            return []
 
         targets: List[TransferTarget] = []
-        target_infos_snapshot: Optional[List[TransferInfo]] = None
         with self.transfer_lock:
             transfer_infos = self.transfer_infos.get(bootstrap_room)
             if not transfer_infos:
                 reason = f"No transfer info found for bootstrap_room={bootstrap_room}"
                 self.record_failure(bootstrap_room, reason)
                 self.update_status(bootstrap_room, KVPoll.Failed)
-                return [], None
+                return []
 
             self.update_status(bootstrap_room, KVPoll.Transferring)
             for info in transfer_infos.values():
@@ -1332,10 +1320,8 @@ class MoriKVManager(CommonKVManager):
                     reason = f"Peer info missing for engine {info.engine_key}"
                     self.record_failure(bootstrap_room, reason)
                     self.update_status(bootstrap_room, KVPoll.Failed)
-                    return [], list(transfer_infos.values())
+                    return []
                 targets.append(TransferTarget(info=info, peer_info=peer_info))
-            if is_last_chunk:
-                target_infos_snapshot = list(transfer_infos.values())
 
         result_statuses: List[TransferStatus] = []
         try:
@@ -1381,9 +1367,9 @@ class MoriKVManager(CommonKVManager):
                 "Mori KV transfer submission failed for bootstrap_room=%s",
                 bootstrap_room,
             )
-            return result_statuses, target_infos_snapshot
+            return result_statuses
 
-        return result_statuses, target_infos_snapshot
+        return result_statuses
 
 
 class MoriKVSender(CommonKVSender):
@@ -1464,7 +1450,7 @@ class MoriKVSender(CommonKVSender):
         if task.wait_event is not None:
             task.wait_event.synchronize()
 
-        statuses, infos = self.kv_mgr.add_transfer_request(
+        statuses = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             task.kv_indices,
             task.index_slice,
@@ -1473,8 +1459,6 @@ class MoriKVSender(CommonKVSender):
             state_indices=task.normalized_state,
         )
         self.transfer_statuses.extend(statuses)
-        if infos is not None:
-            self.pending_infos = infos
 
         if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
             self._finalize_failure()
@@ -1581,16 +1565,14 @@ class MoriKVSender(CommonKVSender):
 
         if status == KVPoll.Failed:
             with self.kv_mgr.failure_lock:
-                self.kv_mgr.failure_records.setdefault(
+                reason = self.kv_mgr.failure_records.setdefault(
                     self.bootstrap_room, reason or "KV transfer failed"
                 )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
 
-        infos = self.pending_infos
-        if infos is None:
-            with self.kv_mgr.transfer_lock:
-                room_infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room)
-                infos = list(room_infos.values()) if room_infos is not None else None
+        with self.kv_mgr.transfer_lock:
+            room_infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room)
+            infos = list(room_infos.values()) if room_infos is not None else None
 
         self._notified_status = status
         self._notified_reason = reason
@@ -1605,8 +1587,11 @@ class MoriKVSender(CommonKVSender):
                 status, failure_reason
             )
         if infos:
-            self.kv_mgr.notify_decode_status(
-                infos, self.bootstrap_room, emitted_status, emitted_reason
+            self.kv_mgr.send_kv_status_message(
+                targets=self.kv_mgr._room_notify_targets(self.bootstrap_room),
+                bootstrap_room=self.bootstrap_room,
+                status=emitted_status,
+                failure_reason=emitted_reason,
             )
         return emitted_status, emitted_reason
 
@@ -1655,9 +1640,6 @@ class MoriKVReceiver(CommonKVReceiver):
         prefill_dp_rank: int,
     ):
         super().init(prefill_dp_rank)
-        if self.bootstrap_room is None:
-            return
-        self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = self.bootstrap_addr
 
     def _register_kv_args(self) -> bool:
         if self.bootstrap_infos is None:
@@ -1785,7 +1767,6 @@ class MoriKVReceiver(CommonKVReceiver):
         if self.bootstrap_room is None:
             return
         super().clear()
-        self.kv_mgr._cleanup_room_tracking(self.bootstrap_room)
 
     def failure_exception(self):
         if self.conclude_state is None:
