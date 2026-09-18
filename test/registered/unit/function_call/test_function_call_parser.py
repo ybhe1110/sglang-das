@@ -2145,7 +2145,9 @@ class TestDeepSeekV4Detector(unittest.TestCase):
                             "parameters"
                         ] += call.parameters
 
-        self.assertGreater(num_tool_call_chunks, 8)
+        # DeepSeek V4 holds the protocol envelope until it is complete, so a
+        # truncated stream cannot publish a name without valid arguments.
+        self.assertEqual(num_tool_call_chunks, 1)
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
@@ -2349,32 +2351,39 @@ class TestDeepSeekV4Detector(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_rstrip_does_not_truncate_streaming_param(self):
-        """Intermediate streaming parameter values ending with chars in
-        {p,a,r,m,e,t} must not be truncated by rstrip(partial_tag)."""
+        """A value ending with chars in {p,a,r,m,e,t} must survive intact.
+        rstrip(partial_tag) would treat the tag as a character set and eat
+        the tail; the merges rely on removesuffix.
+
+        V4 publishes only complete envelopes, so the value is split across
+        deltas and the assertion is made on what the client receives."""
         detector = DeepSeekV4Detector()
         detector.parse_streaming_increment(
-            '<｜DSML｜tool_calls><｜DSML｜invoke name="search">',
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="search">'
+            '<｜DSML｜parameter name="query" string="true">find /t',
             self.tools,
         )
-        detector.parse_streaming_increment(
-            '<｜DSML｜parameter name="query" string="true">find /tmp',
+        result = detector.parse_streaming_increment(
+            "mp</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
             self.tools,
         )
-        intermediate_args = detector.prev_tool_call_arr[0].get("arguments", "")
-        self.assertIn("find /tmp", intermediate_args)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "find /tmp"})
 
     def test_rstrip_does_not_truncate_opt(self):
-        """Intermediate streaming value ending with 'opt' — 'p','t' in char set."""
+        """Value ending with 'opt' — 'p' and 't' are both in the char set."""
         detector = DeepSeekV4Detector()
         detector.parse_streaming_increment(
-            '<｜DSML｜tool_calls><｜DSML｜invoke name="search">', self.tools
-        )
-        detector.parse_streaming_increment(
-            '<｜DSML｜parameter name="query" string="true">ls /opt',
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="search">'
+            '<｜DSML｜parameter name="query" string="true">ls /o',
             self.tools,
         )
-        intermediate_args = detector.prev_tool_call_arr[0].get("arguments", "")
-        self.assertIn("ls /opt", intermediate_args)
+        result = detector.parse_streaming_increment(
+            "pt</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+            self.tools,
+        )
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "ls /opt"})
 
     # ------------------------------------------------------------------
     # Bug 3: potentially_dsml trap + missing finish() flush
@@ -2394,14 +2403,21 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         )
         self.assertEqual(r2.normal_text, "Now let me find the file.")
 
-    def test_finish_flushes_trapped_buffer_as_normal_text(self):
-        """finish() clears the buffer at stream end."""
+    def test_finish_clears_trapped_buffer_without_leaking(self):
+        """finish() clears the buffer at stream end. V4 treats the protocol
+        envelope as non-content, so an unterminated one is dropped rather
+        than flushed — the prose before it was already streamed."""
         detector = DeepSeekV4Detector()
-        detector.parse_streaming_increment("response text<｜DSML｜tool", self.tools)
+        first = detector.parse_streaming_increment(
+            "response text<｜DSML｜tool", self.tools
+        )
         detector.parse_streaming_increment("_calls>", self.tools)
         self.assertTrue(hasattr(detector, "finish"))
         result = detector.finish(self.tools)
         self.assertEqual(detector._buffer, "")
+        self.assertEqual(first.normal_text, "response text")
+        self.assertNotIn("｜DSML｜", result.normal_text)
+        self.assertEqual(result.calls, [])
 
     def test_finish_with_clean_buffer_returns_empty(self):
         """finish() on a clean buffer should return empty result."""
@@ -2424,24 +2440,29 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertEqual(result.normal_text, "")
 
     def test_finish_does_not_leak_dsml_tool_calls_tag(self):
-        """finish() must not emit <｜DSML｜tool_calls> as normal_text."""
+        """finish() must not emit <｜DSML｜tool_calls> as normal_text; the
+        prose preceding it is streamed as it arrives."""
         detector = DeepSeekV4Detector()
-        detector.parse_streaming_increment(
+        streamed = detector.parse_streaming_increment(
             "Let me find the file.<｜DSML｜tool_calls>", self.tools
         )
         result = detector.finish(self.tools)
-        self.assertIn("Let me find the file.", result.normal_text)
+        self.assertEqual(streamed.normal_text, "Let me find the file.")
         self.assertNotIn("｜DSML｜", result.normal_text)
+        self.assertNotIn("｜DSML｜", streamed.normal_text)
+        self.assertEqual(result.calls, [])
 
     def test_finish_does_not_leak_partial_invoke_tag(self):
         """finish() must not emit <｜DSML｜invoke...> as normal_text."""
         detector = DeepSeekV4Detector()
-        detector.parse_streaming_increment(
+        streamed = detector.parse_streaming_increment(
             'response text<｜DSML｜tool_calls><｜DSML｜invoke name="search"', self.tools
         )
         result = detector.finish(self.tools)
-        self.assertIn("response text", result.normal_text)
+        self.assertEqual(streamed.normal_text, "response text")
         self.assertNotIn("｜DSML｜", result.normal_text)
+        self.assertNotIn("｜DSML｜", streamed.normal_text)
+        self.assertEqual(result.calls, [])
 
     def test_chunk_boundary_on_tool_calls_tag_does_not_leak(self):
         """<｜DSML｜tool_calls> split across chunks must not leak the DSML

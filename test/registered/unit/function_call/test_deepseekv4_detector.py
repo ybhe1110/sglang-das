@@ -83,8 +83,8 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertNotIn(DSML, normal)
 
-    def test_malformed_partial_json_falls_back_to_raw_value(self):
-        """A partial non-string parameter must not escape as MalformedJSON."""
+    def test_incomplete_call_is_not_published(self):
+        """A truncated call must not publish its name or partial arguments."""
         detector = DeepSeekV4Detector()
         result = detector.parse_streaming_increment(
             f'<{DSML}tool_calls>\n<{DSML}invoke name="get_weather">\n'
@@ -92,7 +92,37 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             self.tools,
         )
 
-        self.assertEqual([c.name for c in result.calls if c.name], ["get_weather"])
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(detector.finish(self.tools).calls, [])
+
+    def test_complete_call_is_published_atomically(self):
+        detector = DeepSeekV4Detector()
+        text = _weather_call()
+        split = text.index("SF")
+
+        first = detector.parse_streaming_increment(text[:split], self.tools)
+        second = detector.parse_streaming_increment(text[split:], self.tools)
+
+        self.assertEqual(first.calls, [])
+        self.assertEqual(len(second.calls), 1)
+        self.assertEqual(second.calls[0].name, "get_weather")
+
+    def test_malformed_complete_dsml_does_not_leak(self):
+        text = _wrapped(_invoke("get_weather", "{bad}"))
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+        self.assertNotIn(DSML, result.normal_text)
+
+    def test_partial_marker_at_end_does_not_leak(self):
+        text = f"safe text\n\n<{DSML}tool_c"
+        detector = DeepSeekV4Detector()
+
+        self.assertTrue(detector.has_tool_call(text))
+        result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "safe text")
+        self.assertEqual(result.calls, [])
 
     def test_non_streaming_parses_every_tool_calls_section(self):
         """A turn with two tool_calls sections must yield both calls."""
@@ -103,10 +133,14 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         self.assertEqual(len(result.calls), 2)
 
     def test_parse_error_neither_swallows_nor_duplicates(self):
-        """An unexpected parse error must retain the buffer for retry; only
-        the preamble (text before the first DSML tag) is emitted as
-        normal_text so the tool-call text is neither swallowed permanently
-        nor duplicated across deltas."""
+        """A parse failure must not leak the protocol buffer as normal_text,
+        must not publish an argument-less named call, and must not leave the
+        call stranded: the client sees exactly one well-formed call.
+
+        The complete-envelope gate means the parser is only reached once the
+        closing DSML tag has arrived, so the injected failure lands on a full
+        transaction. V4 drops that transaction rather than exposing it, which
+        is the same boundary the truncated-stream case covers."""
         detector = DeepSeekV4Detector()
 
         with patch.object(
@@ -115,18 +149,18 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             side_effect=RuntimeError("boom"),
         ):
             first = detector.parse_streaming_increment(_weather_call(), self.tools)
-            # Buffer is retained for retry — NOT cleared
-            self.assertNotEqual(detector._buffer, "")
+            # Nothing escapes to the client on the failure path.
+            self.assertEqual(first.calls, [])
+            self.assertEqual(first.normal_text, "")
+            self.assertNotIn("get_weather", first.normal_text)
+            self.assertNotIn(DSML, first.normal_text)
 
-        # Mock removed — the retained buffer should now parse successfully
-        # on the next delta, proving the retry works.
+        # Mock removed — the next delta is clean, and must not resurrect the
+        # failed transaction as text or as a duplicate call.
         second = detector.parse_streaming_increment(" tail", self.tools)
-
-        # _weather_call() has no preamble, so first.normal_text is empty.
-        self.assertEqual(first.calls, [])
-        # The tool call is emitted as a call, NOT as normal_text
         self.assertNotIn("get_weather", second.normal_text)
-        self.assertTrue(any(c.name == "get_weather" for c in second.calls))
+        self.assertNotIn(DSML, second.normal_text)
+        self.assertEqual(second.calls, [])
 
 
 if __name__ == "__main__":
