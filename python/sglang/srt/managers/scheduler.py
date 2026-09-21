@@ -4264,6 +4264,14 @@ class Scheduler(
         candidates = list(batch.reqs)
         if self.running_batch is not None and not self.running_batch.is_empty():
             candidates.extend(self.running_batch.reqs)
+        # Between chunks a chunked-prefill request lives only in chunked_req:
+        # it is never merged into running_batch, and its next chunk can stall
+        # indefinitely (e.g. on pages held by the very chain it locks), so
+        # neither list nor the one-step deferral below can reach it. The
+        # membership check keeps the loop single-visit when the processed
+        # batch already carries its chunk.
+        if self.chunked_req is not None and self.chunked_req not in candidates:
+            candidates.append(self.chunked_req)
         for req in candidates:
             if req.rid in failed:
                 failed.discard(req.rid)
