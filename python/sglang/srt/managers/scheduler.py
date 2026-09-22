@@ -1202,6 +1202,10 @@ class Scheduler(
         # Failed external-linker rids that matched no scheduled request on the
         # pass that drained them; retried once, see _mark_failed_linker_loads.
         self._deferred_linker_rids: Set[str] = set()
+        # Track requests marked for external KV abort and cleanup to ensure
+        # proper lifecycle and prevent duplicate releases.
+        self._external_kv_abort_rids: Set[str] = set()
+        self._external_kv_cleanup_rids: Set[str] = set()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -3158,8 +3162,13 @@ class Scheduler(
         if req is None:
             return
         if self.chunked_req is not req:
-            # Already past chunked prefill; the running-batch abort path handles
-            # it. Drop the marker once the request is actually gone.
+            # Already past chunked prefill; check if still needs abort handling.
+            # If the request is still in external KV abort state, it might be in
+            # inflight or result queues and will be handled there.
+            if req.rid in self._external_kv_abort_rids:
+                return
+
+            # Drop the marker once the request is actually gone
             if req.finished() or req.req_pool_idx is None:
                 self._pending_chunked_abort_req = None
             return
@@ -3180,7 +3189,13 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+
+        # Ensure idempotent KV release
+        if req.rid not in self._external_kv_cleanup_rids:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            self._external_kv_cleanup_rids.add(req.rid)
+
+        self._external_kv_abort_rids.discard(req.rid)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -4240,6 +4255,55 @@ class Scheduler(
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
 
+    def _iter_external_linker_candidates(self, batch: ScheduleBatch):
+        """Yield all requests that might hold references to external linker loads.
+
+        This includes not just the current batch and running batch, but also:
+        - chunked_req (between chunks)
+        - disagg_prefill_inflight_queue (mid-transfer)
+        - waiting_queue (not yet scheduled)
+        - disagg_prefill_bootstrap_queue (bootstrapping)
+        - result_queue (under overlap, not yet processed)
+
+        The original code only checked batch.reqs, running_batch.reqs, and chunked_req,
+        missing owners in other queues. This caused pool leaks when a failed linker
+        load's second owner was in one of those locations.
+        """
+        groups = [batch.reqs]
+
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            groups.append(self.running_batch.reqs)
+
+        if self.chunked_req is not None:
+            groups.append([self.chunked_req])
+
+        # Critical additions: requests can also live in these queues
+        if hasattr(self, "disagg_prefill_inflight_queue") and self.disagg_prefill_inflight_queue:
+            groups.append(self.disagg_prefill_inflight_queue)
+
+        if hasattr(self, "waiting_queue") and self.waiting_queue:
+            groups.append(self.waiting_queue)
+
+        # Bootstrap queue access depends on implementation
+        if hasattr(self, "disagg_prefill_bootstrap_queue") and self.disagg_prefill_bootstrap_queue is not None:
+            bootstrap_queue = getattr(self.disagg_prefill_bootstrap_queue, "queue", None)
+            if bootstrap_queue is not None:
+                groups.append(list(bootstrap_queue))
+
+        # Under overlap, unprocessed batches in result_queue also hold requests
+        if hasattr(self, "result_queue") and self.result_queue:
+            for queued_batch, _ in self.result_queue:
+                groups.append(queued_batch.reqs)
+
+        # Deduplicate: a request can appear in multiple groups
+        seen = set()
+        for reqs in groups:
+            for req in reqs:
+                if req.rid in seen:
+                    continue
+                seen.add(req.rid)
+                yield req
+
     def _mark_failed_linker_loads(self, batch: ScheduleBatch) -> None:
         """Mark requests whose external-linker KV load failed for this batch.
 
@@ -4259,47 +4323,50 @@ class Scheduler(
         if not failed and not sweep_chains:
             return
         message = "Aborted: external KV cache load failed."
-        # The MIN-reduced verdict can arrive a batch late on a lagging rank,
-        # by which point the request is already decoding. Sweep both lists.
-        candidates = list(batch.reqs)
-        if self.running_batch is not None and not self.running_batch.is_empty():
-            candidates.extend(self.running_batch.reqs)
-        # Between chunks a chunked-prefill request lives only in chunked_req:
-        # it is never merged into running_batch, and its next chunk can stall
-        # indefinitely (e.g. on pages held by the very chain it locks), so
-        # neither list nor the one-step deferral below can reach it. The
-        # membership check keeps the loop single-visit when the processed
-        # batch already carries its chunk.
-        if self.chunked_req is not None and self.chunked_req not in candidates:
-            candidates.append(self.chunked_req)
+        # Collect candidates from all possible request holding locations
+        candidates = list(self._iter_external_linker_candidates(batch))
+
+        handled_rids = set()
+
         for req in candidates:
-            if req.rid in failed:
-                failed.discard(req.rid)
-            elif not (
+            rid_match = req.rid in failed
+            chain_match = (
                 sweep_chains
                 and self.tree_cache.is_on_failed_linker_chain(
                     getattr(req, "last_node", None)
                 )
-            ):
-                continue
-            if req.finished() or req.to_finish is not None:
-                continue
-            # Never finished_reason here: a request finished ahead of the
-            # result processors is skipped by all of them, so it would leak its
-            # KV and never answer. update_finish_state promotes it instead.
-            req.skip_radix_cache_insert = True
-            req.to_finish = FINISH_ABORT(
-                message,
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
             )
-            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
-            self._release_aborted_request(req.rid)
+
+            if not rid_match and not chain_match:
+                continue
+
+            # Already in cleanup phase - don't duplicate release
+            if req.rid in self._external_kv_cleanup_rids:
+                handled_rids.add(req.rid)
+                continue
+
+            # Only mark for abort if not already finishing
+            if req.to_finish is None and not req.finished():
+                req.skip_radix_cache_insert = True
+                req.to_finish = FINISH_ABORT(
+                    message,
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+                )
+                req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+
+            self._external_kv_abort_rids.add(req.rid)
+            handled_rids.add(req.rid)
+
             if req is self.chunked_req:
                 # A mid-chunk request never reaches update_finish_state, and
                 # freeing it here would leave self.chunked_req pointing at a
                 # freed request for the next step to stash and re-prefill.
                 self._pending_chunked_abort_req = req
+
+        # Only remove rids that were actually handled from the failed set
+        failed -= handled_rids
+
         if not failed:
             return
         # Under overlap the next batch is launched but not yet merged into
@@ -4479,6 +4546,10 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+
+                # Retry reclaiming stranded failed linker chains periodically
+                if self.enable_unified_cache_external_linker:
+                    self.tree_cache.retry_stranded_failed_linker_chains()
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0

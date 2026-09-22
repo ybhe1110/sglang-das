@@ -1747,6 +1747,57 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            # Check if this request was marked for external KV abort
+            external_abort_pending = (
+                req.rid in self._external_kv_abort_rids
+                or req.to_finish is not None
+                or isinstance(req.finished_reason, FINISH_ABORT)
+            )
+
+            if external_abort_pending:
+                # Promote to_finish to finished_reason
+                if req.to_finish is not None:
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
+
+                # Stop the sender first
+                if req.disagg_kv_sender is not None:
+                    try:
+                        req.disagg_kv_sender.abort()
+                    except Exception:
+                        logger.exception(
+                            "Failed to abort disagg sender for external KV failure: %s",
+                            req.rid,
+                        )
+
+                # If sender is not yet terminal, keep in queue for next poll
+                if (
+                    not req.pending_bootstrap
+                    and poll not in (KVPoll.Success, KVPoll.Failed)
+                ):
+                    undone_reqs.append(req)
+                    continue
+
+                # Sender has stopped; clean up resources
+                self.clear_pending_chunk_send(req)
+                maybe_release_metadata_buffer(
+                    req,
+                    self.req_to_metadata_buffer_idx_allocator,
+                    getattr(
+                        getattr(self, "disagg_metadata_buffers", None),
+                        "pd_hidden_pool",
+                        None,
+                    ),
+                )
+
+                # Release KV cache idempotently
+                if req.rid not in self._external_kv_cleanup_rids:
+                    release_kv_cache(req, self.tree_cache)
+                    self._external_kv_cleanup_rids.add(req.rid)
+
+                done_reqs.append(req)
+                continue
+
             if transfer_status is not None:
                 consensus_failed = req.rid in failed_rids
                 failure_pending = isinstance(req.finished_reason, FINISH_ABORT)

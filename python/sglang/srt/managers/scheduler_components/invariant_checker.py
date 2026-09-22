@@ -129,10 +129,47 @@ class SchedulerInvariantChecker:
             # leave a small page-level slack even when all pages are owned by
             # either the allocator or the prefix cache.
             return False, f"{msg}, dcp_physical_page_slack_allowed=True"
+
+        # Add diagnostic information for Full pool leak debugging
+        if leak:
+            accounted = (
+                ps.full_available_size
+                + full_evictable_size
+                + protected
+                + session_held
+                + uncached
+            )
+            delta = accounted - total
+            failed_chains_count = len(getattr(
+                getattr(self.tree_cache, "linker", None), "failed_chains", {}
+            ))
+            stranded_nodes_count = len(getattr(
+                self.tree_cache, "_stranded_linker_nodes", []
+            ))
+            inflight_reqs_count = len(getattr(
+                self.scheduler, "disagg_prefill_inflight_queue", []
+            ))
+            logger.error(
+                "Pool invariant detail: pool=full total=%d accounted=%d delta=%d "
+                "available=%d evictable=%d protected=%d session_held=%d uncached=%d "
+                "failed_chains=%d stranded_nodes=%d inflight_reqs=%d",
+                total,
+                accounted,
+                delta,
+                ps.full_available_size,
+                full_evictable_size,
+                protected,
+                session_held,
+                uncached,
+                failed_chains_count,
+                stranded_nodes_count,
+                inflight_reqs_count,
+            )
+
         return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
-        return self._check_pool_invariant(
+        leak, msg = self._check_pool_invariant(
             "swa",
             ps.swa_available_size,
             ps.swa_evictable_size,
@@ -141,6 +178,44 @@ class SchedulerInvariantChecker:
             self.swa_tokens_per_layer,
             uncached,
         )
+
+        # Add diagnostic information for SWA pool leak debugging
+        if leak:
+            accounted = (
+                ps.swa_available_size
+                + ps.swa_evictable_size
+                + self.tree_cache.swa_protected_size()
+                + self.pool_stats_observer.session_held_swa_tokens()
+                + uncached
+            )
+            delta = accounted - self.swa_tokens_per_layer
+            failed_chains_count = len(getattr(
+                getattr(self.tree_cache, "linker", None), "failed_chains", {}
+            ))
+            stranded_nodes_count = len(getattr(
+                self.tree_cache, "_stranded_linker_nodes", []
+            ))
+            inflight_reqs_count = len(getattr(
+                self.scheduler, "disagg_prefill_inflight_queue", []
+            ))
+            logger.error(
+                "Pool invariant detail: pool=swa total=%d accounted=%d delta=%d "
+                "available=%d evictable=%d protected=%d session_held=%d uncached=%d "
+                "failed_chains=%d stranded_nodes=%d inflight_reqs=%d",
+                self.swa_tokens_per_layer,
+                accounted,
+                delta,
+                ps.swa_available_size,
+                ps.swa_evictable_size,
+                self.tree_cache.swa_protected_size(),
+                self.pool_stats_observer.session_held_swa_tokens(),
+                uncached,
+                failed_chains_count,
+                stranded_nodes_count,
+                inflight_reqs_count,
+            )
+
+        return leak, msg
 
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
         ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
