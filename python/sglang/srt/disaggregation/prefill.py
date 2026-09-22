@@ -1748,11 +1748,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             # Check if this request was marked for external KV abort
-            external_abort_pending = (
-                req.rid in self._external_kv_abort_rids
-                or req.to_finish is not None
-                or isinstance(req.finished_reason, FINISH_ABORT)
-            )
+            external_abort_pending = req.rid in self._external_kv_abort_rids
 
             if external_abort_pending:
                 # Promote to_finish to finished_reason
@@ -1794,6 +1790,10 @@ class SchedulerDisaggregationPrefillMixin:
                 if req.rid not in self._external_kv_cleanup_rids:
                     release_kv_cache(req, self.tree_cache)
                     self._external_kv_cleanup_rids.add(req.rid)
+
+                self._external_kv_abort_rids.discard(req.rid)
+                if self._pending_chunked_abort_req is req:
+                    self._pending_chunked_abort_req = None
 
                 done_reqs.append(req)
                 continue
@@ -1904,6 +1904,8 @@ class SchedulerDisaggregationPrefillMixin:
             )
 
         self.disagg_prefill_inflight_queue = undone_reqs
+        if getattr(self, "enable_unified_cache_external_linker", False):
+            self.tree_cache.retry_stranded_failed_linker_chains()
 
         return done_reqs
 
