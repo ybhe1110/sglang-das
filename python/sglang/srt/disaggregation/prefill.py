@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_req_state as pd_hidden_state,
 )
 from sglang.srt.disaggregation.utils import (
+    EXTERNAL_KV_LOAD_ERR_TYPE,
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     KVClassType,
@@ -1504,6 +1505,93 @@ class SchedulerDisaggregationPrefillMixin:
         )
         return True
 
+    def abort_external_kv_request(
+        self: Scheduler,
+        req: Req,
+        *,
+        forward_drained: bool,
+        sender_terminal: bool,
+        abort_message: str = "External KV load failed",
+        is_insert: bool = False,
+        emit_response: bool = False,
+    ) -> bool:
+        if req.external_kv_cleanup_done:
+            return True
+
+        try:
+            if not req.external_kv_abort_requested:
+                req.skip_radix_cache_insert = True
+                if req.to_finish is None and req.finished_reason is None:
+                    req.to_finish = FINISH_ABORT(
+                        message=abort_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+                    )
+                req.external_kv_abort_requested = True
+                self._external_kv_abort_rids.add(req.rid)
+
+            if not req.external_kv_pending_chunk_cleared:
+                self.clear_pending_chunk_send(req)
+                req.external_kv_pending_chunk_cleared = True
+
+            if not req.external_kv_linker_released:
+                self._release_aborted_request(req.rid)
+                req.external_kv_linker_released = True
+
+            sender = req.disagg_kv_sender
+            if sender is None:
+                req.external_kv_sender_abort_requested = True
+            elif not req.external_kv_sender_abort_requested:
+                sender.abort()
+                req.external_kv_sender_abort_requested = True
+
+            if not forward_drained or not sender_terminal:
+                return False
+
+            if not req.external_kv_finish_state_applied:
+                if req.to_finish is not None:
+                    req.update_finish_state()
+                elif req.finished_reason is None:
+                    req.finished_reason = FINISH_ABORT(
+                        message=abort_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+                    )
+                req.external_kv_finish_state_applied = True
+
+            if not req.external_kv_metadata_released:
+                maybe_release_metadata_buffer(
+                    req,
+                    self.req_to_metadata_buffer_idx_allocator,
+                    getattr(
+                        getattr(self, "disagg_metadata_buffers", None),
+                        "pd_hidden_pool",
+                        None,
+                    ),
+                )
+                req.external_kv_metadata_released = True
+
+            if not req.external_kv_cache_released:
+                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                req.external_kv_cache_released = True
+
+            if emit_response and not req.external_kv_response_sent:
+                self.output_streamer.stream_output([req], req.return_logprob)
+                req.external_kv_response_sent = True
+
+            self._external_kv_abort_rids.discard(req.rid)
+            self._external_kv_cleanup_rids.discard(req.rid)
+            if getattr(self, "_pending_chunked_abort_req", None) is req:
+                self._pending_chunked_abort_req = None
+            req.external_kv_cleanup_done = True
+            return True
+        except Exception:
+            logger.exception(
+                "External KV abort cleanup failed for request %s; cleanup will be retried",
+                req.rid,
+            )
+            return False
+
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -1580,17 +1668,32 @@ class SchedulerDisaggregationPrefillMixin:
                 # Must precede the is_aborted() drop below, which queues the
                 # request for KV transfer instead of retiring it.
                 if is_external_kv_load_failure(req):
-                    req.update_finish_state()
-                    self.clear_pending_chunk_send(req)
+                    sender_terminal = req.disagg_kv_sender is None
                     if req.disagg_kv_sender is not None:
-                        req.disagg_kv_sender.abort()
-                    maybe_release_metadata_buffer(
-                        req, self.req_to_metadata_buffer_idx_allocator
+                        try:
+                            sender_terminal = req.disagg_kv_sender.poll() in (
+                                KVPoll.Success,
+                                KVPoll.Failed,
+                            )
+                        except Exception:
+                            sender_terminal = False
+                    cleanup_done = self.abort_external_kv_request(
+                        req,
+                        forward_drained=True,
+                        sender_terminal=sender_terminal,
+                        abort_message=getattr(
+                            req.to_finish or req.finished_reason,
+                            "message",
+                            "External KV load failed",
+                        ),
+                        is_insert=False,
+                        emit_response=True,
                     )
                     req.pending_bootstrap = False
-                    release_kv_cache(req, self.tree_cache)
-                    req.time_stats.set_completion_time()
-                    self.output_streamer.stream_output([req], req.return_logprob)
+                    if cleanup_done:
+                        req.time_stats.set_completion_time()
+                    else:
+                        self.disagg_prefill_inflight_queue.append(req)
                     advance_logprob_pt(i, req)
                     continue
 
@@ -1751,51 +1854,23 @@ class SchedulerDisaggregationPrefillMixin:
             external_abort_pending = req.rid in self._external_kv_abort_rids
 
             if external_abort_pending:
-                # Promote to_finish to finished_reason
-                if req.to_finish is not None:
-                    req.finished_reason = req.to_finish
-                    req.to_finish = None
-
-                # Stop the sender first
-                if req.disagg_kv_sender is not None:
-                    try:
-                        req.disagg_kv_sender.abort()
-                    except Exception:
-                        logger.exception(
-                            "Failed to abort disagg sender for external KV failure: %s",
-                            req.rid,
-                        )
-
-                # If sender is not yet terminal, keep in queue for next poll
-                if (
-                    not req.pending_bootstrap
-                    and poll not in (KVPoll.Success, KVPoll.Failed)
-                ):
-                    undone_reqs.append(req)
-                    continue
-
-                # Sender has stopped; clean up resources
-                self.clear_pending_chunk_send(req)
-                maybe_release_metadata_buffer(
-                    req,
-                    self.req_to_metadata_buffer_idx_allocator,
-                    getattr(
-                        getattr(self, "disagg_metadata_buffers", None),
-                        "pd_hidden_pool",
-                        None,
-                    ),
+                sender_terminal = poll in (KVPoll.Success, KVPoll.Failed)
+                reason = req.to_finish or req.finished_reason
+                error_message = getattr(
+                    reason, "message", "External KV load failed"
                 )
-
-                # Release KV cache idempotently
-                if req.rid not in self._external_kv_cleanup_rids:
-                    release_kv_cache(req, self.tree_cache)
-                    self._external_kv_cleanup_rids.add(req.rid)
-
-                self._external_kv_abort_rids.discard(req.rid)
-                if self._pending_chunked_abort_req is req:
-                    self._pending_chunked_abort_req = None
-
-                done_reqs.append(req)
+                cleanup_done = self.abort_external_kv_request(
+                    req,
+                    forward_drained=True,
+                    sender_terminal=sender_terminal,
+                    abort_message=error_message,
+                    is_insert=False,
+                    emit_response=False,
+                )
+                if cleanup_done:
+                    done_reqs.append(req)
+                else:
+                    undone_reqs.append(req)
                 continue
 
             if transfer_status is not None:
@@ -1975,7 +2050,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
-        self.clear_pending_chunk_send(req)
         error_message = (
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -1986,31 +2060,46 @@ class SchedulerDisaggregationPrefillMixin:
         except Exception as e:
             error_message += f" with exception {e}"
             is_propagated = getattr(e, "is_from_another_rank", False)
-        # Mute error message for propagated exceptions to avoid duplicate logging
         if is_propagated:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if (
-            req.req_pool_idx is not None
-            or req.kv is not None
-            or req.mamba_pool_idx is not None
-        ):
-            release_kv_cache(req, self.tree_cache)
-        maybe_release_metadata_buffer(
-            req,
-            self.req_to_metadata_buffer_idx_allocator,
-            getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None),
-        )
         req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-        self.output_streamer.stream_output([req], req.return_logprob)
+
+        if req.external_kv_abort_requested or is_external_kv_load_failure(req):
+            cleanup_done = self.abort_external_kv_request(
+                req,
+                forward_drained=True,
+                sender_terminal=True,
+                abort_message=error_message,
+                is_insert=False,
+                emit_response=True,
+            )
+            if not cleanup_done:
+                self._external_kv_abort_rids.add(req.rid)
+        else:
+            self.clear_pending_chunk_send(req)
+            if req.disagg_kv_sender is not None:
+                req.disagg_kv_sender.abort()
+            if (
+                req.req_pool_idx is not None
+                or req.kv is not None
+                or req.mamba_pool_idx is not None
+            ):
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            maybe_release_metadata_buffer(
+                req,
+                self.req_to_metadata_buffer_idx_allocator,
+                getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None),
+            )
+            prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.output_streamer.stream_output([req], req.return_logprob)
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
-
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
         if poll == KVPoll.Failed:

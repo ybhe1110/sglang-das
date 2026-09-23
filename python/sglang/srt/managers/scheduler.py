@@ -78,6 +78,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -93,7 +94,6 @@ from sglang.srt.disaggregation.prefill import (
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
-    EXTERNAL_KV_LOAD_ERR_TYPE,
     DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -3161,16 +3161,59 @@ class Scheduler(
         req = self._pending_chunked_abort_req
         if req is None:
             return
-        if self.chunked_req is not req:
+        if (
+            self.chunked_req is not req
+            and not req.external_kv_abort_requested
+        ):
             # Already past chunked prefill; check if still needs abort handling.
             # If the request is still in external KV abort state, it might be in
             # inflight or result queues and will be handled there.
-            if req.rid in self._external_kv_abort_rids:
+            if (
+                req.rid in self._external_kv_abort_rids
+                and not req.external_kv_abort_requested
+            ):
                 return
 
             # Drop the marker once the request is actually gone
             if req.finished() or req.req_pool_idx is None:
                 self._pending_chunked_abort_req = None
+            return
+
+        if req.external_kv_abort_requested or req.rid in self._external_kv_abort_rids:
+            if self.chunked_req is req:
+                self.chunked_req = None
+            sender_terminal = req.disagg_kv_sender is None
+            if req.disagg_kv_sender is not None:
+                try:
+                    sender_terminal = req.disagg_kv_sender.poll() in (
+                        KVPoll.Success,
+                        KVPoll.Failed,
+                    )
+                except Exception:
+                    sender_terminal = False
+            cleanup_done = self.abort_external_kv_request(
+                req,
+                forward_drained=req.inflight_middle_chunks <= 0,
+                sender_terminal=sender_terminal,
+                abort_message=getattr(
+                    req.to_finish or req.finished_reason,
+                    "message",
+                    "External KV load failed",
+                ),
+                is_insert=False,
+                emit_response=False,
+            )
+            if not cleanup_done:
+                return
+            self._pending_chunked_abort_req = None
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(
+                    rid=req.rid,
+                    finished_reason=req.finished_reason.to_json(),
+                ),
+                req,
+            )
+            logger.debug(f"Abort chunked prefill request. {req.rid=}")
             return
 
         # A caller that already staged a reason keeps it: the client needs to
@@ -4345,17 +4388,15 @@ class Scheduler(
                 handled_rids.add(req.rid)
                 continue
 
-            # Only mark for abort if not already finishing
-            if req.to_finish is None and not req.finished():
-                req.skip_radix_cache_insert = True
-                req.to_finish = FINISH_ABORT(
-                    message,
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
-                )
-                req.time_stats.trace_ctx.abort(abort_info={"reason": message})
-
-            self._external_kv_abort_rids.add(req.rid)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            self.abort_external_kv_request(
+                req,
+                forward_drained=False,
+                sender_terminal=False,
+                abort_message=message,
+                is_insert=False,
+                emit_response=False,
+            )
             handled_rids.add(req.rid)
 
             if req is self.chunked_req:

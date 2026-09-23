@@ -977,6 +977,19 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+
+        # External KV abort cleanup state. Each action is independently
+        # retryable so a request can move between scheduler queues without
+        # losing progress when an asynchronous cleanup step fails.
+        self.external_kv_abort_requested = False
+        self.external_kv_pending_chunk_cleared = False
+        self.external_kv_linker_released = False
+        self.external_kv_sender_abort_requested = False
+        self.external_kv_metadata_released = False
+        self.external_kv_cache_released = False
+        self.external_kv_finish_state_applied = False
+        self.external_kv_response_sent = False
+        self.external_kv_cleanup_done = False
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
