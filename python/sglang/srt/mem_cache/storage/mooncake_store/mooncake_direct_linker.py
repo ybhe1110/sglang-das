@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LayerWiseLoadCounter,
     UnifiedCacheLinker,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -62,75 +63,7 @@ def _storage_suffix(
     return "_".join(parts)
 
 
-class LayerWiseLoadCounter:
-    """CPU completion counter compatible with KV pools' layer wait hook."""
-
-    def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        self.producer_index = -1
-        self.consumer_index = -1
-        self.futures: dict[int, list[Future]] = {}
-        # Batch indices already logged: one line per failed load, not per layer.
-        self.reported: set[int] = set()
-
-    def update_producer(self) -> int:
-        self.producer_index += 1
-        self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
-        return self.producer_index
-
-    def set_consumer(self, index: int) -> None:
-        self.consumer_index = index
-
-    def complete(self, index: int, layer: int) -> None:
-        self.futures[index][layer].set_result(None)
-
-    def fail(self, index: int, error: BaseException) -> None:
-        # A private copy, because wait_until clears the traceback of what it
-        # catches and the caller still needs its own exception for the
-        # logger.exception() that follows.
-        failure = RuntimeError(f"{type(error).__name__}: {error}")
-        for future in self.futures.get(index, ()):
-            if not future.done():
-                future.set_exception(failure)
-
-    def wait_until(self, threshold: int) -> None:
-        index = self.consumer_index
-        futures = self.futures.get(index)
-        if futures is None:
-            return
-        try:
-            futures[threshold].result()
-        except BaseException as error:
-            # Never raise: this runs inside the model forward, where nothing
-            # catches before the scheduler's top-level handler and the whole
-            # engine goes down. The failure travels out through
-            # pop_completed_load(), which aborts the affected requests.
-            if index not in self.reported:
-                self.reported.add(index)
-                logger.error(
-                    "Mooncake layer-wise KV load failed for batch %d; affected "
-                    "requests will be aborted after this forward: %s",
-                    index,
-                    error,
-                )
-            # Every layer re-raises this same exception object, and each
-            # appended traceback entry roots a frame chain that pins that
-            # layer's activations: +31.9 GiB on one faulted 61-layer forward at
-            # --chunked-prefill-size 2048, until the engine OOMed. Nothing
-            # reads the traceback.
-            error.__traceback__ = None
-        finally:
-            if threshold == self.num_layers - 1:
-                self.futures.pop(index, None)
-                self.reported.discard(index)
-
-    def reset(self) -> None:
-        self.producer_index = -1
-        self.consumer_index = -1
-        self.futures.clear()
-        self.reported.clear()
-
-
+ 
 class ReadPlanLoadCounter:
     """Publish one Mooncake ReadPlan; wait for each layer without holding the GIL."""
 

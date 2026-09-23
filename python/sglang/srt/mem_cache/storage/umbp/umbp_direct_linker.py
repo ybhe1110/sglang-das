@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -25,7 +24,10 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
 )
-from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LayerWiseLoadCounter,
+    UnifiedCacheLinker,
+)
 from sglang.srt.runtime_context import get_memory, get_model
 from sglang.srt.utils import freeze_gc, get_device_module
 
@@ -64,75 +66,7 @@ def _ordered_layers(entry) -> list[int]:
     return [by_buffer[index] for index in range(pool_layer_count)]
 
 
-class LayerWiseLoadCounter:
-    """CPU completion counter compatible with KV pools' layer wait hook."""
-
-    def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        self._producer_index = -1
-        self.consumer_index = -1
-        self._futures: dict[int, list[Future]] = {}
-        # Batch indices already logged: one line per failed load, not per layer.
-        self._reported: set[int] = set()
-
-    def update_producer(self) -> int:
-        self._producer_index += 1
-        self._futures[self._producer_index] = [Future() for _ in range(self.num_layers)]
-        return self._producer_index
-
-    def set_consumer(self, index: int) -> None:
-        self.consumer_index = index
-
-    def complete(self, index: int, layer: int) -> None:
-        self._futures[index][layer].set_result(None)
-
-    def fail(self, index: int, error: BaseException) -> None:
-        # A private copy, because wait_until clears the traceback of what it
-        # catches and the caller still needs its own exception for the
-        # logger.exception() that follows.
-        failure = RuntimeError(f"{type(error).__name__}: {error}")
-        for future in self._futures.get(index, ()):
-            if not future.done():
-                future.set_exception(failure)
-
-    def wait_until(self, threshold: int) -> None:
-        index = self.consumer_index
-        futures = self._futures.get(index)
-        if futures is None:
-            return
-        try:
-            futures[threshold].result()
-        except BaseException as error:
-            # Never raise: this runs inside the model forward, where nothing
-            # catches before the scheduler's top-level handler and the whole
-            # engine goes down. The failure travels out through
-            # pop_completed_load(), which aborts the affected requests.
-            if index not in self._reported:
-                self._reported.add(index)
-                logger.error(
-                    "UMBP layer-wise KV load failed for batch %d; affected "
-                    "requests will be aborted after this forward: %s",
-                    index,
-                    error,
-                )
-            # Every layer re-raises this same exception object, and each
-            # appended traceback entry roots a frame chain that pins that
-            # layer's activations: +31.9 GiB on one faulted 61-layer forward at
-            # --chunked-prefill-size 2048, until the engine OOMed. Nothing
-            # reads the traceback.
-            error.__traceback__ = None
-        finally:
-            if threshold == self.num_layers - 1:
-                self._futures.pop(index, None)
-                self._reported.discard(index)
-
-    def reset(self) -> None:
-        self._producer_index = -1
-        self.consumer_index = -1
-        self._futures.clear()
-        self._reported.clear()
-
-
+ 
 @dataclass
 class _PoolRangePlan:
     """Object keys and locations for one pool load."""
