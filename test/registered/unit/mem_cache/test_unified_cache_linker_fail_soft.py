@@ -7,20 +7,16 @@ miss (re-prefill) instead of committing device slots to an async
 layer-wise session that would fail fatally.
 
 The fakes here are built against this branch's signatures: the linker ABC
-requires ``pop_completed_offload`` (take/commit_completed_offloads live on
-the wrapper, not the backend), ``_update_load`` reads ``component_type``
-on the COMMIT path, and ``load_back`` calls
-``tree_core.collect_full_device_indices`` and then walks ``node.parent``
-up to the request's pre-load node.
+requires ``finish_layer_wise_loading`` and ``pop_completed_offload``
+(take/commit_completed_offloads live on the wrapper, not the backend), and
+``load_back`` loads into request-owned slots without touching the tree.
 """
 
-from array import array
 from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     ExternalLinkerLoadPhase,
@@ -42,7 +38,6 @@ class _FakeLinkerBase(UnifiedCacheLinker):
     def __init__(self):
         self.layer_done_counter = object()
         self.queued_loads = {}
-        self.completed_loads = []
         self.completed_offloads = []
         self.queued_offloads = []
         self.reset_count = 0
@@ -61,11 +56,8 @@ class _FakeLinkerBase(UnifiedCacheLinker):
     def cancel_queued_load(self, rid):
         return self.queued_loads.pop(rid, None) is not None
 
-    def num_completed_loads(self):
-        return len(self.completed_loads)
-
-    def pop_completed_load(self):
-        return self.completed_loads.pop(0)
+    def finish_layer_wise_loading(self, counter_index):
+        return True
 
     def offload(self, transfers):
         self.queued_offloads.append(list(transfers))
@@ -175,7 +167,6 @@ def _cache_for_load_back(component, empty_indices):
 
 def _hit_marker():
     return ExternalCacheHitMarker(
-        prefix_key=RadixKey(array("q", range(4))),
         tail_hashes=["k0", "k1"],
         device_hit_len=2,
     )
@@ -224,14 +215,12 @@ def test_revalidation_success_proceeds_to_prepare_and_load():
 
     (indices, last_node), _, component = _load_back(wrapper, component)
 
-    # The load proceeds: slots committed and the async load queued.
-    assert component.phases == [
-        ExternalLinkerLoadPhase.PREPARE,
-        ExternalLinkerLoadPhase.COMMIT,
-    ]
+    # The load proceeds into request-owned slots; the tree is not touched.
+    assert component.phases == [ExternalLinkerLoadPhase.PREPARE]
     assert "rid" in linker.queued_loads
-    assert len(indices) == 2  # device prefix + loaded tail pages
-    assert last_node == 9
+    assert wrapper.inflight_load_rids == ["rid"]
+    assert len(indices) == 2  # loaded tail pages
+    assert last_node == 5
 
 
 def test_backend_without_revalidation_keeps_legacy_path():
@@ -247,7 +236,4 @@ def test_backend_without_revalidation_keeps_legacy_path():
     (indices, last_node), _, component = _load_back(wrapper, component)
 
     assert "rid" in linker.queued_loads
-    assert component.phases == [
-        ExternalLinkerLoadPhase.PREPARE,
-        ExternalLinkerLoadPhase.COMMIT,
-    ]
+    assert component.phases == [ExternalLinkerLoadPhase.PREPARE]

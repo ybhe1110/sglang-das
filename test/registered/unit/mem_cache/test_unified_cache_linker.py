@@ -1,14 +1,14 @@
 from array import array
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
-    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LayerWiseLoadCounter,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
@@ -45,7 +46,8 @@ class _FakeLinker(UnifiedCacheLinker):
         self.lookup_calls = []
         self.queued_loads = {}
         self.queued_offloads = []
-        self.completed_loads = []
+        self.load_landed = True
+        self.finished_loads = []
         self.completed_offloads = []
         self.reset_count = 0
         self.closed = False
@@ -61,17 +63,15 @@ class _FakeLinker(UnifiedCacheLinker):
     def start_layer_wise_loading(self):
         return 3
 
+    def finish_layer_wise_loading(self, counter_index):
+        self.finished_loads.append(counter_index)
+        return self.load_landed
+
     def cancel_queued_load(self, rid):
         if rid not in self.queued_loads:
             return False
         del self.queued_loads[rid]
         return True
-
-    def num_completed_loads(self):
-        return len(self.completed_loads)
-
-    def pop_completed_load(self):
-        return self.completed_loads.pop(0)
 
     def offload(self, transfers):
         self.queued_offloads.append(list(transfers))
@@ -261,12 +261,8 @@ def test_pp_load_uses_normal_request_insert_and_release(pp_cache, overlap, outco
     req.set_extend_range(4, 5)
     values = torch.cat([loaded, allocator.alloc(1)])
     cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), values)
-    # Upstream drains with linker.drain_loads(1) and a bare rid list. On this
-    # branch (#38352) that single call is split into take/commit around the
-    # cross-rank MIN reduction, and pop_completed_load carries the verdict, so
-    # a completed batch is (rids, success).
-    backend.completed_loads.append(([req.rid], True))
-    cache.linker.commit_completed_loads(cache.linker.take_completed_loads(1))
+    assert cache.linker.start_layer_wise_loading() == 3
+    assert cache.linker.finish_loads() == []
     assert allocator.full_available_size() == 32 - 5 - overlap
 
     if outcome == "unfinished":
@@ -300,7 +296,7 @@ def test_pp_load_queue_failure_releases_full_and_swa_slots(pp_cache, raises):
     with pytest.raises(RuntimeError):
         cache.linker.load_back(req)
     assert allocator.full_available_size() == allocator.swa_available_size() == 32
-    assert not cache.linker.pending_loads
+    assert not cache.linker.inflight_load_rids
     assert not cache.tree_core.root_node.children
 
 
@@ -324,7 +320,6 @@ def test_async_offload_pins_node_until_completion():
         id=node_id,
         external_cache_stored=False,
         write_through_pending_id=None,
-        detached=False,
     )
     cache = _cache_for_wrapper(
         tree_core=SimpleNamespace(
@@ -354,52 +349,71 @@ def test_async_offload_pins_node_until_completion():
     assert unlocks == [(node_id, lock_params)]
 
 
-def test_async_load_pins_node_until_completion():
-    linker = _FakeLinker()
-    lock_params = object()
-    locks = []
-    unlocks = []
-
-    def inc_lock_ref(node):
-        locks.append(node)
-        return SimpleNamespace(to_dec_params=lambda: lock_params)
-
-    node_id = 7
-    cache = _cache_for_wrapper(
-        inc_lock_ref=inc_lock_ref,
-        dec_lock_ref=lambda node, params: unlocks.append((node, params)),
+def test_layer_counter_reports_failure_after_forward_instead_of_raising():
+    ready = []
+    counter = LayerWiseLoadCounter(
+        2, on_layer_ready=lambda index, layer: ready.append((index, layer))
     )
-    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    failed = counter.update_producer()
+    counter.set_consumer(failed)
+    counter.complete(failed, 0)
+    counter.fail(failed, RuntimeError("storage read failed"))
 
-    wrapper._queue_load("rid", node_id, [object()], anchor=0)
+    counter.wait_until(0)
+    counter.wait_until(1)
 
-    assert locks == [node_id]
-    assert not unlocks
+    # A dedup source still broadcasts the failed layer its peers wait for.
+    assert ready == [(failed, 0), (failed, 1)]
+    assert counter.finish(failed) is False
+    assert counter.finish(failed) is True
 
-    linker.completed_loads.append((["rid"], True))
-    wrapper.commit_completed_loads(wrapper.take_completed_loads(1))
+    landed = counter.update_producer()
+    counter.complete(landed, 0)
+    counter.complete(landed, 1)
+    assert counter.finish(landed) is True
 
-    assert unlocks == [(node_id, lock_params)]
 
+@pytest.mark.parametrize("peer_landed", [True, False], ids=["landed", "peer-failed"])
+@pytest.mark.parametrize("local_landed", [True, False], ids=["local", "local-failed"])
+def test_finish_loads_agrees_on_the_verdict_across_ranks(local_landed, peer_landed):
+    def reduce_with_peer(value, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        value.copy_(torch.minimum(value, torch.tensor([int(peer_landed)])))
 
-def test_release_request_cancels_queued_load():
+    cache = _cache_for_wrapper(_all_reduce_attn_groups=reduce_with_peer)
     linker = _FakeLinker()
-    lock_params = object()
-    unlocks = []
-    cache = _cache_for_wrapper(
-        dec_lock_ref=lambda node, params: unlocks.append((node, params))
-    )
+    linker.load_landed = local_landed
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper.hit_markers["rid"] = object()
-    wrapper.pending_loads["rid"] = (7, lock_params, 0)
-    linker.queued_loads["rid"] = [object()]
+    wrapper.inflight_load_rids = ["a", "b"]
+    assert wrapper.start_layer_wise_loading() == 3
 
-    wrapper.release_request("rid")
+    failed = wrapper.finish_loads()
+
+    assert failed == ([] if local_landed and peer_landed else ["a", "b"])
+    assert linker.finished_loads == [3]
+    assert wrapper.inflight_load_rids == []
+    assert wrapper.inflight_load_index == -1
+
+    # A batch that loaded nothing skips the collective entirely.
+    cache._all_reduce_attn_groups = MagicMock()
+    assert wrapper.finish_loads() == []
+    cache._all_reduce_attn_groups.assert_not_called()
+
+
+def test_release_request_cancels_only_a_queued_load():
+    linker = _FakeLinker()
+    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), linker)
+    wrapper.hit_markers["queued"] = object()
+    wrapper.inflight_load_rids = ["queued", "started"]
+    linker.queued_loads["queued"] = [object()]
+
+    wrapper.release_request("queued")
+    wrapper.release_request("started")
 
     assert wrapper.hit_markers == {}
-    assert wrapper.pending_loads == {}
-    assert "rid" not in linker.queued_loads
-    assert unlocks == [(7, lock_params)]
+    assert "queued" not in linker.queued_loads
+    # A started load keeps writing until finish_loads waits for it.
+    assert wrapper.inflight_load_rids == ["started"]
 
 
 def test_failed_offload_rolls_back_split_fragments():
@@ -414,13 +428,11 @@ def test_failed_offload_rolls_back_split_fragments():
         id=7,
         external_cache_stored=False,
         write_through_pending_id=None,
-        detached=False,
     )
     parent = SimpleNamespace(
         id=8,
         external_cache_stored=False,
         write_through_pending_id=None,
-        detached=False,
     )
     nodes = {child.id: child, parent.id: parent}
 
@@ -477,7 +489,7 @@ def test_split_action_retargets_pending_external_offload():
     ]
 
 
-def test_reset_quiesces_backend_before_releasing_pending_locks():
+def test_reset_quiesces_backend_before_releasing_pending_state():
     class _Component:
         def build_external_linker_transfer(self, phase, node, keys):
             return PoolTransfer(name=PoolName.KV, keys=["page"])
@@ -494,7 +506,6 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
         id=7,
         external_cache_stored=False,
         write_through_pending_id=None,
-        detached=False,
     )
     cache = _cache_for_wrapper(
         tree_core=SimpleNamespace(
@@ -509,19 +520,21 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
         resolve_node_handle=lambda node_id: node,
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper._queue_load("rid", node.id, [object()], anchor=0)
+    wrapper.inflight_load_rids = ["rid"]
+    wrapper.inflight_load_index = 3
     wrapper.offload_nodes([node.id])
 
     wrapper.reset()
 
-    assert events == ["backend", ("unlock", node.id), ("unlock", node.id)]
-    assert wrapper.pending_loads == {}
+    assert events == ["backend", ("unlock", node.id)]
+    assert wrapper.inflight_load_rids == []
+    assert wrapper.inflight_load_index == -1
     assert wrapper.pending_offloads == []
     assert not node.external_cache_stored
     assert node.write_through_pending_id is None
 
 
-def test_close_quiesces_backend_before_releasing_pending_loads():
+def test_close_quiesces_backend_before_releasing_pending_offloads():
     events = []
 
     class _ClosingFakeLinker(_FakeLinker):
@@ -529,33 +542,44 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
             events.append("backend")
             super().close()
 
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            return PoolTransfer(name=PoolName.KV, keys=["page"])
+
     linker = _ClosingFakeLinker()
+    node = SimpleNamespace(
+        id=7,
+        external_cache_stored=False,
+        write_through_pending_id=None,
+    )
     cache = _cache_for_wrapper(
-        dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id))
+        tree_core=SimpleNamespace(
+            enable_external_cache_linker=False,
+            mark_write_through_pending=lambda value: setattr(
+                node, "write_through_pending_id", value
+            ),
+        ),
+        _components_tuple=(_Component(),),
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=object),
+        dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id)),
+        resolve_node_handle=lambda node_id: node,
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper.pending_loads["rid"] = (7, object(), 0)
+    wrapper.inflight_load_rids = ["rid"]
+    wrapper.offload_nodes([node.id])
 
     wrapper.close()
 
-    assert events == ["backend", ("unlock", 7)]
+    assert events == ["backend", ("unlock", node.id)]
     assert linker.closed
-    assert wrapper.pending_loads == {}
+    assert wrapper.inflight_load_rids == []
+    assert wrapper.pending_offloads == []
 
 
 def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-    cache._failed_linker_rids = []
-
-    def commit_loads(successes):
-        committed.append(("load", successes))
-        return []
-
     cache.linker = SimpleNamespace(
-        num_completed_loads=lambda: 1,
-        take_completed_loads=lambda count: [True] * count,
-        commit_completed_loads=commit_loads,
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
@@ -568,7 +592,7 @@ def test_check_hicache_events_commits_common_rank_results():
         assert op == torch.distributed.ReduceOp.MIN
         reduce_calls += 1
         if reduce_calls == 1:
-            value.copy_(torch.tensor([1, 1]))
+            value.copy_(torch.tensor([1]))
         else:
             value.fill_(0)
 
@@ -576,15 +600,23 @@ def test_check_hicache_events_commits_common_rank_results():
 
     cache.check_hicache_events()
 
-    assert committed == [("load", [False]), [False]]
+    assert committed == [[False]]
 
 
-def test_component_commit_keeps_only_adopted_pages():
+def test_component_load_prepare_maps_private_window_and_abort_frees_it():
     mapping = _MappingRecorder()
+    freed = []
     cache = _cache_for_wrapper(
         page_size=2,
+        is_swa_enabled=True,
         token_to_kv_pool_allocator=SimpleNamespace(
-            set_full_to_swa_mapping=mapping.set_full_to_swa_mapping
+            set_full_to_swa_mapping=mapping.set_full_to_swa_mapping,
+            full_attn_allocator=SimpleNamespace(
+                free=lambda indices: freed.append(("full", indices.tolist()))
+            ),
+            swa_attn_allocator=SimpleNamespace(
+                free=lambda indices: freed.append(("swa", indices.tolist()))
+            ),
         ),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
@@ -594,42 +626,40 @@ def test_component_commit_keeps_only_adopted_pages():
     swa_component = SWAComponent.__new__(SWAComponent)
     swa_component.cache = cache
     swa_component.component_type = ComponentType.SWA
+    swa_component.sliding_window_size = 4
     full = PoolTransfer(
         name=PoolName.KV,
         keys=["a", "b", "c", "d"],
         device_indices=torch.tensor([100, 101, 102, 103, 104, 105, 106, 107]),
     )
-    canonical_tail = torch.tensor([10, 11, 102, 103, 14, 15, 106, 107])
     swa = PoolTransfer(
         name=PoolName.SWA,
-        keys=["a", "b", "c", "d"],
-        device_indices=torch.tensor([200, 201, 202, 203, 204, 205, 206, 207]),
+        keys=["c", "d"],
+        device_indices=torch.tensor([200, 201, 202, 203]),
     )
-    insert_result = InsertResult(
-        prefix_len=0,
-        adopted_ranges={
-            ComponentType.FULL: [(2, 4), (6, 8)],
-            ComponentType.SWA: [(2, 4), (6, 8)],
-        },
+    transfers = [(full_component, full), (swa_component, swa)]
+    req = SimpleNamespace(kv=ReqKvInfo())
+
+    prepared = wrapper._update_load(
+        ExternalLinkerLoadPhase.PREPARE, req, transfers, prefix_len=8
     )
 
-    filtered = wrapper._update_load(
-        ExternalLinkerLoadPhase.COMMIT,
-        SimpleNamespace(),
-        [(full_component, full), (swa_component, swa)],
-        prefix_len=8,
-        insert_result=insert_result,
-        canonical_full=canonical_tail,
+    assert prepared == [full, swa]
+    ((mapped_full, mapped_swa),) = mapping.mapping
+    assert mapped_full.tolist() == [104, 105, 106, 107]
+    assert mapped_swa.tolist() == [200, 201, 202, 203]
+    assert req.kv.swa_evicted_seqlen == 4
+    assert freed == []
+
+    aborted = wrapper._update_load(
+        ExternalLinkerLoadPhase.ABORT, req, transfers, prefix_len=8
     )
 
-    assert filtered == [full, swa]
-    assert full.keys == ["b", "d"]
-    assert full.device_indices.tolist() == [102, 103, 106, 107]
-    assert swa.keys == ["b", "d"]
-    assert swa.device_indices.tolist() == [202, 203, 206, 207]
-    mapped_full, mapped_swa = mapping.mapping[0]
-    assert mapped_full.tolist() == [102, 103, 106, 107]
-    assert mapped_swa.tolist() == [202, 203, 206, 207]
+    assert aborted == []
+    assert freed == [
+        ("swa", [200, 201, 202, 203]),
+        ("full", [100, 101, 102, 103, 104, 105, 106, 107]),
+    ]
 
 
 if __name__ == "__main__":

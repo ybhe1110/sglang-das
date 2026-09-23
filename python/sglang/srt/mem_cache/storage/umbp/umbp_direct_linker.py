@@ -21,9 +21,6 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
-    arm_load_failure_injection,
-)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
@@ -66,7 +63,6 @@ def _ordered_layers(entry) -> list[int]:
     return [by_buffer[index] for index in range(pool_layer_count)]
 
 
- 
 @dataclass
 class _PoolRangePlan:
     """Object keys and locations for one pool load."""
@@ -166,7 +162,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         tp_rank = 0
         if distributed:
             tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
-        self.tp_rank = tp_rank
         self.pool_group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
             page_size=self.page_size,
@@ -329,12 +324,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
-        self._load_queue: Queue[
-            tuple[int, list[str], list[_PoolRangePlan], object] | None
-        ] = Queue()
-        # (rids, success) per started load batch. Pushed from a finally so a
-        # failed batch still releases the tree-side locks it pinned.
-        self._completed_loads: Queue[tuple[list[str], bool]] = Queue()
+        self._load_queue: Queue[tuple[int, list[_PoolRangePlan], object] | None] = (
+            Queue()
+        )
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._stats = {
@@ -487,28 +479,21 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        # The tree node is already visible in L1. Dropping its transfer would
-        # leave a device hit pointing at slots that were never populated.
-        return False
+        return self._pending.pop(rid, None) is not None
 
-    def num_completed_loads(self) -> int:
-        # The tree agrees on the drain count across ranks before calling pop.
-        return self._completed_loads.qsize()
-
-    def pop_completed_load(self) -> tuple[list[str], bool]:
-        return self._completed_loads.get_nowait()
+    def finish_layer_wise_loading(self, counter_index: int) -> bool:
+        return self.layer_done_counter.finish(counter_index)
 
     def start_layer_wise_loading(self) -> int:
         if not self._pending:
             return -1
         self._freeze_gc_once()
         pending = self._pending
-        rids = list(pending)
         plans = self._build_load_plans(list(pending.values()))
         ready_event = device_module.Event()
         ready_event.record()
         counter_index = self.layer_done_counter.update_producer()
-        self._load_queue.put((counter_index, rids, plans, ready_event))
+        self._load_queue.put((counter_index, plans, ready_event))
         self._pending = {}
         self._stats["load"] += len(pending)
         return counter_index
@@ -650,16 +635,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, rids, plans, ready_event = task
-                success = False
-                try:
-                    success = self._run_layer_wise_batch(
-                        counter_index, plans, ready_event
-                    )
-                finally:
-                    # In a finally so the tree always gets its batch back and
-                    # can release the node locks the load pinned.
-                    self._completed_loads.put((rids, success))
+                counter_index, plans, ready_event = task
+                self._run_layer_wise_batch(counter_index, plans, ready_event)
             finally:
                 self._load_queue.task_done()
 
@@ -792,8 +769,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
     def _run_layer_wise_batch(
         self, counter_index: int, plans: list[_PoolRangePlan], ready_event: object
-    ) -> bool:
-        maybe_fail = arm_load_failure_injection(self.tp_rank)
+    ) -> None:
         try:
             ready_event.synchronize()
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
@@ -808,15 +784,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         continue
                     ptrs, sizes, offsets = meta
                     step = self._entries_per_call(sizes)
-                    where = (
-                        f"layer={group[0]}"
-                        if len(group) == 1
-                        else f"layers={group[0]}..{group[-1]}"
-                    )
                     for start in range(0, len(plan.keys), step):
                         end = start + step
                         chunk_keys = plan.keys[start:end]
-                        maybe_fail(plan.name, where)
                         results = list(
                             self.storage.client.batch_get_ranges_into_ptr(
                                 chunk_keys,
@@ -826,6 +796,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                             )
                         )
                         if len(results) != len(chunk_keys) or not all(results):
+                            where = (
+                                f"layer={group[0]}"
+                                if len(group) == 1
+                                else f"layers={group[0]}..{group[-1]}"
+                            )
                             raise RuntimeError(
                                 f"UMBP get failed for pool={plan.name}, {where}: "
                                 f"success={sum(bool(value) for value in results)}/"
@@ -836,11 +811,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 # granularity for fewer times each object is named on the wire.
                 for logical_layer in group:
                     self.layer_done_counter.complete(counter_index, logical_layer)
-            return True
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("UMBP layer-wise load batch failed")
-            return False
 
     def _layer_groups(self) -> list[list[int]]:
         return [
@@ -992,12 +965,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._pending.clear()
         self._load_queue.join()
         self._offload_queue.join()
-        for queue in (self._offload_results, self._completed_loads):
-            while True:
-                try:
-                    queue.get_nowait()
-                except Empty:
-                    break
+        while True:
+            try:
+                self._offload_results.get_nowait()
+            except Empty:
+                break
         self.layer_done_counter.reset()
 
     def close(self) -> None:
