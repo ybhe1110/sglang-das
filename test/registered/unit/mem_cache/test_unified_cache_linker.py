@@ -293,8 +293,14 @@ def test_pp_load_queue_failure_releases_full_and_swa_slots(pp_cache, raises):
         return False
 
     backend.load = fail_load
-    with pytest.raises(RuntimeError):
-        cache.linker.load_back(req)
+    if raises:
+        with pytest.raises(RuntimeError):
+            cache.linker.load_back(req)
+    else:
+        # A refused load is undone before PREPARE and falls back to recompute.
+        loaded, last_node = cache.linker.load_back(req)
+        assert loaded.numel() == 0
+        assert last_node == cache.root_node_handle()
     assert allocator.full_available_size() == allocator.swa_available_size() == 32
     assert not cache.linker.inflight_load_rids
     assert not cache.tree_core.root_node.children

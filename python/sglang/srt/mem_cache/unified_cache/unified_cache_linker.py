@@ -395,15 +395,13 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        load_transfers = self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
-        )
-
+        # Queue before PREPARE touches the request, so a refused load only has
+        # the allocations to undo before falling back to recompute. The result
+        # depends on the transfers alone, so every rank takes the same branch.
         try:
-            queued = self.cache_linker.load(req.rid, load_transfers)
+            queued = self.cache_linker.load(
+                req.rid, [transfer for _, transfer in component_transfers]
+            )
         except BaseException:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
@@ -413,7 +411,13 @@ class UnifiedCacheLinkerWrapper:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
-            raise RuntimeError(f"Failed to queue the linker load for rid={req.rid!r}.")
+            return empty_indices, req.last_node
+        self._update_load(
+            ExternalLinkerLoadPhase.PREPARE,
+            req,
+            component_transfers,
+            prefix_len,
+        )
         self.inflight_load_rids.append(req.rid)
         return full_transfer.device_indices, req.last_node
 
