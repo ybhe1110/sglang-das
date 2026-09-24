@@ -65,6 +65,7 @@ class _PrefillReq:
         self.grammar = None
         self.require_reasoning = False
         self.customized_info = None
+        self.discard_output_reason = None
 
     def finished(self):
         return False
