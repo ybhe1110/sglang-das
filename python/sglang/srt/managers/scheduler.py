@@ -78,7 +78,6 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
-from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -1199,6 +1198,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self._external_kv_chunked_abort_reqs = {}
         # Failed external-linker rids that matched no scheduled request on the
         # pass that drained them; retried once, see _mark_failed_linker_loads.
         self._deferred_linker_rids: Set[str] = set()
@@ -3158,13 +3158,22 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        pending = getattr(self, "_external_kv_chunked_abort_reqs", None)
+        if pending is None:
+            pending = self._external_kv_chunked_abort_reqs = {}
         req = self._pending_chunked_abort_req
-        if req is None:
-            return
-        if (
-            self.chunked_req is not req
-            and not req.external_kv_abort_requested
+        if req is not None and (
+            req.external_kv_abort_requested or req.rid in self._external_kv_abort_rids
         ):
+            req.external_kv_abort_response_via_chunked = True
+            pending[req.rid] = req
+        # A later chunk's abort must not replace the earlier response retry owner.
+        for aborted_req in tuple(pending.values()):
+            self._process_external_kv_chunked_abort(aborted_req)
+        req = self._pending_chunked_abort_req
+        if req is None or req.external_kv_abort_requested or req.rid in pending:
+            return
+        if self.chunked_req is not req and not req.external_kv_abort_requested:
             # Already past chunked prefill; check if still needs abort handling.
             # If the request is still in external KV abort state, it might be in
             # inflight or result queues and will be handled there.
@@ -3177,43 +3186,6 @@ class Scheduler(
             # Drop the marker once the request is actually gone
             if req.finished() or req.req_pool_idx is None:
                 self._pending_chunked_abort_req = None
-            return
-
-        if req.external_kv_abort_requested or req.rid in self._external_kv_abort_rids:
-            if self.chunked_req is req:
-                self.chunked_req = None
-            sender_terminal = req.disagg_kv_sender is None
-            if req.disagg_kv_sender is not None:
-                try:
-                    sender_terminal = req.disagg_kv_sender.poll() in (
-                        KVPoll.Success,
-                        KVPoll.Failed,
-                    )
-                except Exception:
-                    sender_terminal = False
-            cleanup_done = self.abort_external_kv_request(
-                req,
-                forward_drained=req.inflight_middle_chunks <= 0,
-                sender_terminal=sender_terminal,
-                abort_message=getattr(
-                    req.to_finish or req.finished_reason,
-                    "message",
-                    "External KV load failed",
-                ),
-                is_insert=False,
-                emit_response=False,
-            )
-            if not cleanup_done:
-                return
-            self._pending_chunked_abort_req = None
-            self.ipc_channels.send_to_tokenizer.send_output(
-                AbortReq(
-                    rid=req.rid,
-                    finished_reason=req.finished_reason.to_json(),
-                ),
-                req,
-            )
-            logger.debug(f"Abort chunked prefill request. {req.rid=}")
             return
 
         # A caller that already staged a reason keeps it: the client needs to
@@ -3252,6 +3224,46 @@ class Scheduler(
             req,
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+    def _process_external_kv_chunked_abort(self, req) -> None:
+        if self.chunked_req is req:
+            self.chunked_req = None
+        req.external_kv_abort_response_via_chunked = True
+        sender_terminal = self.prefill_abort_sender_terminal(req)
+        cleanup_done = self.abort_external_kv_request(
+            req,
+            forward_drained=self.prefill_abort_forward_drained(req),
+            sender_terminal=sender_terminal,
+            abort_message=getattr(
+                req.to_finish or req.finished_reason,
+                "message",
+                "External KV load failed",
+            ),
+            is_insert=False,
+            emit_response=False,
+        )
+        if not cleanup_done:
+            return
+        if not req.external_kv_response_sent:
+            try:
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(
+                        rid=req.rid,
+                        finished_reason=req.finished_reason.to_json(),
+                    ),
+                    req,
+                )
+            except Exception:
+                logger.exception(
+                    "Chunked abort response failed for %s; will retry", req.rid
+                )
+                return
+            req.external_kv_response_sent = True
+        self._external_kv_chunked_abort_reqs.pop(req.rid, None)
+        if self._pending_chunked_abort_req is req:
+            self._pending_chunked_abort_req = None
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+        return
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -4373,11 +4385,8 @@ class Scheduler(
 
         for req in candidates:
             rid_match = req.rid in failed
-            chain_match = (
-                sweep_chains
-                and self.tree_cache.is_on_failed_linker_chain(
-                    getattr(req, "last_node", None)
-                )
+            chain_match = sweep_chains and self.tree_cache.is_on_failed_linker_chain(
+                getattr(req, "last_node", None)
             )
 
             if not rid_match and not chain_match:
@@ -4389,6 +4398,9 @@ class Scheduler(
                 continue
 
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            if req is self.chunked_req:
+                req.external_kv_abort_response_via_chunked = True
+                self._external_kv_chunked_abort_reqs[req.rid] = req
             self.abort_external_kv_request(
                 req,
                 forward_drained=False,

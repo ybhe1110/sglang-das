@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import torch
-
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -39,6 +38,8 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_capture_layer_ids,
+)
+from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_req_state as pd_hidden_state,
 )
 from sglang.srt.disaggregation.utils import (
@@ -69,6 +70,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.cleanup import CleanupOutcomeUnknown, run_cleanup_step
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -89,10 +91,9 @@ from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
+    from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -138,22 +139,32 @@ def maybe_release_metadata_buffer(
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
     if req.metadata_buffer_index >= 0:
-        allocator.free(req.metadata_buffer_index)
+        run_cleanup_step(
+            req, "metadata.index", lambda: allocator.free(req.metadata_buffer_index)
+        )
         req.metadata_buffer_index = -1
     indices = pd_hidden_state(req).src_indices
     if indices:
         sender = req.disagg_kv_sender
         if pd_hidden_pool is None and sender is not None:
             pd_hidden_pool = sender.kv_mgr.pd_hidden_pool
-        worker_released = (
-            sender is not None
-            and sender.kv_mgr.pop_pd_hidden_request_done(sender.bootstrap_room)
+        worker_released = run_cleanup_step(
+            req,
+            "metadata.hidden_worker_done",
+            lambda: sender is not None
+            and sender.kv_mgr.pop_pd_hidden_request_done(sender.bootstrap_room),
         )
         if not worker_released and pd_hidden_pool is not None:
-            pd_hidden_pool.free(indices)
-        clear_pd_hidden_request_state(req)
+            run_cleanup_step(
+                req, "metadata.hidden_rows", lambda: pd_hidden_pool.free(indices)
+            )
+        run_cleanup_step(
+            req, "metadata.hidden_state", lambda: clear_pd_hidden_request_state(req)
+        )
     elif not indices:
-        clear_pd_hidden_request_state(req)
+        run_cleanup_step(
+            req, "metadata.hidden_state", lambda: clear_pd_hidden_request_state(req)
+        )
 
 
 def maybe_release_pd_hidden_rows(req: Req, pd_hidden_pool) -> None:
@@ -1510,7 +1521,12 @@ class SchedulerDisaggregationPrefillMixin:
         if req.disagg_kv_sender is None:
             return True
         try:
-            return req.disagg_kv_sender.poll() in (KVPoll.Success, KVPoll.Failed)
+            sender = req.disagg_kv_sender
+            if sender.poll() not in (KVPoll.Success, KVPoll.Failed):
+                return False
+            # Mooncake logical Failed is immediate; source ownership is separate.
+            drained = getattr(sender, "is_transfer_drained", None)
+            return bool(drained()) if drained is not None else True
         except Exception:
             logger.exception("Failed to poll aborting sender for request %s", req.rid)
             return False
@@ -1540,6 +1556,10 @@ class SchedulerDisaggregationPrefillMixin:
         owns response delivery and must track external_kv_response_sent.
         """
         try:
+            if getattr(self, "_pending_chunked_abort_req", None) is req:
+                req.external_kv_abort_response_via_chunked = True
+            if getattr(req, "external_kv_abort_response_via_chunked", False):
+                emit_response = False
             # A resource-only caller may return later to deliver the response.
             if req.external_kv_cleanup_done:
                 if emit_response and not req.external_kv_response_sent:
@@ -1573,7 +1593,13 @@ class SchedulerDisaggregationPrefillMixin:
                 sender.abort()
                 req.external_kv_sender_abort_requested = True
 
-            if not forward_drained or not sender_terminal:
+            if (
+                not forward_drained
+                or not sender_terminal
+                # Recheck after abort closes publication; the caller's earlier
+                # observation may precede the final enqueue.
+                or not self.prefill_abort_sender_terminal(req)
+            ):
                 return False
 
             if not req.external_kv_finish_state_applied:
@@ -1612,6 +1638,10 @@ class SchedulerDisaggregationPrefillMixin:
                     req.req_pool_idx is not None
                     or req.kv is not None
                     or req.mamba_pool_idx is not None
+                    or any(
+                        name.startswith("kv.")
+                        for name in getattr(req, "external_kv_cleanup_steps", {})
+                    )
                 ):
                     release_kv_cache(req, self.tree_cache, is_insert=is_insert)
                 req.external_kv_cache_released = True
@@ -1623,13 +1653,16 @@ class SchedulerDisaggregationPrefillMixin:
 
             self._external_kv_abort_rids.discard(req.rid)
             self._external_kv_cleanup_rids.discard(req.rid)
-            if getattr(self, "_pending_chunked_abort_req", None) is req:
-                self._pending_chunked_abort_req = None
+            # The chunked protocol owner clears its marker after delivery.
             req.external_kv_cleanup_done = True
             return True
+        except CleanupOutcomeUnknown:
+            # The original exception was logged on the first attempt. Keep the
+            # request reachable without flooding logs on every scheduler tick.
+            return False
         except Exception:
             logger.exception(
-                "External KV abort cleanup failed for request %s; cleanup will be retried",
+                "External KV abort cleanup failed for request %s; pending cleanup retained",
                 req.rid,
             )
             return False
@@ -2021,7 +2054,12 @@ class SchedulerDisaggregationPrefillMixin:
                     self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
         # Stream requests which have finished transfer
-        output_reqs = [req for req in done_reqs if not req.external_kv_response_sent]
+        output_reqs = [
+            req
+            for req in done_reqs
+            if not req.external_kv_response_sent
+            and not getattr(req, "external_kv_abort_response_via_chunked", False)
+        ]
         if output_reqs:
             self.output_streamer.stream_output(
                 output_reqs,
