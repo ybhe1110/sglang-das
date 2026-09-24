@@ -283,6 +283,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
     PD_HIDDEN_CHUNK_READY_HEADER = b"PD_HIDDEN_CHUNK_READY"
     PD_HIDDEN_CHUNK_ACK_HEADER = b"PD_HIDDEN_CHUNK_ACK"
+    supports_deferred_decode_kv_release = True
 
     def __init__(
         self,

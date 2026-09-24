@@ -27,6 +27,9 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
