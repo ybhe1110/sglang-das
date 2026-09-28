@@ -489,6 +489,9 @@ class Envs:
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
+    # Benchmark-only synthetic routing; replaces routed expert IDs and must not
+    # be used for correctness or production inference.
+    SGLANG_SIMULATED_EXPERT_BALANCE = EnvBool(False)
 
     # ===================================================================
     # DSpark speculative decoding
@@ -754,6 +757,7 @@ class Envs:
     MOONCAKE_PROTOCOL = EnvStr("rdma")
     MOONCAKE_DEVICE = EnvStr("")
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
+    MOONCAKE_CLIENT_METRICS_PORT_BASE = EnvInt(9301)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
@@ -792,6 +796,9 @@ class Envs:
     # ===================================================================
     # AMD, ROCm, and AITER
     # ===================================================================
+    # Avoid nonzero synchronization when committing HCU FA prefix KV rows.
+    SGLANG_ENABLE_HCU_FA_PREFIX_VALID = EnvBool(False)
+
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
@@ -816,6 +823,9 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Pin the AITER MoE to the moe_c backend instead of the tuned-config
+    # priority order (asm > moe_c > triton). Default keeps autodetection.
+    SGLANG_FORCE_AITER_MOE_C = EnvBool(False)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone
@@ -1054,6 +1064,8 @@ class Envs:
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
+    # Fixed-layout replica probabilities; bypass per-forward LP and all-reduce.
+    SGLANG_EXPERIMENTAL_LPLB_STATIC_PROBS = EnvStr(None)
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
@@ -1284,6 +1296,11 @@ class Envs:
     # CUDA graphs and execution buffers
     # ===================================================================
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # Fixed context extent for breakable prefill CUDA graph attention metadata
+    # (0 = request-pool width, i.e. the model context). DSV4 otherwise sizes the
+    # captured page tables for the full context (e.g. 1M) on every replay; batches
+    # whose context exceeds the limit fall back to eager prefill.
+    SGLANG_BCG_PREFILL_MAX_CONTEXT = EnvInt(0)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -1379,6 +1396,11 @@ class Envs:
     # Enabling this also requires the native LightOp INT8 Paged MQA consumer;
     # there is intentionally no BF16 dequantization fallback.
     SGLANG_DSV4_HCU_INT8_INDEX_K_CACHE = EnvBool(False)
+    # Opt in to the persistent INT8 Paged MQA producer on HCU gfx936.
+    SGLANG_MQA_PERSISTENT = EnvBool(False)
+    # Fuse C4 indexer Q RoPE, Hadamard, and INT8 quantization into one kernel.
+    # This is independent from the INT8 K-cache switch but requires it at runtime.
+    SGLANG_NSA_INDEX_Q_INT8 = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
@@ -1548,6 +1570,8 @@ class Envs:
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
+    # Optional legacy fixed GiB budget; unset retains the fraction policy.
+    SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB = EnvFloat(None)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     # Paired gfx938 LightOp sparse Page-MQA and mask-aware paged TopK.
     SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK = EnvBoolWithAlias(

@@ -131,8 +131,8 @@ except ImportError:
 
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
-# from lightop import fuse_situ_mul_quant_contiguous  as  fuse_situ_mul_quant
-# from lightop import fuse_situ_mul_quant_ep
+from lightop import fuse_situ_mul_quant_contiguous  as  fuse_situ_mul_quant
+from lightop import fuse_situ_mul_quant_ep
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -141,19 +141,6 @@ from lightop.activation import (
     fuse_silu_mul_quant_ep,
 )
 
-
-# Dummy SiTU functions for Kimi K3 (not used by Qwen)
-def fuse_situ_mul_quant(input, gemm1_alpha, gemm1_clamp_limit):
-    raise NotImplementedError("SiTU activation not supported. This build only supports Qwen with SiLU.")
-
-def fuse_situ_mul_quant_ep(
-    input: torch.Tensor,
-    masked_m: torch.Tensor,
-    situ_beta: float,
-    situ_linear_beta: float,
-    expect_m: int = -1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    raise NotImplementedError("SiTU activation not supported. This build only supports Qwen with SiLU.")
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -1066,8 +1053,8 @@ class DeepEPMoE(FusedMoE):
                     f"{num_recv_tokens_per_expert}"
                 )
 
-            # Both HIPC kernels consume the true scale restored by
-            # process_weights_after_loading; no forward-time rescaling is needed.
+            # HIPC kernels apply the checkpoint scale/16 factor internally.
+            # process_weights_after_loading must leave the stored scale unchanged.
 
             # DeepEP normal dispatch is token-major. Scatter it into contiguous
             # expert segments and retain output_index for the weighted gather.
@@ -2051,7 +2038,10 @@ class DeepEPMoE(FusedMoE):
         )
 
         q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(
-            input=gateup_output, fp8type=0, tokens_per_expert=masked_m
+            input=gateup_output,
+            fp8type=0,
+            tokens_per_expert=masked_m,
+            limit=self.moe_runner_config.swiglu_limit,
         )
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.

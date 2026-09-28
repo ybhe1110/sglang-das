@@ -326,6 +326,7 @@ def _get_aiter_w8a8_moe_config(
     quant_info: AiterMoeQuantInfo,
 ):
     from aiter.moe import MoeSolutionType, get_aiter_moe_config
+    from sglang.srt.environ import envs
 
     if hidden_states.dim() != 2:
         raise RuntimeError(
@@ -359,6 +360,9 @@ def _get_aiter_w8a8_moe_config(
         quant_type=quant_type,
         activation=activation,
     )
+
+    if envs.SGLANG_FORCE_AITER_MOE_C.get():
+        config_kwargs["spec_sol_type"] = MoeSolutionType.MOE_C
 
     try:
         status, moe_config = get_aiter_moe_config(**config_kwargs)
@@ -404,10 +408,7 @@ def _get_aiter_w8a8_weights_for_solution(
     moe_config,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter.moe import MoeSolutionType
-    from aiter.ops.shuffle import (
-        moe_layout_shuffle_gemm1,
-        moe_layout_shuffle_gemm2,
-    )
+    from aiter.ops.shuffle import moe_layout_shuffle_gemm2
 
     solution_type = moe_config.solution_type
     need_shuffle = getattr(
@@ -430,7 +431,11 @@ def _get_aiter_w8a8_weights_for_solution(
     layer = quant_info.layer
 
     with torch.no_grad():
-        w1_moe_c = moe_layout_shuffle_gemm1(quant_info.w13_weight).view(
+        # w13 must use moe_layout_shuffle_gemm2: the AITER MOE_C w8a8 kernel
+        # expects the gemm2 tile layout for both GEMMs, and gemm1 shuffling
+        # produces garbage output (cos_sim 0.038 vs 0.9998, tuned E=256 N=256
+        # int8_w8a8 config on gfx936). Do not "fix" this to gemm1 by name.
+        w1_moe_c = moe_layout_shuffle_gemm2(quant_info.w13_weight).view(
             *quant_info.w13_weight.shape
         )
         w2_moe_c = moe_layout_shuffle_gemm2(quant_info.w2_weight).view(

@@ -263,7 +263,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
-    "hcu_mla"
+    "hcu_mla",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
@@ -1198,6 +1198,11 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
+    enable_cp_cache_layer_split: A[
+        bool,
+        "Split DeepSeek V4 prefill KV and compressor-state layers across CP ranks (CUDA/HCU, interleave, Mooncake). Draft caches remain replicated.",
+        NS("parallel"),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
@@ -2238,6 +2243,16 @@ class ServerArgs:
         "The number of tokens sampled from the draft model in eagle2 each step.",
         NS("spec"),
     ] = None
+    speculative_draft_lm_head_vp_size: A[
+        int,
+        Arg(
+            help="Node-local vocabulary parallel group size for EAGLE draft decode "
+            "LM-head top-1. Requires DP attention, DP LM head, and eagle topk=1. "
+            "Use 1 to disable; target verify and draft extend keep their existing paths.",
+            choices=[1, 4, 8, 16],
+        ),
+        NS("spec"),
+    ] = 1
     speculative_num_draft_tokens: A[
         Optional[int],
         "The number of tokens sampled from the draft model in Speculative Decoding.",
@@ -2931,7 +2946,19 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "mooncake"
-
+    mooncake_page_wise_load_threshold: A[
+        int,
+        "Minimum number of Mooncake direct-linker keys that switches loading "
+        "from the layer-wise flow to the complete-page flow.",
+        NS("memory"),
+    ] = 10
+    mooncake_enable_page_wise_load: A[
+        bool,
+        "Enable page-wise loading for Mooncake direct-linker. When enabled, "
+        "switches from layer-wise flow to complete-page flow based on key "
+        "count threshold.",
+        NS("memory"),
+    ] = False
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------
@@ -5747,6 +5774,10 @@ class ServerArgs:
                     "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
                 )
 
+        if self.enable_cp_cache_layer_split:
+            if model_arch != "DeepseekV4ForCausalLM":
+                raise ValueError("--enable-cp-cache-layer-split requires DeepSeek V4")
+
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
                 "--enable-dsa-cache-layer-split is only supported for DSA "
@@ -6024,6 +6055,12 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
             validate_deepseek_v4_mega_moe_token_budget(self)
+            if self.enable_cp_cache_layer_split:
+                from sglang.srt.mem_cache.cp_cache_layer_split.validation import (
+                    validate_cp_cache_layer_split,
+                )
+
+                validate_cp_cache_layer_split(self, hf_config)
 
             if is_sm120_supported():
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
@@ -8974,6 +9011,12 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_unified_cache_external_linker and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-unified-cache-external-linker and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -10058,13 +10101,12 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert self.disable_overlap_schedule, (
-                "Pipeline parallelism is not compatible with overlap schedule"
-            )
+            assert (
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
             pp_dspark_prefill = (
-                (self.speculative_algorithm or "").upper() == "DSPARK"
-                and self.disaggregation_mode == "prefill"
-            )
+                self.speculative_algorithm or ""
+            ).upper() == "DSPARK" and self.disaggregation_mode == "prefill"
             assert self.speculative_algorithm is None or pp_dspark_prefill, (
                 "Pipeline parallelism with speculative decoding is only supported "
                 "for DSPARK on a PD prefill server"
