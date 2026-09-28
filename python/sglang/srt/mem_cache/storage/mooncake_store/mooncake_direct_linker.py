@@ -21,6 +21,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.master_availability import (
+    MasterAvailability,
+    StoreUnavailable,
+    checked_exists,
+)
 from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
 )
@@ -197,9 +202,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
     ):
         self.page_size = params.page_size
-        self.page_wise_load_threshold = (
-            server_args.mooncake_page_wise_load_threshold
-        )
+        self.page_wise_load_threshold = server_args.mooncake_page_wise_load_threshold
         self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
         if self.page_wise_load_threshold <= 0:
             raise ValueError(
@@ -215,14 +218,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
-        self._load_revalidation_groups = ()
-        if self.pool_group.storage_layout_tag:
-            self._load_revalidation_groups = tuple(
-                group
-                for group in (params.attn_cp_cache_group, params.attn_tp_cache_group)
-                if group is not None
-                and torch.distributed.get_world_size(group=group) > 1
-            )
+        self.pp_size = params.pp_size
+        # Revalidation must agree even without a LayerSplit storage layout.
+        self._load_revalidation_groups = tuple(
+            group
+            for group in (params.attn_cp_cache_group, params.attn_tp_cache_group)
+            if group is not None and torch.distributed.get_world_size(group=group) > 1
+        )
 
         tp_rank = 0
         tp_size = server_args.tp_size
@@ -250,20 +252,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             extra_config=extra_config,
             dp_rank=getattr(params, "dp_rank", None),
         )
-        if storage is None:
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStore,
+        self.l1_fallback_enabled = (
+            os.environ.get("SGLANG_MOONCAKE_L1_FALLBACK", "1") == "1"
+        )
+        self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
+        self.read_plan_reuse_ranges = (
+            os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
+        )
+        if self.read_plan_reuse_ranges and not self.read_plan_enabled:
+            raise ValueError(
+                "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES requires SGLANG_MOONCAKE_READ_PLAN=1"
             )
-
-            self.storage = MooncakeStore(
-                storage_config,
-                mem_pool=None,
-                enable_client_http_server=params.enable_metrics,
-            )
-        else:
-            self.storage = storage
-        self.storage.mem_pool_host = self.pool_group
-        self.storage.registered_pools = self.pools
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
@@ -272,36 +271,75 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         if self.pool_group.storage_layout_tag:
             storage_suffix = f"{self.pool_group.storage_layout_tag}_{storage_suffix}"
-        self.storage.mla_suffix = storage_suffix
-        self.storage.mha_suffix = storage_suffix
+        pool_device = getattr(kvcache, "device", None)
+        self._availability = None
+        self.storage = None
+
+        def create_storage():
+            # Initialization may be retried on a daemon metadata worker. Restore
+            # this rank's device context before native memory registration.
+            if pool_device is not None and torch.device(pool_device).type != "cpu":
+                device_module.set_device(pool_device)
+            created = storage
+            if created is None:
+                from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                    MooncakeStore,
+                )
+
+                created = MooncakeStore(
+                    storage_config,
+                    mem_pool=None,
+                    enable_client_http_server=params.enable_metrics,
+                )
+            created.mem_pool_host = self.pool_group
+            created.registered_pools = self.pools
+            created.mla_suffix = created.mha_suffix = storage_suffix
+            if self.read_plan_enabled and not callable(
+                getattr(created.store, "create_read_plan", None)
+            ):
+                raise RuntimeError(
+                    "Mooncake ReadPlan requires a ReadPlan-enabled Mooncake package"
+                )
+            self.register_buffers(storage=created)
+            if self._availability is not None:
+                # All existence queries, including batch_set_v2's check, receive
+                # a bounded metadata-only wait. Data transfers remain synchronous.
+                raw_exists = created._batch_exist
+
+                def guarded_exists(keys):
+                    keys = list(keys)
+                    return self._availability.query(
+                        lambda: checked_exists(raw_exists(keys), len(keys))
+                    )
+
+                created._batch_exist = guarded_exists
+            return created
+
+        if self.l1_fallback_enabled:
+            self._availability = MasterAvailability(
+                create_storage,
+                # A missing probe key (0) proves RPC health just as a hit does.
+                lambda st: checked_exists(
+                    st.store.batch_is_exist(["__sglang_master_health_probe__"]), 1
+                ),
+                timeout_s=float(
+                    os.environ.get("SGLANG_MOONCAKE_MASTER_TIMEOUT_S", "2")
+                ),
+                retry_s=float(os.environ.get("SGLANG_MOONCAKE_MASTER_RETRY_S", "10")),
+            )
+            self._availability.initialize()
+            self.storage = self._availability.storage
+        else:
+            self.storage = create_storage()
         logger.info(
-            "Mooncake direct linker storage topology: "
-            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            "Mooncake direct linker: rank_replicated=%s tp=%d/%d owner=%s suffix=%s L1_fallback=%s",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
             storage_suffix,
+            self.l1_fallback_enabled,
         )
-        self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
-        self.read_plan_reuse_ranges = (
-            os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
-        )
-        if self.read_plan_reuse_ranges and not self.read_plan_enabled:
-            raise ValueError(
-                "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES requires "
-                "SGLANG_MOONCAKE_READ_PLAN=1"
-            )
-        if self.read_plan_enabled:
-            if not callable(getattr(self.storage.store, "create_read_plan", None)):
-                raise RuntimeError(
-                    "Mooncake ReadPlan requires a package with create_read_plan. "
-                    "Install the ReadPlan-enabled Mooncake package."
-                )
-            logger.info(
-                "Mooncake ReadPlan enabled; address reuse=%s",
-                self.read_plan_reuse_ranges,
-            )
 
         self.storage_metrics_collector = None
         if params.enable_metrics:
@@ -321,7 +359,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
             self.storage_metrics_collector = collector_cls(labels=labels)
 
-        self.register_buffers()
         if self.read_plan_enabled:
             self.layer_done_counter = ReadPlanLoadCounter(self.num_layers)
         else:
@@ -357,20 +394,36 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.offload_thread.start()
 
-    def register_buffers(self) -> None:
+    def _storage_ready(self) -> bool:
+        availability = getattr(self, "_availability", None)
+        if availability is None:
+            return True
+        ready = availability.ready()
+        self.storage = availability.storage
+        return ready
+
+    def _storage_failed(self, error) -> None:
+        availability = getattr(self, "_availability", None)
+        if availability is not None and not isinstance(error, StoreUnavailable):
+            availability.failed(error)
+
+    def register_buffers(self, storage=None) -> None:
+        storage = self.storage if storage is None else storage
         seen = set()
         for pool in self.pools.values():
             for buffer in pool.get_hybrid_pool_buffer():
-                storage = buffer.untyped_storage()
-                allocation = (int(storage.data_ptr()), int(storage.nbytes()))
+                buffer_storage = buffer.untyped_storage()
+                allocation = (
+                    int(buffer_storage.data_ptr()),
+                    int(buffer_storage.nbytes()),
+                )
                 if allocation in seen:
                     continue
                 seen.add(allocation)
-                result = self.storage.store.register_buffer(*allocation)
+                result = storage.store.register_buffer(*allocation)
                 if result not in (0, None):
                     raise RuntimeError(
-                        "Failed to register GPU KV buffer with Mooncake, "
-                        f"error code: {result}."
+                        f"Failed to register GPU KV buffer with Mooncake, error code: {result}."
                     )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -383,7 +436,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return []
         # PP0 queries every PP shard; the wrapper's existing TP/CP reduction
         # then selects a boundary that all ranks can restore.
-        result = self.storage.batch_exists_v2(page_keys, expanded, query_all_pp=True)
+        if not self._storage_ready():
+            return []
+        try:
+            result = self.storage.batch_exists_v2(
+                page_keys, expanded, query_all_pp=True
+            )
+        except Exception as error:
+            if not getattr(self, "l1_fallback_enabled", True):
+                raise
+            self._storage_failed(error)
+            # The wrapper still performs its TP/CP reduction with this empty
+            # result; never skip that collective on a locally failed lookup.
+            return []
         restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
         if restorable:
@@ -407,6 +472,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     verdict, op=torch.distributed.ReduceOp.MIN, group=group
                 )
             valid = bool(verdict.item())
+        if not valid and getattr(self, "pp_size", 1) > 1:
+            # PP0 has already distributed the prefix boundary. Preserve its
+            # shape; the queued load reports failure via the existing PP abort
+            # path. Future PP0 lookups while down return no external hit.
+            return True
         return valid
 
     def _revalidate_load_local(self, transfers: list[PoolTransfer]) -> bool:
@@ -418,10 +488,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         replicas and would fail the layer-wise load fatally. Re-checking here
         lets the caller degrade the request to a plain cache miss instead.
 
-        Failures inside the revalidation itself never propagate: this hook
-        guards a hot scheduling path, so an unexpected error falls back to
-        "validated" and the async load path retains its own semantics.
+        Connection failures become a cache miss before device slots are
+        published. PP uses its already-agreed boundary and aborts on load failure.
         """
+        if not self._storage_ready():
+            return False
         try:
             resolved = self.pool_group.resolve_transfers(
                 transfers, allow_partial=True, allow_missing_kv=True
@@ -436,10 +507,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 key_strs.extend(self.storage._tag_keys(component_keys))
             if not key_strs:
                 return True
-            exist = self.storage._batch_exist(key_strs)
-        except BaseException:
-            logger.exception("Mooncake direct linker load revalidation error")
-            return True
+            exist = checked_exists(self.storage._batch_exist(key_strs), len(key_strs))
+        except Exception as error:
+            self._storage_failed(error)
+            return False
         missing = [key for key, state in zip(key_strs, exist) if state != 1]
         if missing:
             logger.warning(
@@ -537,6 +608,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         success = False
         maybe_fail = arm_load_failure_injection(self.tp_rank)
         try:
+            # Do not reject load() after the wrapper published its pages. A load
+            # admitted just before the outage must produce a failed completion.
+            if not self._storage_ready():
+                raise StoreUnavailable(
+                    "Mooncake unavailable before queued load started"
+                )
             if getattr(self, "read_plan_enabled", False):
                 self.load_with_read_plan(counter_index, request_transfers)
                 return True
@@ -584,9 +661,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(keys) >= self.page_wise_load_threshold
                 for keys, _ in batches.values()
             ):
-                self._load_page_wise(
-                    counter_index, batches, started, maybe_fail
-                )
+                self._load_page_wise(counter_index, batches, started, maybe_fail)
                 success = True
                 return success
 
@@ -619,6 +694,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.layer_done_counter.complete(counter_index, layer)
             success = True
         except BaseException as error:
+            self._storage_failed(error)
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
@@ -626,6 +702,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 try:
                     self.storage.store.batch_get_session_end(keys)
                 except BaseException as error:
+                    self._storage_failed(error)
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
                     success = False
@@ -661,9 +738,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 exc_info=True,
             )
 
-    def _load_page_wise(
-        self, counter_index: int, batches, started, maybe_fail
-    ) -> None:
+    def _load_page_wise(self, counter_index: int, batches, started, maybe_fail) -> None:
         """Load all layer ranges for each page before exposing the data."""
         all_keys: list[str] = []
         all_ptrs: list[list[int]] = []
@@ -675,9 +750,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             offsets: list[list[int]] = [[] for _ in keys]
 
             for layer in range(self.num_layers):
-                meta = self.pools[name].get_prepared_layer_range_meta(
-                    locations, layer
-                )
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                 if meta is None:
                     continue
                 layer_ptrs, layer_sizes, layer_offsets = meta
@@ -720,9 +793,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         expected = [sum(item) for item in all_sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
-            pool_counts = {
-                str(name): len(keys) for name, (keys, _) in batches.items()
-            }
+            pool_counts = {str(name): len(keys) for name, (keys, _) in batches.items()}
             raise RuntimeError(
                 "Mooncake aggregated range get failed for "
                 f"pools={pool_counts}, complete_page: transferred={result}, "
@@ -739,9 +810,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         for layer in range(self.num_layers):
             self.layer_done_counter.complete(counter_index, layer)
 
-    def _prepare_read_plan_layouts(
-        self, request_transfers: list[list[PoolTransfer]]
-    ):
+    def _prepare_read_plan_layouts(self, request_transfers: list[list[PoolTransfer]]):
         # Consolidate index copies once per pool, preserving request/key order.
         # Each component describes (base, row stride, byte count, source offset).
         # Locations may be non-contiguous; Mooncake expands addresses in C++.
@@ -766,9 +835,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 buffer_indices = (
                     ()
                     if mapped is None
-                    else (mapped,)
-                    if isinstance(mapped, int)
-                    else tuple(mapped)
+                    else (mapped,) if isinstance(mapped, int) else tuple(mapped)
                 )
                 layout.append(
                     [
@@ -822,8 +889,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     return
                 expanded, tokens, started, ready_event = task
                 ready_event.synchronize()
+                if not self._storage_ready():
+                    raise StoreUnavailable(
+                        "Mooncake unavailable; skipping queued write-back"
+                    )
                 results = self.storage.batch_set_v2(expanded)
                 success = all(all(pool_results) for pool_results in results.values())
+                if not success:
+                    self._storage_failed(RuntimeError("Mooncake write-back failed"))
                 self._log_l4_backup_metric(
                     tokens, time.perf_counter() - started, success
                 )
@@ -833,8 +906,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if self.stats["offload"] == 1:
                         logger.info("Mooncake direct linker offload: tokens=%d", tokens)
                 self.offload_results.put(success)
-            except BaseException:
-                logger.exception("Mooncake offload failed")
+            except BaseException as error:
+                self._storage_failed(error)
+                if not isinstance(error, StoreUnavailable):
+                    logger.exception("Mooncake offload failed")
                 if task is not None and not metric_recorded:
                     _, tokens, started, _ = task
                     self._log_l4_backup_metric(
@@ -890,4 +965,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.load_thread.join()
         self.offload_thread.join()
         logger.info("Mooncake direct linker stats: %s", self.stats)
-        self.storage.close()
+        if self._availability is not None:
+            self._availability.close()
+        if self.storage is not None:
+            self.storage.close()

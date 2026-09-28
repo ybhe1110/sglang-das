@@ -333,6 +333,68 @@ Distributed deployment of Mooncake is straightforward. Similar to the single-nod
 
 Mooncake also supports high availability mode. This mode enhances fault tolerance by running the `master service` as a cluster of multiple master nodes coordinated through an `etcd` cluster. The master nodes use `etcd` to elect a leader, which is responsible for handling client requests. For more details about how to deploy in this mode, please refer to our [documents](https://kvcache-ai.github.io/Mooncake/).
 
+### Automatic L1 fallback for the UnifiedCache direct linker
+
+`MooncakeDirectLinker` treats the remote store as an optional cache. By default,
+startup connection failures, metadata RPC errors (including negative error codes
+and malformed replies), metadata timeouts, and asynchronous load/write-back
+failures open a local circuit breaker. New remote lookups return no external hit:
+existing device L1 prefixes remain usable, and missing tokens are recomputed.
+This does not restore KV that exists only in Mooncake into L1.
+
+Set these environment variables on **all SGLang ranks**:
+
+```bash
+export SGLANG_MOONCAKE_L1_FALLBACK=1       # default; 0 disables the circuit breaker
+export SGLANG_MOONCAKE_MASTER_TIMEOUT_S=2 # initial setup / metadata wait budget
+export SGLANG_MOONCAKE_MASTER_RETRY_S=10  # cooldown before another recovery attempt
+```
+
+Timeout and retry values must be finite, positive seconds. During the cooldown,
+remote queries and queued write-backs are skipped. Write-backs still produce FIFO
+failure completions so the cache can release their pins consistently across ranks.
+After the cooldown, the next cache operation triggers an asynchronous probe; a
+successful probe restores remote caching. Startup failures retry client creation
+and buffer registration instead. No traffic means no probe. A probe returning a
+valid "key absent" response is healthy; an RPC error is not a cache miss.
+
+Each linker uses one persistent metadata worker, with at most one pending RPC.
+An RPC that exceeds the caller's wait budget retains that worker until the native
+call actually returns. Repeated requests cannot create extra stuck workers, and a
+late result cannot undo a newer failure. Recovery cannot proceed until that call
+returns. The SDK must release the Python GIL during blocking calls for the Python
+wait budget to work; configure finite native RPC timeouts in the deployed SDK too.
+
+TP/CP lookups and load revalidation keep group agreement. A failure before load
+admission becomes a local-cache miss. A request already admitted to an external
+load may still receive an abort response through the request cleanup state
+machine. In PP, once PP0 has distributed a prefix boundary, later stages preserve
+that boundary and report load failure through the existing PP abort path; they
+must not independently recompute different token lengths. A master-wide outage
+makes subsequent PP0 lookups miss. A connection failure isolated to another PP
+stage can still abort requests while PP0 remains connected.
+
+This feature covers the **UnifiedCache direct-linker storage path**, not the
+separate HiCache host-storage pipeline or prefill/decode transport availability.
+It does not configure master leader election. Native crashes and indefinitely
+blocked GPU/RDMA transfers require backend support: data transfers are never
+reported complete merely because a Python timeout expired, and their KV buffers
+remain owned until the transfer exits. An indefinitely blocked data transfer can
+therefore still stall its affected requests or retain cache capacity.
+
+CPU regression tests:
+
+```bash
+python -m pytest -q test/registered/unit/mem_cache/test_mooncake_l1_fallback.py
+```
+
+Before production rollout, validate on the deployed Linux GPU/DCU and Mooncake
+build: warm L1, stop the master during queries and active loads/write-backs,
+continue both repeated and new prompts, check process health and KV usage, then
+restart the master and check recovery. Repeat with TP/CP and PP, including a master
+that is unreachable at server startup. CPU fault injection does not establish
+native RPC timeout, DMA drain, or distributed liveness guarantees.
+
 ### Deployment with Dummy Client (Experimental)
 
 In addition to the standard deployment where SGLang acts as a full Mooncake node, you can use the **Dummy Client** mode. In this mode, SGLang connects to a local **Mooncake Store Service** (Real Client) via RPC/IPC. This decouples the SGLang process from the heavy RDMA and memory management, potentially improving stability and allowing the cache to persist even if the SGLang process restarts.
