@@ -272,14 +272,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if self.pool_group.storage_layout_tag:
             storage_suffix = f"{self.pool_group.storage_layout_tag}_{storage_suffix}"
         pool_device = getattr(kvcache, "device", None)
+        storage_device_module = None
+        storage_device_index = None
+        if pool_device is not None:
+            resolved_device = torch.device(pool_device)
+            if resolved_device.type != "cpu":
+                storage_device_module = torch.get_device_module(resolved_device)
+                storage_device_index = resolved_device.index
+                if storage_device_index is None:
+                    # Capture this rank's selected device on the initializing
+                    # thread; a new worker may have a different default device.
+                    storage_device_index = storage_device_module.current_device()
+
         self._availability = None
         self.storage = None
 
         def create_storage():
-            # Initialization may be retried on a daemon metadata worker. Restore
-            # this rank's device context before native memory registration.
-            if pool_device is not None and torch.device(pool_device).type != "cpu":
-                device_module.set_device(pool_device)
+            # Restore the captured device before registration, including retries.
+            if storage_device_module is not None:
+                storage_device_module.set_device(storage_device_index)
             created = storage
             if created is None:
                 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (

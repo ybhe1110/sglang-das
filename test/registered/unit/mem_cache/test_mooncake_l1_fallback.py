@@ -352,6 +352,156 @@ class TestLinkerFallback(unittest.TestCase):
         self.addCleanup(linker.close)
         return linker
 
+    def configure_storage_device(self, device, current_index=3):
+        caller_thread = threading.get_ident()
+        thread_device = threading.local()
+        events = []
+        if isinstance(device, str):
+            kind, _, index = device.partition(":")
+            resolved = SimpleNamespace(type=kind, index=int(index) if index else None)
+        else:
+            resolved = device
+        expected = resolved.index if resolved.index is not None else current_index
+
+        def current_device():
+            self.assertEqual(threading.get_ident(), caller_thread)
+            events.append(("capture", caller_thread, current_index))
+            return current_index
+
+        def set_device(index):
+            # Emulate the backend rejecting a bare string/device without index.
+            self.assertIsInstance(index, int)
+            self.assertEqual(index, expected)
+            thread_device.index = index
+            events.append(("set", threading.get_ident(), index))
+
+        def register_buffer(*args):
+            if resolved.type != "cpu":
+                self.assertEqual(getattr(thread_device, "index", None), expected)
+            events.append(("register", threading.get_ident(), None))
+            return 0
+
+        backend = SimpleNamespace(
+            current_device=Mock(side_effect=current_device),
+            set_device=Mock(side_effect=set_device),
+        )
+        self.torch.device = Mock(return_value=resolved)
+        self.torch.get_device_module = Mock(return_value=backend)
+        self.params.token_to_kv_pool_allocator.get_kvcache = lambda: SimpleNamespace(
+            device=device
+        )
+        self.raw.register_buffer.side_effect = register_buffer
+        return backend, events, resolved
+
+    def test_bare_cuda_captures_device_on_initializing_thread(self):
+        backend, events, resolved = self.configure_storage_device("cuda", 3)
+        linker = self.make_linker()
+        self.assertTrue(linker._storage_ready())
+        self.torch.get_device_module.assert_called_once_with(resolved)
+        backend.current_device.assert_called_once_with()
+        backend.set_device.assert_called_once_with(3)
+        self.assertEqual([event[0] for event in events], ["capture", "set", "register"])
+        self.assertNotEqual(events[0][1], events[1][1])
+        self.assertEqual(events[1][1], events[2][1])
+        self.assertEqual(linker.lookup("r", [self.transfer]), [1])
+
+    def test_explicit_cuda_index_ignores_current_device(self):
+        backend, events, _ = self.configure_storage_device("cuda:5", 2)
+        linker = self.make_linker()
+        self.assertTrue(linker._storage_ready())
+        backend.current_device.assert_not_called()
+        backend.set_device.assert_called_once_with(5)
+        self.assertEqual([event[0] for event in events], ["set", "register"])
+
+    def test_device_object_preserves_explicit_index(self):
+        device = SimpleNamespace(type="cuda", index=4)
+        backend, _, _ = self.configure_storage_device(device, 1)
+        linker = self.make_linker()
+        self.assertTrue(linker._storage_ready())
+        self.torch.device.assert_called_once_with(device)
+        backend.current_device.assert_not_called()
+        backend.set_device.assert_called_once_with(4)
+
+    def test_cpu_storage_does_not_select_accelerator(self):
+        backend, _, _ = self.configure_storage_device("cpu")
+        linker = self.make_linker()
+        self.assertTrue(linker._storage_ready())
+        self.torch.get_device_module.assert_not_called()
+        backend.current_device.assert_not_called()
+        backend.set_device.assert_not_called()
+        self.raw.register_buffer.assert_called_once()
+
+    def test_npu_storage_uses_its_own_device_module(self):
+        backend, _, resolved = self.configure_storage_device("npu", 2)
+        linker = self.make_linker()
+        self.assertTrue(linker._storage_ready())
+        self.torch.get_device_module.assert_called_once_with(resolved)
+        backend.current_device.assert_called_once_with()
+        backend.set_device.assert_called_once_with(2)
+
+    def test_rank_uses_visible_device_instead_of_global_rank(self):
+        for rank, visible_device in ((7, 3), (8, 0), (9, 1)):
+            with self.subTest(rank=rank, visible_device=visible_device):
+                case = TestLinkerFallback()
+                case.setUp()
+                try:
+                    case.torch.distributed.is_available = lambda: True
+                    case.torch.distributed.is_initialized = lambda: True
+                    case.torch.distributed.get_rank = Mock(return_value=rank)
+                    case.torch.distributed.get_world_size = Mock(return_value=16)
+                    case.params.dp_rank = 1
+                    backend, _, _ = case.configure_storage_device(
+                        "cuda", visible_device
+                    )
+                    linker = case.make_linker()
+                    case.assertEqual(linker.tp_rank, rank)
+                    case.assertTrue(linker._storage_ready())
+                    backend.set_device.assert_called_once_with(visible_device)
+                    case.assertEqual(linker.lookup("r", [case.transfer]), [1])
+                finally:
+                    case.doCleanups()
+
+    def test_initialization_retry_reuses_captured_device(self):
+        backend, events, _ = self.configure_storage_device("cuda", 3)
+        register = self.raw.register_buffer.side_effect
+        attempts = 0
+
+        def fail_once(*args):
+            nonlocal attempts
+            register(*args)
+            attempts += 1
+            if attempts == 1:
+                raise ConnectionError("master down on initialization")
+            return 0
+
+        self.raw.register_buffer.side_effect = fail_once
+        linker = self.make_linker()
+        self.assertFalse(linker._storage_ready())
+        backend.current_device.side_effect = AssertionError(
+            "device re-resolved on retry"
+        )
+        self.clock.now = 5
+        eventually(linker._storage_ready)
+        backend.current_device.assert_called_once_with()
+        self.assertEqual(
+            [call.args for call in backend.set_device.call_args_list], [(3,), (3,)]
+        )
+        self.assertEqual(
+            [event[0] for event in events],
+            ["capture", "set", "register", "set", "register"],
+        )
+        self.assertEqual(linker.lookup("r", [self.transfer]), [1])
+
+    def test_disabled_fallback_also_resolves_bare_device(self):
+        os.environ["SGLANG_MOONCAKE_L1_FALLBACK"] = "0"
+        backend, events, _ = self.configure_storage_device("cuda", 3)
+        linker = self.make_linker()
+        self.assertTrue(linker._storage_ready())
+        backend.current_device.assert_called_once_with()
+        backend.set_device.assert_called_once_with(3)
+        self.assertEqual({event[1] for event in events}, {threading.get_ident()})
+        self.assertEqual(linker.lookup("r", [self.transfer]), [1])
+
     def test_lookup_exception_is_miss_and_recovery_restores_hits(self):
         linker = self.make_linker()
         self.assertEqual(linker.lookup("r", [self.transfer]), [1])
