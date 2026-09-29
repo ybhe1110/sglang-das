@@ -337,7 +337,7 @@ Mooncake also supports high availability mode. This mode enhances fault toleranc
 
 `MooncakeDirectLinker` treats the remote store as an optional cache. By default,
 startup connection failures, metadata RPC errors (including negative error codes
-and malformed replies), metadata timeouts, and asynchronous load/write-back
+and malformed replies), metadata RPC result timeouts, and asynchronous load/write-back
 failures open a local circuit breaker. New remote lookups return no external hit:
 existing device L1 prefixes remain usable, and missing tokens are recomputed.
 This does not restore KV that exists only in Mooncake into L1.
@@ -346,7 +346,7 @@ Set these environment variables on **all SGLang ranks**:
 
 ```bash
 export SGLANG_MOONCAKE_L1_FALLBACK=1       # default; 0 disables the circuit breaker
-export SGLANG_MOONCAKE_MASTER_TIMEOUT_S=2 # initial setup / metadata wait budget
+export SGLANG_MOONCAKE_MASTER_TIMEOUT_S=2 # initial setup / each metadata wait phase budget
 export SGLANG_MOONCAKE_MASTER_RETRY_S=10  # cooldown before another recovery attempt
 ```
 
@@ -357,6 +357,42 @@ After the cooldown, the next cache operation triggers an asynchronous probe; a
 successful probe restores remote caching. Startup failures retry client creation
 and buffer registration instead. No traffic means no probe. A probe returning a
 valid "key absent" response is healthy; an RPC error is not a cache miss.
+
+Metadata queries have two separate wait budgets, each set by
+`SGLANG_MOONCAKE_MASTER_TIMEOUT_S`: waiting for the worker (including dispatch),
+and waiting for the RPC result after the worker starts the operation. A query
+can therefore wait up to approximately twice this value. Exhausting the worker
+budget skips only the current lookup, revalidation, or write-back; it does not
+mark the store unhealthy or extend the circuit-breaker cooldown. An RPC result
+timeout or SDK error still opens the circuit. An RPC timeout alone does not prove
+that the master is down; SDK execution can also be slow.
+
+With fallback enabled, metadata diagnostics include four fields on every query
+that completes, fails in the SDK, or times out:
+
+| Field | Meaning |
+| --- | --- |
+| `queue_wait_ms` | Time waiting for the existing job and worker dispatch. |
+| `rpc_execution_ms` | Worker operation time, excluding queueing; zero if it never started. For an unfinished RPC timeout, elapsed time so far. |
+| `num_keys` | Actual number of keys passed to the existence query, after pool/PP expansion. |
+| `operation_source` | `lookup`, `revalidate`, or `writeback-exists`. |
+
+Timeouts and SDK errors log at WARNING. Normal and late RPC completions log at
+DEBUG (enable debug logging to see successful timings). For example:
+
+```text
+Mooncake metadata waiting for worker timed out: operation_source=lookup num_keys=512 queue_wait_ms=2000.123 rpc_execution_ms=0.000
+Mooncake metadata waiting for RPC result timed out: operation_source=revalidate num_keys=128 queue_wait_ms=0.042 rpc_execution_ms=2000.110
+```
+
+The first message indicates local worker contention; the second indicates that
+this operation started but did not deliver its result within its RPC budget.
+These timings cover the existence SDK call and reply validation, not GPU/RDMA
+transfer duration or server-only network latency. Skipped calls while the circuit
+is open do not execute an RPC and do not emit these timing records. Structured
+log records also expose `metadata_event` (`worker_timeout`, `rpc_timeout`,
+`rpc_error`, or `rpc_completed`); `rpc_completed` describes SDK completion and
+does not imply that a late result was accepted or that the circuit recovered.
 
 Each linker uses one persistent metadata worker, with at most one pending RPC.
 An RPC that exceeds the caller's wait budget retains that worker until the native

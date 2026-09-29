@@ -204,6 +204,149 @@ class TestAvailability(unittest.TestCase):
         self.assertIs(self.gate._worker, worker)
         self.assertTrue(self.gate.ready())
 
+    def block_worker(self):
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def operation():
+            started.set()
+            release.wait(2)
+            return [1]
+
+        with self.gate._lock:
+            future = self.gate._start_locked("query", operation)
+        self.assertTrue(started.wait(1))
+        return release, future
+
+    def test_worker_wait_timeout_does_not_trip_or_extend_cooldown(self):
+        self.assertTrue(self.gate.initialize())
+        release, pending = self.block_worker()
+        operation = Mock(return_value=[0])
+        before = (self.gate.failures, self.gate._generation, self.gate._retry_at)
+        with self.assertLogs(availability.logger, level="WARNING") as logs:
+            with self.assertRaisesRegex(
+                StoreUnavailable, "waiting for worker timed out"
+            ):
+                self.gate.query(operation, operation_source="lookup", num_keys=7)
+        operation.assert_not_called()
+        self.assertTrue(self.gate.ready())
+        self.assertEqual(
+            (self.gate.failures, self.gate._generation, self.gate._retry_at), before
+        )
+        self.assertEqual(len(logs.records), 1)
+        record = logs.records[0]
+        self.assertEqual(record.metadata_event, "worker_timeout")
+        self.assertEqual(record.operation_source, "lookup")
+        self.assertEqual(record.num_keys, 7)
+        self.assertGreaterEqual(record.queue_wait_ms, 20)
+        self.assertEqual(record.rpc_execution_ms, 0)
+        release.set()
+        self.assertEqual(pending.result(1), [1])
+        self.assertEqual(self.gate.query(operation), [0])
+        self.assertEqual(self.gate.failures, 0)
+
+    def test_rpc_result_timeout_reports_execution_and_trips_circuit(self):
+        self.assertTrue(self.gate.initialize())
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with self.assertLogs(availability.logger, level="WARNING") as logs:
+            with self.assertRaisesRegex(
+                StoreUnavailable, "waiting for RPC result timed out"
+            ):
+                self.gate.query(
+                    lambda: release.wait(2), operation_source="revalidate", num_keys=11
+                )
+        self.assertFalse(self.gate.ready())
+        self.assertEqual(self.gate.failures, 1)
+        record = next(r for r in logs.records if getattr(r, "metadata_event", None))
+        self.assertEqual(record.metadata_event, "rpc_timeout")
+        self.assertEqual(record.operation_source, "revalidate")
+        self.assertEqual(record.num_keys, 11)
+        self.assertGreaterEqual(record.queue_wait_ms, 0)
+        self.assertGreaterEqual(record.rpc_execution_ms, 20)
+        release.set()
+        eventually(lambda: self.gate._job is None)
+        self.assertFalse(self.gate._healthy)
+
+    def test_queued_query_receives_full_rpc_budget(self):
+        self.gate.timeout_s = 0.3
+        self.assertTrue(self.gate.initialize())
+        release, pending = self.block_worker()
+        timer = threading.Timer(0.18, release.set)
+        timer.start()
+        self.addCleanup(timer.join)
+
+        def operation():
+            threading.Event().wait(0.18)
+            return [1]
+
+        with self.assertLogs(availability.logger, level="DEBUG") as logs:
+            self.assertEqual(
+                self.gate.query(
+                    operation, operation_source="writeback-exists", num_keys=3
+                ),
+                [1],
+            )
+        self.assertEqual(pending.result(1), [1])
+        record = next(r for r in logs.records if getattr(r, "metadata_event", None))
+        self.assertEqual(record.metadata_event, "rpc_completed")
+        self.assertEqual(record.operation_source, "writeback-exists")
+        self.assertEqual(record.num_keys, 3)
+        self.assertGreaterEqual(record.queue_wait_ms + record.rpc_execution_ms, 300)
+        self.assertGreaterEqual(record.queue_wait_ms, 150)
+        self.assertGreaterEqual(record.rpc_execution_ms, 150)
+        self.assertTrue(self.gate.ready())
+        self.assertEqual(self.gate.failures, 0)
+
+    def test_timeout_before_worker_dispatch_cancels_without_running_rpc(self):
+        self.assertTrue(self.gate.initialize())
+        release = threading.Event()
+        self.addCleanup(release.set)
+        original = self.gate._run_operation
+
+        def delayed_dispatch(*args):
+            release.wait(2)
+            original(*args)
+
+        operation = Mock(return_value=[1])
+        with patch.object(self.gate, "_run_operation", side_effect=delayed_dispatch):
+            with self.assertRaisesRegex(
+                StoreUnavailable, "waiting for worker timed out"
+            ):
+                self.gate.query(operation, operation_source="lookup", num_keys=1)
+            pending = self.gate._job
+            self.assertTrue(pending.cancelled())
+            self.assertTrue(self.gate.ready())
+            # A cancelled but undispatched job still gates admission; it cannot
+            # create an unbounded backlog or turn into an RPC timeout.
+            with self.assertRaisesRegex(
+                StoreUnavailable, "waiting for worker timed out"
+            ):
+                self.gate.query(operation)
+            self.assertIs(self.gate._job, pending)
+            self.assertEqual(self.gate.failures, 0)
+            operation.assert_not_called()
+            release.set()
+            eventually(lambda: self.gate._job is None)
+        operation.assert_not_called()
+        self.assertEqual(self.gate.query(operation), [1])
+        operation.assert_called_once_with()
+
+    def test_rpc_exception_records_source_keys_and_execution(self):
+        self.assertTrue(self.gate.initialize())
+        operation = Mock(side_effect=ConnectionError("master disconnected"))
+        with self.assertLogs(availability.logger, level="WARNING") as logs:
+            with self.assertRaisesRegex(StoreUnavailable, "master disconnected"):
+                self.gate.query(operation, operation_source="lookup", num_keys=13)
+        record = next(r for r in logs.records if getattr(r, "metadata_event", None))
+        self.assertEqual(record.metadata_event, "rpc_error")
+        self.assertEqual(record.operation_source, "lookup")
+        self.assertEqual(record.num_keys, 13)
+        self.assertGreaterEqual(record.queue_wait_ms, 0)
+        self.assertGreaterEqual(record.rpc_execution_ms, 0)
+        self.assertFalse(self.gate.ready())
+        self.assertEqual(self.gate.failures, 1)
+
     def test_reject_non_finite_or_nonpositive_configuration(self):
         for value in (0, -1, float("inf"), float("nan")):
             with self.assertRaises(ValueError):
@@ -351,6 +494,128 @@ class TestLinkerFallback(unittest.TestCase):
         linker = self.cls(self.args, self.params, components=(), storage=self.store)
         self.addCleanup(linker.close)
         return linker
+
+    def test_metadata_logs_label_all_three_call_sites_and_actual_key_count(self):
+        linker = self.make_linker()
+
+        def expanded_lookup(keys, transfers, **kwargs):
+            self.raw.batch_is_exist.return_value = [1, 1, 1]
+            values = self.store._batch_exist(["pp0", "pp1", "pp2"])
+            return SimpleNamespace(restorable_prefix_pages=[1] if all(values) else [])
+
+        def writeback(transfers):
+            self.store._batch_exist(["key"])
+            return {"kv": [True]}
+
+        self.store.batch_exists_v2.side_effect = expanded_lookup
+        self.store.batch_set_v2.side_effect = writeback
+        with self.assertLogs(availability.logger, level="DEBUG") as logs:
+            self.assertEqual(linker.lookup("r", [self.transfer]), [1])
+            self.raw.batch_is_exist.return_value = [1]
+            self.assertTrue(linker.revalidate_load([self.transfer]))
+            self.assertTrue(linker.offload([self.transfer]))
+            eventually(lambda: linker.num_completed_offloads() == 1)
+            self.assertTrue(linker.pop_completed_offload())
+        records = [r for r in logs.records if getattr(r, "metadata_event", None)]
+        self.assertEqual(
+            [(r.operation_source, r.num_keys) for r in records],
+            [("lookup", 3), ("revalidate", 1), ("writeback-exists", 1)],
+        )
+        for record in records:
+            self.assertEqual(record.metadata_event, "rpc_completed")
+            self.assertGreaterEqual(record.queue_wait_ms, 0)
+            self.assertGreaterEqual(record.rpc_execution_ms, 0)
+            for name in (
+                "queue_wait_ms",
+                "rpc_execution_ms",
+                "num_keys",
+                "operation_source",
+            ):
+                self.assertIn(name + "=", record.getMessage())
+        self.assertEqual(linker._metadata_context.source, "unknown")
+
+    def test_all_sources_queue_timeout_leave_remote_healthy(self):
+        linker = self.make_linker()
+        gate = linker._availability
+        release, started = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def busy():
+            started.set()
+            release.wait(2)
+
+        with gate._lock:
+            pending = gate._start_locked("query", busy)
+        self.assertTrue(started.wait(1))
+
+        def writeback(transfers):
+            self.store._batch_exist(["key"])
+            return {"kv": [True]}
+
+        self.store.batch_set_v2.side_effect = writeback
+        with self.assertLogs(availability.logger, level="WARNING") as logs:
+            self.assertEqual(linker.lookup("r", [self.transfer]), [])
+            self.assertFalse(linker.revalidate_load([self.transfer]))
+            self.assertTrue(linker.offload([self.transfer]))
+            eventually(lambda: linker.num_completed_offloads() == 1)
+            self.assertFalse(linker.pop_completed_offload())
+        records = [r for r in logs.records if getattr(r, "metadata_event", None)]
+        self.assertEqual(
+            [r.operation_source for r in records],
+            ["lookup", "revalidate", "writeback-exists"],
+        )
+        self.assertTrue(all(r.metadata_event == "worker_timeout" for r in records))
+        self.raw.batch_is_exist.assert_not_called()
+        self.assertTrue(linker._storage_ready())
+        self.assertEqual(gate.failures, 0)
+        self.assertEqual(gate._retry_at, 0)
+        release.set()
+        pending.result(1)
+        self.assertEqual(linker.lookup("next-request", [self.transfer]), [1])
+        self.assertEqual(gate.failures, 0)
+
+    def test_metadata_source_is_thread_local_and_restored_after_failure(self):
+        linker = self.make_linker()
+        linker._availability.timeout_s = 1
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def operation():
+            barrier.wait(1)
+            return self.store._batch_exist(["key"])
+
+        def call(source):
+            try:
+                self.assertEqual(linker._storage_metadata_call(source, operation), [1])
+                self.assertEqual(linker._metadata_context.source, "unknown")
+            except BaseException as error:
+                errors.append(error)
+
+        with self.assertLogs(availability.logger, level="DEBUG") as logs:
+            threads = [
+                threading.Thread(target=call, args=(source,))
+                for source in ("lookup", "writeback-exists")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+        self.assertFalse(errors)
+        self.assertCountEqual(
+            [
+                r.operation_source
+                for r in logs.records
+                if getattr(r, "metadata_event", None)
+            ],
+            ["lookup", "writeback-exists"],
+        )
+        linker._metadata_context.source = "outer"
+        with self.assertRaisesRegex(ValueError, "failed"):
+            linker._storage_metadata_call(
+                "revalidate", Mock(side_effect=ValueError("failed"))
+            )
+        self.assertEqual(linker._metadata_context.source, "outer")
 
     def configure_storage_device(self, device, current_index=3):
         caller_thread = threading.get_ident()

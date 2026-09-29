@@ -284,6 +284,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     # thread; a new worker may have a different default device.
                     storage_device_index = storage_device_module.current_device()
 
+        self._metadata_context = threading.local()
         self._availability = None
         self.storage = None
 
@@ -320,7 +321,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 def guarded_exists(keys):
                     keys = list(keys)
                     return self._availability.query(
-                        lambda: checked_exists(raw_exists(keys), len(keys))
+                        lambda: checked_exists(raw_exists(keys), len(keys)),
+                        operation_source=getattr(
+                            self._metadata_context, "source", "unknown"
+                        ),
+                        num_keys=len(keys),
                     )
 
                 created._batch_exist = guarded_exists
@@ -405,6 +410,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.offload_thread.start()
 
+    def _storage_metadata_call(self, source, operation, *args, **kwargs):
+        # Scheduler lookups and background write-backs can run concurrently.
+        # Capture this thread's source in guarded_exists before queueing the RPC.
+        if getattr(self, "_availability", None) is None:
+            return operation(*args, **kwargs)
+        context = self._metadata_context
+        previous = getattr(context, "source", "unknown")
+        context.source = source
+        try:
+            return operation(*args, **kwargs)
+        finally:
+            context.source = previous
+
     def _storage_ready(self) -> bool:
         availability = getattr(self, "_availability", None)
         if availability is None:
@@ -450,8 +468,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not self._storage_ready():
             return []
         try:
-            result = self.storage.batch_exists_v2(
-                page_keys, expanded, query_all_pp=True
+            result = self._storage_metadata_call(
+                "lookup",
+                self.storage.batch_exists_v2,
+                page_keys,
+                expanded,
+                query_all_pp=True,
             )
         except Exception as error:
             if not getattr(self, "l1_fallback_enabled", True):
@@ -518,7 +540,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 key_strs.extend(self.storage._tag_keys(component_keys))
             if not key_strs:
                 return True
-            exist = checked_exists(self.storage._batch_exist(key_strs), len(key_strs))
+            exist = checked_exists(
+                self._storage_metadata_call(
+                    "revalidate", self.storage._batch_exist, key_strs
+                ),
+                len(key_strs),
+            )
         except Exception as error:
             self._storage_failed(error)
             return False
@@ -904,7 +931,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     raise StoreUnavailable(
                         "Mooncake unavailable; skipping queued write-back"
                     )
-                results = self.storage.batch_set_v2(expanded)
+                results = self._storage_metadata_call(
+                    "writeback-exists", self.storage.batch_set_v2, expanded
+                )
                 success = all(all(pool_results) for pool_results in results.values())
                 if not success:
                     self._storage_failed(RuntimeError("Mooncake write-back failed"))
