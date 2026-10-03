@@ -2918,13 +2918,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.req.rid,
                     e,
                 )
-            if (
-                receiver.kv_mgr.enable_deferred_decode_kv_release
-                and receiver.abort_notified
-            ):
-                receiver.kv_mgr.register_deferred_abort_room(
-                    decode_req.req.bootstrap_room
-                )
         logger.warning(
             "Abort decode transfer marked Failed; KV released after PP consensus. rids=%s tp_rank=%s",
             rids,
