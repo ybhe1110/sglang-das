@@ -741,6 +741,9 @@ class SchedulerMetricsReporter:
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
                 )
+                self.stats.num_decode_deferred_kv_release_reqs = (
+                    self.scheduler.disagg_decode_transfer_queue.num_pending_deferred_releases()
+                )
 
             # Utilization / LoRA / HiCache
             self._calculate_utilization()
@@ -964,6 +967,9 @@ class SchedulerMetricsReporter:
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+                )
+                self.stats.num_decode_deferred_kv_release_reqs = (
+                    self.scheduler.disagg_decode_transfer_queue.num_pending_deferred_releases()
                 )
 
             # Streaming session metrics
@@ -1241,5 +1247,8 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+            )
+            self.stats.num_decode_deferred_kv_release_reqs = (
+                self.scheduler.disagg_decode_transfer_queue.num_pending_deferred_releases()
             )
         self.metrics_collector.log_stats(self.stats)
