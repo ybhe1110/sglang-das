@@ -1940,11 +1940,18 @@ class SchedulerDisaggregationPrefillMixin:
             return True
         try:
             sender = req.disagg_kv_sender
-            if sender.poll() not in (KVPoll.Success, KVPoll.Failed):
+            status = sender.poll()
+            if status not in (KVPoll.Success, KVPoll.Failed):
                 return False
-            # Mooncake logical Failed is immediate; source ownership is separate.
-            drained = getattr(sender, "is_transfer_drained", None)
-            return bool(drained()) if drained is not None else True
+            if status == KVPoll.Success:
+                probe = getattr(sender, "is_transfer_drained", None)
+            else:
+                # A logical failure does not prove that the source DMA stopped.
+                probe = getattr(type(sender), "is_transfer_terminal", None)
+                probe = probe.__get__(sender, type(sender)) if probe else None
+                if probe is None:
+                    probe = getattr(sender, "is_transfer_drained", None)
+            return bool(probe()) if probe is not None else True
         except Exception:
             logger.exception("Failed to poll aborting sender for request %s", req.rid)
             return False
@@ -2062,6 +2069,14 @@ class SchedulerDisaggregationPrefillMixin:
                 ):
                     release_kv_cache(req, self.tree_cache, checkpoint=is_insert)
                 req.external_kv_cache_released = True
+
+            forget = (
+                getattr(type(sender), "forget_source_transfers", None)
+                if sender
+                else None
+            )
+            if forget is not None and not forget.__get__(sender, type(sender))():
+                return False
 
             if emit_response and not req.external_kv_response_sent:
                 req.time_stats.set_completion_time()

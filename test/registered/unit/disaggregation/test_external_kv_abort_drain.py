@@ -316,10 +316,13 @@ class TestSourceDrain(unittest.TestCase):
         self.tracker.publish(self.chunk, queue, lambda: True)
         another = SimpleNamespace(room=7)
         self.tracker.publish(another, queue, lambda: True)
+        self.tracker.begin(self.chunk)
+        self.tracker.begin(another)
         self.tracker.complete(self.chunk)
         self.tracker.complete(self.chunk)
         self.assertFalse(self.tracker.drained(7))
         self.tracker.complete(another)
+        self.tracker.close(7)
         self.assertTrue(self.tracker.drained(7))
 
     def test_deferred_requeue_keeps_original_ownership(self):
@@ -327,20 +330,25 @@ class TestSourceDrain(unittest.TestCase):
         self.tracker.publish(self.chunk, queue, lambda: True)
         queue.put(self.chunk)  # Worker defer / hidden ACK wake, same object.
         self.assertFalse(self.tracker.drained(7))
+        self.tracker.begin(self.chunk)
         self.tracker.complete(self.chunk)
+        self.tracker.close(7)
         self.assertTrue(self.tracker.drained(7))
 
     def test_aborted_room_rejects_late_enqueue(self):
         queue = Mock()
         self.tracker.publish(self.chunk, queue, lambda: False)
         queue.put.assert_not_called()
-        self.assertTrue(self.tracker.drained(7))
+        self.tracker.close(7, poisoned=True)
+        self.assertTrue(self.tracker.terminal(7))
+        self.assertFalse(self.tracker.drained(7))
 
     def test_ambiguous_publication_stays_quarantined(self):
         queue = Mock()
         queue.put.side_effect = RuntimeError("after publication unknown")
         with self.assertRaises(RuntimeError):
             self.tracker.publish(self.chunk, queue, lambda: True)
+        self.tracker.begin(self.chunk)
         self.tracker.complete(self.chunk)
         self.assertFalse(self.tracker.drained(7))
 
@@ -358,10 +366,12 @@ class TestSourceDrain(unittest.TestCase):
         self.tracker.publish(self.chunk, Mock(), lambda: True)
         self.assertFalse(mgr.source_transfers_drained(7))
         mgr._wake_pd_hidden_ack_waiters.assert_called_once_with(7)
+        self.tracker.begin(self.chunk)
         self.tracker.complete(self.chunk)
-        self.assertTrue(mgr.source_transfers_drained(7))
+        self.tracker.poison(7)
+        self.assertTrue(mgr._source_drain.terminal(7))
         mgr.request_status.clear()  # failure_exception() clears the room.
-        self.assertTrue(mgr.source_transfers_drained(7))
+        self.assertFalse(mgr.source_transfers_drained(7))
 
     def test_real_worker_skip_completes_only_its_own_token(self):
         class StopWorker(BaseException):
@@ -397,7 +407,9 @@ class TestSourceDrain(unittest.TestCase):
         with self.assertRaises(StopWorker):
             mgr.transfer_worker(queue, Mock())
         self.assertFalse(self.tracker.drained(7))
+        self.tracker.begin(self.chunk)
         self.tracker.complete(self.chunk)
+        self.tracker.close(7)
         self.assertTrue(self.tracker.drained(7))
 
     def test_all_running_futures_drain_after_status_failure_or_exception(self):
