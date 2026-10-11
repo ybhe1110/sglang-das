@@ -695,6 +695,40 @@ class UnifiedCacheLinkerWrapper:
     def start_layer_wise_loading(self) -> int:
         return self.cache_linker.start_layer_wise_loading()
 
+    def finish_loads(self) -> list[str]:
+        """Retire completed load batches and return failed request IDs.
+
+        The scheduler calls this after the forward that consumed the private
+        request-owned slots.  Reduce each batch verdict before detaching a
+        chain so all TP/CP ranks abort the same requests.
+        """
+        finish_count = min(self.num_completed_loads(), len(self.pending_loads))
+        if finish_count <= 0:
+            return []
+        local_successes = self.take_completed_loads(finish_count)
+        successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
+        self.cache._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+        return self.commit_completed_loads(
+            [bool(success) for success in successes.tolist()]
+        )
+
+    # Compatibility names retained for release scheduler integrations.  The
+    # completion path above now retires and detaches failed chains atomically.
+    def drain_linker_loads(self) -> list[str]:
+        return self.finish_loads()
+
+    def has_outstanding_failed_linker_chains(self) -> bool:
+        return bool(self.failed_chains)
+
+    def is_on_failed_linker_chain(self, node_id: NodeId | None) -> bool:
+        if node_id is None:
+            return False
+        return any(node_id in chain for chain in self.failed_chains.values())
+
+    def retry_stranded_failed_linker_chains(self) -> list[NodeId]:
+        """Compatibility hook; failed chains are retired by finish_loads()."""
+        return []
+
     # ---- lifecycle ----
 
     def reset(self) -> None:

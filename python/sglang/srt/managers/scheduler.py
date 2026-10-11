@@ -1198,6 +1198,10 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self._external_kv_chunked_abort_reqs = {}
+        self._deferred_linker_rids: Set[str] = set()
+        self._external_kv_abort_rids: Set[str] = set()
+        self._external_kv_cleanup_rids: Set[str] = set()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -3150,8 +3154,19 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        pending = getattr(self, "_external_kv_chunked_abort_reqs", None)
+        if pending is None:
+            pending = self._external_kv_chunked_abort_reqs = {}
         req = self._pending_chunked_abort_req
-        if req is None:
+        if req is not None and (
+            req.external_kv_abort_requested or req.rid in self._external_kv_abort_rids
+        ):
+            req.external_kv_abort_response_via_chunked = True
+            pending[req.rid] = req
+        for aborted_req in tuple(pending.values()):
+            self._process_external_kv_chunked_abort(aborted_req)
+        req = self._pending_chunked_abort_req
+        if req is None or req.external_kv_abort_requested or req.rid in pending:
             return
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
@@ -3181,6 +3196,48 @@ class Scheduler(
         self.ipc_channels.send_to_tokenizer.send_output(
             AbortReq(rid=req.rid, finished_reason=finished_reason), req
         )
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+    def _process_external_kv_chunked_abort(self, req) -> None:
+        """Retry an external-KV chunked abort until drain cleanup is ready."""
+        if self.chunked_req is req:
+            self.chunked_req = None
+        req.external_kv_abort_response_via_chunked = True
+        sender_terminal = self.prefill_abort_sender_terminal(req)
+        cleanup_done = self.abort_external_kv_request(
+            req,
+            forward_drained=self.prefill_abort_forward_drained(req),
+            sender_terminal=sender_terminal,
+            abort_message=getattr(
+                req.to_finish or req.finished_reason,
+                "message",
+                "External KV load failed",
+            ),
+            is_insert=False,
+            emit_response=False,
+        )
+        if not cleanup_done:
+            return
+        if not req.external_kv_response_sent:
+            try:
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(
+                        rid=req.rid,
+                        finished_reason=req.finished_reason.to_json(),
+                    ),
+                    req,
+                )
+            except Exception:
+                logger.exception(
+                    "Chunked abort response failed for %s; will retry", req.rid
+                )
+                return
+            req.external_kv_response_sent = True
+        pending = getattr(self, "_external_kv_chunked_abort_reqs", None)
+        if pending is not None:
+            pending.pop(req.rid, None)
+        if self._pending_chunked_abort_req is req:
+            self._pending_chunked_abort_req = None
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -4231,6 +4288,67 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _iter_external_linker_candidates(self, batch: ScheduleBatch):
+        """Yield every request that may still own an external load."""
+        groups = [batch.reqs]
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            groups.append(self.running_batch.reqs)
+        if self.chunked_req is not None:
+            groups.append([self.chunked_req])
+        if getattr(self, "disagg_prefill_inflight_queue", None):
+            groups.append(self.disagg_prefill_inflight_queue)
+        if getattr(self, "waiting_queue", None):
+            groups.append(self.waiting_queue)
+        bootstrap = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        if bootstrap is not None and getattr(bootstrap, "queue", None) is not None:
+            groups.append(list(bootstrap.queue))
+        if getattr(self, "result_queue", None):
+            groups.extend(queued_batch.reqs for queued_batch, _ in self.result_queue)
+        seen = set()
+        for reqs in groups:
+            for req in reqs:
+                if req.rid not in seen:
+                    seen.add(req.rid)
+                    yield req
+
+    def _mark_failed_linker_loads(self, batch: ScheduleBatch) -> None:
+        """Compatibility sweep for callers using the release cleanup hook."""
+        deferred = self._deferred_linker_rids
+        self._deferred_linker_rids = set()
+        failed = set(self.tree_cache.drain_linker_loads()) | deferred
+        sweep_chains = self.tree_cache.has_outstanding_failed_linker_chains()
+        if not failed and not sweep_chains:
+            return
+        message = "Aborted: external KV cache load failed."
+        handled = set()
+        for req in self._iter_external_linker_candidates(batch):
+            rid_match = req.rid in failed
+            chain_match = sweep_chains and self.tree_cache.is_on_failed_linker_chain(
+                getattr(req, "last_node", None)
+            )
+            if not rid_match and not chain_match:
+                continue
+            if req.rid in self._external_kv_cleanup_rids:
+                handled.add(req.rid)
+                continue
+            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            if req is self.chunked_req:
+                req.external_kv_abort_response_via_chunked = True
+                self._external_kv_chunked_abort_reqs[req.rid] = req
+                self._pending_chunked_abort_req = req
+            self.abort_external_kv_request(
+                req,
+                forward_drained=False,
+                sender_terminal=False,
+                abort_message=message,
+                is_insert=False,
+                emit_response=False,
+            )
+            handled.add(req.rid)
+        failed -= handled
+        if failed:
+            self._deferred_linker_rids = failed - deferred
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

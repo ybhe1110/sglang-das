@@ -2655,6 +2655,23 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         return failed
 
+    def drain_linker_loads(self) -> list[str]:
+        """Compatibility wrapper for the release scheduler cleanup path."""
+        if self.linker is None:
+            return []
+        return self.linker.drain_linker_loads()
+
+    def has_outstanding_failed_linker_chains(self) -> bool:
+        return self.linker is not None and self.linker.has_outstanding_failed_linker_chains()
+
+    def is_on_failed_linker_chain(self, node_id) -> bool:
+        return self.linker is not None and self.linker.is_on_failed_linker_chain(node_id)
+
+    def retry_stranded_failed_linker_chains(self) -> list:
+        if self.linker is None:
+            return []
+        return self.linker.retry_stranded_failed_linker_chains()
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
