@@ -356,6 +356,46 @@ class TestSourceDrain(unittest.TestCase):
         self.tracker.poison(7)
         self.assertFalse(self.tracker.drained(7))
 
+    def test_sync_exception_releases_hazard_after_call_returns(self):
+        queue = Mock()
+        self.tracker.publish(self.chunk, queue, lambda: True)
+        self.tracker.begin(self.chunk)
+        with self.assertRaises(RuntimeError):
+            self.tracker.run(
+                lambda: (_ for _ in ()).throw(RuntimeError("sync failure"))
+            )
+        self.tracker.mark_unresolved(self.chunk)
+        self.assertTrue(self.tracker.finish_quiesced(self.chunk))
+        self.tracker.poison(7)
+        self.assertTrue(self.tracker.terminal(7))
+
+    def test_failed_future_completion_releases_hazard(self):
+        queue = Mock()
+        self.tracker.publish(self.chunk, queue, lambda: True)
+        self.tracker.begin(self.chunk)
+        with concurrent.futures.ThreadPoolExecutor(1) as executor:
+            future = self.tracker.submit(
+                executor,
+                lambda: (_ for _ in ()).throw(RuntimeError("future failure")),
+            )
+            with self.assertRaises(RuntimeError):
+                future.result()
+        self.tracker.mark_unresolved(self.chunk)
+        self.assertTrue(self.tracker.finish_quiesced(self.chunk))
+
+    def test_rejected_submit_does_not_leave_submission_hazard(self):
+        class RejectingExecutor:
+            def submit(self, fn):
+                raise RuntimeError("executor stopped")
+
+        queue = Mock()
+        self.tracker.publish(self.chunk, queue, lambda: True)
+        self.tracker.begin(self.chunk)
+        with self.assertRaises(RuntimeError):
+            self.tracker.submit(RejectingExecutor(), lambda: None)
+        self.tracker.mark_unresolved(self.chunk)
+        self.assertTrue(self.tracker.finish_quiesced(self.chunk))
+
     def test_sender_probe_wakes_parked_chunks_but_does_not_invent_drain(self):
         env = dict(KVPoll=KVPoll)
         cls = load_methods(CONN, ["source_transfers_drained"], env)
