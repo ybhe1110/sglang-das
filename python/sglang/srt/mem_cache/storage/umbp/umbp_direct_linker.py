@@ -324,9 +324,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
-        self._load_queue: Queue[tuple[int, list[_PoolRangePlan], object] | None] = (
-            Queue()
-        )
+        self._load_queue: Queue[
+            tuple[int, list[str], list[_PoolRangePlan], object] | None
+        ] = Queue()
+        self._completed_loads: Queue[tuple[list[str], bool]] = Queue()
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._stats = {
@@ -493,7 +494,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         ready_event = device_module.Event()
         ready_event.record()
         counter_index = self.layer_done_counter.update_producer()
-        self._load_queue.put((counter_index, plans, ready_event))
+        self._load_queue.put((counter_index, list(pending), plans, ready_event))
         self._pending = {}
         self._stats["load"] += len(pending)
         return counter_index
@@ -635,8 +636,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, plans, ready_event = task
-                self._run_layer_wise_batch(counter_index, plans, ready_event)
+                counter_index, rids, plans, ready_event = task
+                success = False
+                try:
+                    success = self._run_layer_wise_batch(
+                        counter_index, plans, ready_event
+                    )
+                finally:
+                    self._completed_loads.put((rids, success))
             finally:
                 self._load_queue.task_done()
 
@@ -961,6 +968,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def pop_completed_offload(self) -> bool:
         return self._offload_results.get_nowait()
 
+    def num_completed_loads(self) -> int:
+        return self._completed_loads.qsize()
+
+    def pop_completed_load(self) -> tuple[list[str], bool]:
+        return self._completed_loads.get_nowait()
+
     def reset(self) -> None:
         self._pending.clear()
         self._load_queue.join()
@@ -968,6 +981,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         while True:
             try:
                 self._offload_results.get_nowait()
+            except Empty:
+                break
+        while True:
+            try:
+                self._completed_loads.get_nowait()
             except Empty:
                 break
         self.layer_done_counter.reset()

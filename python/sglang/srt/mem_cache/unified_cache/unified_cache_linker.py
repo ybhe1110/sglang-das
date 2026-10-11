@@ -89,6 +89,13 @@ class LayerWiseLoadCounter:
             if threshold == self.num_layers - 1:
                 self.futures.pop(index, None)
 
+    def finish(self, index: int) -> bool:
+        """Wait for a batch and report whether every layer completed."""
+        futures = self.futures.pop(index, None)
+        if futures is None:
+            return True
+        return all(future.exception() is None for future in futures)
+
     def reset(self) -> None:
         self.producer_index = -1
         self.consumer_index = -1

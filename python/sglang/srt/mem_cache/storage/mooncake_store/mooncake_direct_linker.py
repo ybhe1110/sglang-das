@@ -324,6 +324,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.pending_load_tokens: dict[str, int] = {}
+        self.completed_loads: Queue[tuple[list[str], bool]] = Queue()
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -508,6 +509,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def finish_layer_wise_loading(self, counter_index: int) -> bool:
         return self.layer_done_counter.finish(counter_index)
 
+    def num_completed_loads(self) -> int:
+        return self.completed_loads.qsize()
+
+    def pop_completed_load(self) -> tuple[list[str], bool]:
+        return self.completed_loads.get_nowait()
+
     def freeze_gc_once(self) -> None:
         if self.gc_frozen:
             return
@@ -548,6 +555,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
                     self._finish_prefetch_metrics(list(pending), success is True)
+                    self.completed_loads.put((list(pending), success is True))
             finally:
                 self.load_queue.task_done()
 
@@ -896,6 +904,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         while True:
             try:
                 self.offload_results.get_nowait()
+            except Empty:
+                break
+        while True:
+            try:
+                self.completed_loads.get_nowait()
             except Empty:
                 break
         self.layer_done_counter.reset()
