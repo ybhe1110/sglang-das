@@ -55,6 +55,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_disagg_prefill_inflight_queue: Optional[Callable[[], object]] = None
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -146,9 +147,12 @@ class SchedulerInvariantChecker:
             stranded_nodes_count = len(getattr(
                 self.tree_cache, "_stranded_linker_nodes", []
             ))
-            inflight_reqs_count = len(getattr(
-                self.scheduler, "disagg_prefill_inflight_queue", []
-            ))
+            inflight_queue = (
+                self.get_disagg_prefill_inflight_queue()
+                if self.get_disagg_prefill_inflight_queue is not None
+                else []
+            )
+            inflight_reqs_count = len(inflight_queue or [])
             logger.error(
                 "Pool invariant detail: pool=full total=%d accounted=%d delta=%d "
                 "available=%d evictable=%d protected=%d session_held=%d uncached=%d "
@@ -195,9 +199,12 @@ class SchedulerInvariantChecker:
             stranded_nodes_count = len(getattr(
                 self.tree_cache, "_stranded_linker_nodes", []
             ))
-            inflight_reqs_count = len(getattr(
-                self.scheduler, "disagg_prefill_inflight_queue", []
-            ))
+            inflight_queue = (
+                self.get_disagg_prefill_inflight_queue()
+                if self.get_disagg_prefill_inflight_queue is not None
+                else []
+            )
+            inflight_reqs_count = len(inflight_queue or [])
             logger.error(
                 "Pool invariant detail: pool=swa total=%d accounted=%d delta=%d "
                 "available=%d evictable=%d protected=%d session_held=%d uncached=%d "

@@ -2641,7 +2641,11 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def load_back_is_cache_owned(self) -> bool:
-        return self.linker is None
+        # A PP1 external-linker load inserts the restored tail into the radix
+        # tree before returning, so those indices become cache-owned and must
+        # be protected from request cleanup. PP>1 deliberately keeps the
+        # loaded slots request-owned until the post-prefill PP insert completes.
+        return self.linker is None or self.pp_size == 1
 
     def finish_external_linker_loads(self, reqs: list[Req]) -> list[Req]:
         """Wait for the external-linker loads of the batch that just ran and
