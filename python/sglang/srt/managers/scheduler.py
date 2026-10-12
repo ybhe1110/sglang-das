@@ -3434,7 +3434,9 @@ class Scheduler(
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
             max_pool_usage = (
-                self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
+                self.pool_stats_observer
+                .get_pool_stats()
+                .get_admission_max_pool_usage()
             )
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
                 self.prefill_delayer, token_usage=max_pool_usage

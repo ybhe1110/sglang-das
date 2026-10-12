@@ -42,6 +42,14 @@ class PoolStats:
     swa_available_size: Optional[int] = None
     swa_evictable_size: Optional[int] = None
 
+    # Conservative values used by admission/throttling when a sampling window
+    # observes an invalid negative usage. Keep these separate from metrics: a
+    # fail-soft sample must not make the scheduler believe capacity is free.
+    full_num_used_for_admission: Optional[int] = None
+    full_token_usage_for_admission: Optional[float] = None
+    swa_num_used_for_admission: Optional[int] = None
+    swa_token_usage_for_admission: Optional[float] = None
+
     # For mamba pools
     mamba_num_used: Optional[int] = None
     mamba_usage: Optional[float] = None
@@ -65,10 +73,57 @@ class PoolStats:
 
         return num_used, token_usage
 
+    def get_admission_kv_token_stats(self) -> Tuple[int, float]:
+        """Return conservative KV usage for scheduling decisions."""
+        full_num_used = (
+            self.full_num_used
+            if self.full_num_used_for_admission is None
+            else self.full_num_used_for_admission
+        )
+        full_token_usage = (
+            self.full_token_usage
+            if self.full_token_usage_for_admission is None
+            else self.full_token_usage_for_admission
+        )
+        if self.is_hybrid_swa:
+            swa_num_used = (
+                self.swa_num_used
+                if self.swa_num_used_for_admission is None
+                else self.swa_num_used_for_admission
+            )
+            swa_token_usage = (
+                self.swa_token_usage
+                if self.swa_token_usage_for_admission is None
+                else self.swa_token_usage_for_admission
+            )
+            return max(full_num_used, swa_num_used), max(
+                full_token_usage, swa_token_usage
+            )
+        return full_num_used, full_token_usage
+
     def get_max_pool_usage(self) -> float:
         usage = self.full_token_usage
         if self.is_hybrid_swa:
             usage = max(usage, self.swa_token_usage)
+        if self.is_hybrid_ssm:
+            usage = max(usage, self.mamba_usage)
+        assert usage is not None and usage >= 0, f"{usage=} is not valid"
+        return usage
+
+    def get_admission_max_pool_usage(self) -> float:
+        """Return conservative pool usage for throttling/admission."""
+        usage = (
+            self.full_token_usage
+            if self.full_token_usage_for_admission is None
+            else self.full_token_usage_for_admission
+        )
+        if self.is_hybrid_swa:
+            swa_usage = (
+                self.swa_token_usage
+                if self.swa_token_usage_for_admission is None
+                else self.swa_token_usage_for_admission
+            )
+            usage = max(usage, swa_usage)
         if self.is_hybrid_ssm:
             usage = max(usage, self.mamba_usage)
         assert usage is not None and usage >= 0, f"{usage=} is not valid"
@@ -338,12 +393,15 @@ class SchedulerPoolStatsObserver:
         # metrics sample caught that short-lived mismatch.  The raw values are
         # logged so a persistent mismatch remains diagnosable; allocator free()
         # also de-duplicates token slots to prevent it from accumulating.
-        if full_num_used < 0 or swa_num_used < 0:
+        full_invalid = full_num_used < 0
+        swa_invalid = swa_num_used < 0
+        if full_invalid or swa_invalid:
             logger.warning(
                 "KV pool accounting observed negative usage; clamping sample: "
                 "full_used=%s swa_used=%s full_capacity=%s swa_capacity=%s "
                 "full_available=%s full_evictable=%s swa_available=%s "
-                "swa_evictable=%s request_swa_ring=%s",
+                "swa_evictable=%s request_swa_ring=%s allocator=%s "
+                "page_size=%s kvcache=%s unified_kv=%s",
                 full_num_used,
                 swa_num_used,
                 full_capacity,
@@ -353,6 +411,10 @@ class SchedulerPoolStatsObserver:
                 swa_available_size,
                 swa_evictable_size,
                 uses_request_swa_ring,
+                type(allocator).__name__,
+                getattr(allocator, "page_size", None),
+                type(kvcache).__name__ if kvcache is not None else None,
+                getattr(kvcache, "_unified_kv", False),
             )
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
@@ -364,6 +426,23 @@ class SchedulerPoolStatsObserver:
             full_token_usage = full_num_used / full_capacity
         swa_token_usage = swa_num_used / swa_capacity if swa_capacity else 0.0
 
+        # Metrics use the clamped sample above. Scheduling uses a conservative
+        # value for an invalid sample so a transient accounting mismatch cannot
+        # turn into over-admission. Once the allocator/tree views agree again,
+        # both paths use the same values.
+        full_num_used_for_admission = (
+            full_capacity if full_invalid else full_num_used
+        )
+        swa_num_used_for_admission = (
+            swa_capacity if swa_invalid else swa_num_used
+        )
+        full_token_usage_for_admission = (
+            1.0 if full_invalid else full_token_usage
+        )
+        swa_token_usage_for_admission = (
+            1.0 if swa_invalid else swa_token_usage
+        )
+
         return PoolStats(
             is_hybrid_swa=True,
             full_num_used=full_num_used,
@@ -374,4 +453,8 @@ class SchedulerPoolStatsObserver:
             swa_token_usage=swa_token_usage,
             swa_available_size=swa_available_size,
             swa_evictable_size=swa_evictable_size,
+            full_num_used_for_admission=full_num_used_for_admission,
+            full_token_usage_for_admission=full_token_usage_for_admission,
+            swa_num_used_for_admission=swa_num_used_for_admission,
+            swa_token_usage_for_admission=swa_token_usage_for_admission,
         )

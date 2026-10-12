@@ -128,7 +128,7 @@ class SchedulerLoadInquirer:
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
         num_used_tokens, kv_token_usage = (
-            self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
+            self.pool_stats_observer.get_pool_stats().get_admission_kv_token_stats()
         )
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
