@@ -68,6 +68,23 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
+            # Slot 0 is the padding sink and must never contribute to the
+            # available count.  More importantly, a cleanup retry can present
+            # the same slot twice (for example after an external KV load is
+            # aborted while its request is being retired).  Token allocators
+            # used to append both copies, making available_size() exceed the
+            # static capacity and turning pool usage negative.  Paged
+            # allocators already de-duplicate at page granularity; keep the
+            # token allocator's accounting equally idempotent.
+            free_index = torch.unique(free_index[free_index > 0])
+            if free_index.numel() == 0:
+                return
+            occupied = self.free_pages
+            if self.need_sort and self.release_pages.numel() > 0:
+                occupied = torch.cat((occupied, self.release_pages))
+            free_index = free_index[~torch.isin(free_index, occupied)]
+            if free_index.numel() == 0:
+                return
             if self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -18,6 +19,9 @@ if TYPE_CHECKING:
 
 
 class SchedulerStats: ...  # type: ignore[no-redef]
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -283,30 +287,82 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        allocator = self.token_to_kv_pool_allocator
+        # Some hybrid allocators coordinate a shared byte budget and expose the
+        # static-capacity view separately.  Prefer that view when available;
+        # the equation below is a slot-conservation equation, so mixing a
+        # byte-budget availability with a token capacity produces false
+        # negative usage.
+        capacity_and_available = getattr(
+            allocator, "swa_capacity_and_available", None
+        )
+        if callable(capacity_and_available):
+            (full_capacity, full_available_size), (
+                swa_capacity,
+                swa_available_size,
+            ) = capacity_and_available(
+                full_capacity=self.full_tokens_per_layer,
+                swa_capacity=self.swa_tokens_per_layer,
+            )
+        else:
+            full_capacity = self.full_tokens_per_layer
+            swa_capacity = self.swa_tokens_per_layer
+            full_available_size = allocator.full_available_size()
+            swa_available_size = allocator.swa_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
-        full_num_used = self.full_tokens_per_layer - (
+
+        # A request-owned SWA ring is released with the request slot, while
+        # cached radix prefixes can still report SWA values.  Those values do
+        # not consume the ring allocator and must not be charged against its
+        # capacity.  Keep this duck-typed for HCU/DSV4 allocator variants that
+        # expose the flag without sharing the upstream class hierarchy.
+        kvcache = getattr(allocator, "_kvcache", None)
+        uses_request_swa_ring = bool(
+            getattr(allocator, "swa_req_ring", False)
+            or getattr(allocator, "_swa_req_ring", False)
+            or getattr(kvcache, "swa_req_ring_size", None) is not None
+            or getattr(kvcache, "_unified_kv", False)
+        )
+        if uses_request_swa_ring:
+            swa_evictable_size = 0
+
+        full_num_used = full_capacity - (
             full_available_size + full_evictable_size
         )
-        swa_num_used = self.swa_tokens_per_layer - (
+        swa_num_used = swa_capacity - (
             swa_available_size + swa_evictable_size
         )
-        # FIXME(hisparse): host-backup transiently over-releases the device pool
-        # counter, producing negative full_num_used / swa_num_used. We clamp to 0
-        # to keep token_usage / leak checks sane, but the underlying accounting
-        # bug should be fixed so the clamp can go away.
-        if self.enable_hisparse:
+        # Cleanup and eviction can be observed between their allocator and tree
+        # bookkeeping barriers.  Do not take down the scheduler because a
+        # metrics sample caught that short-lived mismatch.  The raw values are
+        # logged so a persistent mismatch remains diagnosable; allocator free()
+        # also de-duplicates token slots to prevent it from accumulating.
+        if full_num_used < 0 or swa_num_used < 0:
+            logger.warning(
+                "KV pool accounting observed negative usage; clamping sample: "
+                "full_used=%s swa_used=%s full_capacity=%s swa_capacity=%s "
+                "full_available=%s full_evictable=%s swa_available=%s "
+                "swa_evictable=%s request_swa_ring=%s",
+                full_num_used,
+                swa_num_used,
+                full_capacity,
+                swa_capacity,
+                full_available_size,
+                full_evictable_size,
+                swa_available_size,
+                swa_evictable_size,
+                uses_request_swa_ring,
+            )
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
-        if not self.full_tokens_per_layer:
+        if not full_capacity:
             full_num_used = 0
             full_available_size = 0
             full_token_usage = 0.0
         else:
-            full_token_usage = full_num_used / self.full_tokens_per_layer
-        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+            full_token_usage = full_num_used / full_capacity
+        swa_token_usage = swa_num_used / swa_capacity if swa_capacity else 0.0
 
         return PoolStats(
             is_hybrid_swa=True,
