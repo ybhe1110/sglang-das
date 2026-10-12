@@ -2294,6 +2294,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             "Failed to publish worker-exit status for room %s", room
                         )
 
+    def _poison_unsettled_send(self, room: int) -> None:
+        """Keep the drain ack from firing after a submitted transfer failed.
+
+        batch_transfer_sync returns -1 on its wall-clock timeout with the batch
+        still running (freeBatchID refuses a busy batch and the handle is
+        dropped), so a failed send may still be writing decode's pages; decode
+        falls back to its release timeout instead."""
+        if self.enable_deferred_decode_kv_release:
+            self.poison_deferred_ack_room(room)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -2794,6 +2804,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 executor,
                             )
                         if ret != 0:
+                            self._poison_unsettled_send(kv_chunk.room)
                             self._mark_session_failed_and_sync(
                                 kv_chunk=kv_chunk,
                                 req=req,
@@ -2815,6 +2826,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                # Before the Failed check: an ABORT during the
+                                # send also marks the room Failed.
+                                if state_rc != 0:
+                                    self._poison_unsettled_send(kv_chunk.room)
+                                if (
+                                    self.request_status.get(
+                                        kv_chunk.room, KVPoll.Failed
+                                    )
+                                    == KVPoll.Failed
+                                ):
+                                    break
                                 if state_rc != 0:
                                     with self.session_lock:
                                         self.session_failures[
@@ -2839,6 +2861,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            if ret != 0:
+                                # The aux write targets decode's metadata
+                                # slot, which the deferred release also frees.
+                                self._poison_unsettled_send(req.room)
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append((req.endpoint, req.dst_port))
 
