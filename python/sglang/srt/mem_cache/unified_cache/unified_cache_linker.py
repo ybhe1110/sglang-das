@@ -57,6 +57,10 @@ class LayerWiseLoadCounter:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures: dict[int, list[Future]] = {}
+        # A last-layer wait removes the future list before finish() runs. Keep
+        # the failed verdict separately so a failed load cannot become a
+        # successful load merely because forward consumed its last layer.
+        self.reported: set[int] = set()
 
     def update_producer(self) -> int:
         self.producer_index += 1
@@ -80,11 +84,18 @@ class LayerWiseLoadCounter:
         if futures is None:
             return
         try:
-            futures[threshold].result()
+            # ``exception()`` waits for completion without propagating the
+            # backend error into model forward. The scheduler commits the
+            # fail-soft verdict after forward in finish_loads().
+            error = futures[threshold].exception()
+            if error is not None:
+                self.reported.add(index)
             if self.on_layer_ready is not None:
                 self.on_layer_ready(index, threshold)
         except BaseException as error:
-            raise RuntimeError("Layer-wise KV load failed.") from error
+            self.reported.add(index)
+            # Do not retain a worker traceback on a long-lived counter.
+            error.__traceback__ = None
         finally:
             if threshold == self.num_layers - 1:
                 self.futures.pop(index, None)
@@ -92,14 +103,20 @@ class LayerWiseLoadCounter:
     def finish(self, index: int) -> bool:
         """Wait for a batch and report whether every layer completed."""
         futures = self.futures.pop(index, None)
+        failed = index in self.reported
+        self.reported.discard(index)
         if futures is None:
-            return True
-        return all(future.exception() is None for future in futures)
+            return not failed
+        try:
+            return not failed and all(future.exception() is None for future in futures)
+        except BaseException:
+            return False
 
     def reset(self) -> None:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures.clear()
+        self.reported.clear()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -765,7 +782,15 @@ class UnifiedCacheLinkerWrapper:
         request-owned slots.  Reduce each batch verdict before detaching a
         chain so all TP/CP ranks abort the same requests.
         """
-        finish_count = min(self.num_completed_loads(), len(self.pending_loads))
+        # Every rank must enter this collective, including ranks whose local
+        # completion queue is still empty. Otherwise a ready rank can block
+        # forever in the verdict all-reduce while another rank returns early.
+        local_count = min(self.num_completed_loads(), len(self.pending_loads))
+        finish_count_tensor = torch.tensor([local_count], dtype=torch.int, device="cpu")
+        self.cache._all_reduce_attn_groups(
+            finish_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        finish_count = int(finish_count_tensor.item())
         if finish_count <= 0:
             return []
         local_successes = self.take_completed_loads(finish_count)
@@ -789,8 +814,29 @@ class UnifiedCacheLinkerWrapper:
         return any(node_id in chain for chain in self.failed_chains.values())
 
     def retry_stranded_failed_linker_chains(self) -> list[NodeId]:
-        """Compatibility hook; failed chains are retired by finish_loads()."""
-        return []
+        """Reclaim detached chains after the failed request released its lock.
+
+        A failed load is detached before its request cleanup runs.  The lock
+        release may make the endpoint reclaimable only later, so retry the
+        endpoint-first chain on each scheduler sweep and retain only nodes
+        that are still owned.  The tree core returns the actual pool frees;
+        consume them through the cache so allocator accounting stays paired.
+        """
+        reclaimed: list[NodeId] = []
+        for rid, chain in list(self.failed_chains.items()):
+            remaining: list[NodeId] = []
+            for node_id in chain:
+                result = self.cache.tree_core.invalidate_external_load_chain(node_id)
+                self.cache._free_values(result.device_frees, result.host_frees)
+                if result.is_dropped:
+                    reclaimed.append(node_id)
+                elif self.cache.tree_core.holds_detached_node(node_id):
+                    remaining.append(node_id)
+            if remaining:
+                self.failed_chains[rid] = remaining
+            else:
+                self.failed_chains.pop(rid, None)
+        return reclaimed
 
     # ---- lifecycle ----
 

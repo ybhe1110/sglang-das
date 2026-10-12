@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, Type
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.disaggregation.utils import EXTERNAL_KV_LOAD_ERR_TYPE
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -243,6 +244,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        # Failed external loads are detached from the tree before the
+        # request's final lock release. Keep nodes that another request still
+        # owns and retry them when that owner finishes.
+        self._stranded_linker_nodes: list[NodeId] = []
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -347,6 +352,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
+        self._stranded_linker_nodes.clear()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -759,6 +765,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+            self._reclaim_failed_linker_chain(req.rid)
             return
 
         if self.disable:
@@ -830,6 +837,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+        self._reclaim_failed_linker_chain(req.rid)
 
         if is_insert and result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node
@@ -2650,8 +2658,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
             for req in failed:
                 req.skip_radix_cache_insert = True
+                req.external_kv_abort_requested = True
                 req.discard_output_reason = FINISH_ABORT(
-                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                    "External KV cache load failed",
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
                 )
         return failed
 
@@ -2662,15 +2673,54 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.linker.drain_linker_loads()
 
     def has_outstanding_failed_linker_chains(self) -> bool:
-        return self.linker is not None and self.linker.has_outstanding_failed_linker_chains()
+        if self.linker is None:
+            return False
+        has_failed = getattr(self.linker, "has_outstanding_failed_linker_chains", None)
+        backend_failed = (
+            has_failed()
+            if callable(has_failed)
+            else bool(getattr(self.linker, "failed_chains", {}))
+        )
+        return bool(self._stranded_linker_nodes) or backend_failed
 
     def is_on_failed_linker_chain(self, node_id) -> bool:
-        return self.linker is not None and self.linker.is_on_failed_linker_chain(node_id)
+        return (
+            self.linker is not None
+            and node_id is not None
+            and self.tree_core.is_on_detached_chain(node_id)
+        )
+
+    def _reclaim_failed_linker_chain(self, rid: str) -> None:
+        """Free detached chains after a request releases its tree lock.
+
+        The loader is not necessarily the last owner: another request may
+        have matched the chain while the load was in flight. Endpoint-first
+        retries preserve the parent/child reclaim order, and nodes that have
+        already been evicted are simply discarded from the retry list.
+        """
+        if self.linker is None:
+            return
+        pending = self._stranded_linker_nodes + self.linker.take_failed_chain(rid)
+        if not pending:
+            return
+        pending = list(dict.fromkeys(pending))
+        self._stranded_linker_nodes = []
+        stranded: list[NodeId] = []
+        for node_id in pending:
+            result = self.tree_core.invalidate_external_load_chain(node_id)
+            self._free_values(result.device_frees, result.host_frees)
+            if result.is_dropped:
+                continue
+            if self.tree_core.holds_detached_node(node_id):
+                stranded.append(node_id)
+        self._stranded_linker_nodes = stranded
 
     def retry_stranded_failed_linker_chains(self) -> list:
-        if self.linker is None:
+        if self.linker is None or not self._stranded_linker_nodes:
             return []
-        return self.linker.retry_stranded_failed_linker_chains()
+        before = set(self._stranded_linker_nodes)
+        self._reclaim_failed_linker_chain("")
+        return list(before - set(self._stranded_linker_nodes))
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""

@@ -997,6 +997,9 @@ class SWAComponent(TreeComponent):
         full_transfer: PoolTransfer,
         transfer: PoolTransfer,
         prefix_len: int,
+        *,
+        insert_result=None,
+        canonical_full: Optional[torch.Tensor] = None,
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
             self.cache.token_to_kv_pool_allocator.swa_attn_allocator.free(
@@ -1022,6 +1025,13 @@ class SWAComponent(TreeComponent):
                 )
             else:
                 req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
+        elif phase == ExternalLinkerLoadPhase.COMMIT and canonical_full is not None:
+            # The tree may adopt only disjoint portions of the loaded tail and
+            # may canonicalize Full pages during insertion. Refresh the
+            # Full->SWA mapping with exactly the pages that were committed.
+            allocator.set_full_to_swa_mapping(
+                canonical_full.to(torch.int64), transfer.device_indices
+            )
         return transfer
 
     def commit_hicache_transfer(
