@@ -14,6 +14,7 @@ from sglang.srt.disaggregation import prefill  # noqa: E402
 from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
 from sglang.srt.disaggregation.utils import EXTERNAL_KV_LOAD_ERR_TYPE  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -65,6 +66,12 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         s._pending_chunked_abort_req = None
         s._external_kv_chunked_abort_reqs = {}
         s.chunked_req = None
+        s.process_pending_chunked_abort = Scheduler.process_pending_chunked_abort.__get__(
+            s, type(s)
+        )
+        s._process_external_kv_chunked_abort = (
+            Scheduler._process_external_kv_chunked_abort.__get__(s, type(s))
+        )
         s.disagg_prefill_pending_chunk_rids = {self.req.rid}
         s.disagg_prefill_inflight_queue = []
         s.result_queue = []
