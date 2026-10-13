@@ -155,6 +155,7 @@ def _make_wrapper(completions, chain_len=3):
     wrapper.cache_linker = FakeLinker(completions)
     wrapper.hit_markers = {}
     wrapper.pending_loads = {}
+    wrapper.pending_load_allocations = {}
     wrapper.pending_offloads = []
     wrapper.failed_chains = {}
     wrapper.taken_loads = []
@@ -185,19 +186,19 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
         self.assertEqual(wrapper.cache.locks, 0)
         self.assertEqual(wrapper.pending_loads, {})
 
-    def test_failed_batch_detaches_the_chain_it_published(self):
-        """The published chain must never be offloaded back into the store."""
+    def test_failed_batch_does_not_detach_request_private_slots(self):
+        """A private load has no radix-tree chain to detach on failure."""
         wrapper = _make_wrapper([(["rid-a"], False)])
         wrapper._queue_load("rid-a", 2, ["transfer"], anchor=0)
 
         _drain(wrapper, 1)
 
-        # Nodes 1 and 2 were published by this load; node 0 is the anchor the
-        # request already had, and must be left alone.
-        self.assertTrue(wrapper.cache.nodes[2].detached)
-        self.assertTrue(wrapper.cache.nodes[1].detached)
+        # The request owns the loaded slots; no node was published by the
+        # load-back, so the existing anchor and tree remain untouched.
+        self.assertFalse(wrapper.cache.nodes[2].detached)
+        self.assertFalse(wrapper.cache.nodes[1].detached)
         self.assertFalse(wrapper.cache.nodes[0].detached)
-        self.assertEqual(wrapper.take_failed_chain("rid-a"), [2, 1])
+        self.assertEqual(wrapper.take_failed_chain("rid-a"), [])
         self.assertEqual(wrapper.take_failed_chain("rid-a"), [])
 
     def test_successful_batch_reports_nothing_and_keeps_the_chain(self):
@@ -255,8 +256,8 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
 
         self.assertEqual(failed, ["rid-a"])
         self.assertEqual(wrapper.cache.locks, 0)
-        self.assertTrue(wrapper.cache.nodes[2].detached)
-        self.assertEqual(wrapper.take_failed_chain("rid-a"), [2, 1])
+        self.assertFalse(wrapper.cache.nodes[2].detached)
+        self.assertEqual(wrapper.take_failed_chain("rid-a"), [])
 
     def test_commit_keeps_a_chain_when_the_group_agrees_it_landed(self):
         wrapper = _make_wrapper([(["rid-a"], True)])

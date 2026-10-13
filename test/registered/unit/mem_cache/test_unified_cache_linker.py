@@ -197,8 +197,8 @@ def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_l
     assert pp0.has_hit("rid") == (hit_pages * 2 > device_hit_len)
 
 
-@pytest.fixture
-def pp_cache():
+@pytest.fixture(params=[1, 2], ids=["pp1", "pp2"])
+def pp_cache(request):
     pool = SWAKVPool(
         size=32,
         size_swa=32,
@@ -220,7 +220,7 @@ def pp_cache():
             req_to_token_pool=req_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=1,
-            pp_size=2,
+            pp_size=request.param,
             sliding_window_size=4,
             tree_components=(ComponentType.FULL, ComponentType.SWA),
         )
@@ -244,10 +244,15 @@ def pp_cache():
 def test_pp_load_uses_normal_request_insert_and_release(pp_cache, overlap, outcome):
     cache, allocator, req, backend = pp_cache
     key = RadixKey(req.origin_input_ids)
+    insert_calls = []
+    original_insert = cache.insert
+    cache.insert = lambda params: insert_calls.append(params)
     loaded, last_node = cache.linker.load_back(req)
+    cache.insert = original_insert
 
     assert len(loaded) == 4
     assert last_node == req.last_node == cache.root_node_handle()
+    assert insert_calls == []
     # Upstream reads req.kv.cache_protected_len; on this branch the field lives
     # directly on Req (ReqKvInfo carries only kv_allocated_len/swa_evicted_seqlen).
     assert req.cache_protected_len == 0
@@ -285,6 +290,33 @@ def test_pp_load_uses_normal_request_insert_and_release(pp_cache, overlap, outco
     assert allocator.swa_available_size() == 32 - len(expected)
     if outcome != "abort":
         assert torch.all(allocator.translate_loc_from_full_to_swa(matched) > 0)
+
+
+def test_external_linker_failed_private_load_is_released_by_abort_cleanup(pp_cache):
+    cache, allocator, req, backend = pp_cache
+    key = RadixKey(req.origin_input_ids)
+    loaded, last_node = cache.linker.load_back(req)
+
+    assert last_node == req.last_node == cache.root_node_handle()
+    assert cache.match_prefix(MatchPrefixParams(key=key)).device_indices.numel() == 0
+
+    req.prefix_indices = loaded
+    req.set_extend_range(4, 5)
+    values = torch.cat([loaded, allocator.alloc(1)])
+    cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), values)
+
+    backend.completed_loads.append(([req.rid], False))
+    failed = cache.linker.commit_completed_loads(
+        cache.linker.take_completed_loads(1)
+    )
+    assert failed == [req.rid]
+    assert not cache.linker.failed_chains
+
+    req.skip_radix_cache_insert = True
+    cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=5)
+
+    assert allocator.full_available_size() == allocator.swa_available_size() == 32
+    assert cache.match_prefix(MatchPrefixParams(key=key)).device_indices.numel() == 0
 
 
 @pytest.mark.parametrize("raises", [False, True])
