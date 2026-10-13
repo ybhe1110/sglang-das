@@ -63,12 +63,15 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         s._external_kv_abort_rids = set()
         s._external_kv_cleanup_rids = set()
         s._pending_chunked_abort_req = None
+        s._external_kv_chunked_abort_reqs = {}
+        s.chunked_req = None
         s.disagg_prefill_pending_chunk_rids = {self.req.rid}
         s.disagg_prefill_inflight_queue = []
         s.result_queue = []
         s._release_aborted_request = Mock()
         s.clear_pending_chunk_send = Mock(wraps=s.clear_pending_chunk_send)
         s.output_streamer = Mock()
+        s.ipc_channels = SimpleNamespace(send_to_tokenizer=Mock())
         s.req_to_metadata_buffer_idx_allocator = object()
         s.disagg_metadata_buffers = SimpleNamespace(pd_hidden_pool=object())
         s.tree_cache = object()
@@ -287,6 +290,55 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             emit_response=True,
         )
         self.assertIn("original Mooncake failure", self.req.to_finish.message)
+
+    def test_inflight_failure_retains_live_chunked_request_until_cleanup(self):
+        """P->D failure must park a live chunked request before releasing it."""
+        s = self.scheduler
+        s.chunked_req = self.req
+        self.req.inflight_middle_chunks = 1
+
+        with patch.object(
+            s,
+            "prefill_abort_sender_terminal",
+            side_effect=[False, True, True],
+        ):
+            _, done = s.handle_inflight_transfer_failure(
+                self.req,
+                sender_terminal=False,
+            )
+
+            self.assertFalse(done)
+            self.assertIs(s.chunked_req, self.req)
+            self.assertIs(s._pending_chunked_abort_req, self.req)
+            self.assertIs(
+                s._external_kv_chunked_abort_reqs[self.req.rid], self.req
+            )
+            self.assertTrue(self.req.external_kv_abort_response_via_chunked)
+            self.cache.assert_not_called()
+            s.output_streamer.stream_output.assert_not_called()
+
+            # The current forward is still executing.  The scheduler may clear
+            # the active pointer to prevent another chunk from launching, but
+            # the retry map must retain the request and its resources.
+            s.process_pending_chunked_abort()
+            self.assertIsNone(s.chunked_req)
+            self.assertIn(self.req.rid, s._external_kv_chunked_abort_reqs)
+            self.cache.assert_not_called()
+
+            # Once both the forward and sender are terminal, cleanup completes
+            # and the retry owner is removed exactly once.
+            self.req.inflight_middle_chunks = 0
+            s.process_pending_chunked_abort()
+
+        self.cache.assert_called_once_with(
+            self.req,
+            s.tree_cache,
+            is_insert=False,
+        )
+        self.assertTrue(self.req.external_kv_cleanup_done)
+        self.assertTrue(self.req.external_kv_response_sent)
+        self.assertNotIn(self.req.rid, s._external_kv_chunked_abort_reqs)
+        self.assertIsNone(s._pending_chunked_abort_req)
 
     def test_inflight_queue_retains_failed_cleanup_then_finishes_once(self):
         self.scheduler.disagg_prefill_inflight_queue = [self.req]

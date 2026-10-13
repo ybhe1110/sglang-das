@@ -2644,6 +2644,18 @@ class SchedulerDisaggregationPrefillMixin:
             req.to_finish = FINISH_ABORT(
                 error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
+        # A transfer can fail while the request is still the live chunked
+        # request.  Keep a strong retry owner and clear ``chunked_req`` only
+        # from ``process_pending_chunked_abort`` after the current forward has
+        # drained; otherwise the next scheduler step can either launch a new
+        # chunk for a failed request or release its resources too early.
+        if req is getattr(self, "chunked_req", None):
+            req.external_kv_abort_response_via_chunked = True
+            pending = getattr(self, "_external_kv_chunked_abort_reqs", None)
+            if pending is None:
+                pending = self._external_kv_chunked_abort_reqs = {}
+            pending[req.rid] = req
+            self._pending_chunked_abort_req = req
         cleanup_done = self.abort_external_kv_request(
             req,
             forward_drained=self.prefill_abort_forward_drained(req),
