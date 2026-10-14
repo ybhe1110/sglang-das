@@ -1203,6 +1203,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Internal PP handoff: the absolute external-cache boundary selected by PP0.
     external_cache_hit_length: Optional[int] = None
 
+    # Internal controller epoch, rank, sequence, cumulative token reservation.
+    dp_budget_ticket: Optional[Tuple[str, int, int, int]] = None
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 
@@ -1568,6 +1571,9 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     time_stats: Optional[PickleWrapper] = None
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+
+    # Internal controller epoch, rank, sequence, cumulative token reservation.
+    dp_budget_ticket: Optional[Tuple[str, int, int, int]] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

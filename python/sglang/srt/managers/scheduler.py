@@ -130,6 +130,7 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
+from sglang.srt.managers.dp_budget import SchedulerDPBudget
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -859,6 +860,13 @@ class Scheduler(
         self.metrics_collector = self.metrics_collector_context.collector
 
     def init_ipc_channels(self, port_args: PortArgs):
+        """Initialize scheduler IPC, load publication and dispatch accounting.
+
+        Args:
+            port_args: Resolved process and load-snapshot endpoints.
+        Returns:
+            None.
+        """
         is_rank_zero = (
             get_parallel().pp_rank == 0
             and get_parallel().attn_tp_rank == 0
@@ -880,6 +888,10 @@ class Scheduler(
         )
 
         self.load_snapshot_writer = None
+        parallel = get_parallel()
+        self.dp_budget_source = SchedulerDPBudget(
+            parallel.dp_rank if parallel.dp_rank is not None else 0
+        )
         self.recv_from_tokenizer = None
 
         if not is_rank_zero:
@@ -928,6 +940,7 @@ class Scheduler(
         writer.publish_counter = 0
         try:
             load = self.load_inquirer.get_loads()
+            self.dp_budget_source.attach(self, load)
             writer.write(load)
             return load
         except Exception as e:
@@ -2732,6 +2745,8 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
 
         for recv_req in recv_reqs:
+            # Validate the routed ticket before any early exit below.
+            self.dp_budget_source.begin(recv_req)
             # Before any early exit, so every request releases its CUDA IPC pool slot.
             for tokenized_req in self._tokenized_requests(recv_req):
                 if tokenized_req.positional_embed_overrides is not None:
@@ -2753,13 +2768,16 @@ class Scheduler(
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
+                self.dp_budget_source.complete()
                 continue
 
             if vmm_errors is not None and any(vmm_errors):
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
+                self.dp_budget_source.complete()
                 continue
 
             output = self._request_dispatcher(recv_req)
+            self.dp_budget_source.complete()
             if output is not None:
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:

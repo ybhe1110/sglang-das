@@ -21,7 +21,6 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum, auto
 from multiprocessing.connection import Connection, wait
 
 import psutil
@@ -36,6 +35,7 @@ from sglang.srt.elastic_ep.topology import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.dp_budget import DPBudget, LoadBalanceMethod
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -99,59 +99,6 @@ class WorkerPortHandshake:
     worker_ports: list[int]
     attn_tp_size: int
     attn_cp_size: int
-
-
-class LoadBalanceMethod(Enum):
-    """Load balance method."""
-
-    ROUND_ROBIN = auto()
-    FOLLOW_BOOTSTRAP_ROOM = auto()
-    TOTAL_REQUESTS = auto()
-    TOTAL_TOKENS = auto()
-
-    @classmethod
-    def from_str(cls, method: str):
-        method = method.upper()
-        try:
-            return cls[method]
-        except KeyError as exc:
-            raise ValueError(f"Invalid load balance method: {method}") from exc
-
-
-class DPBudget:
-    def __init__(self, num_dp_ranks: int):
-        self.num_dp_ranks = num_dp_ranks
-        self.total_requests = [0] * num_dp_ranks
-        self.total_tokens = [0] * num_dp_ranks
-        self.last_timestamp = [0.0] * num_dp_ranks
-
-    def update_budget(self, loads):
-        """Update budget from shm snapshots, skipping stale reads."""
-        for load in loads:
-            if load.timestamp == self.last_timestamp[load.dp_rank]:
-                continue
-            self.last_timestamp[load.dp_rank] = load.timestamp
-            self.total_requests[load.dp_rank] = (
-                load.num_running_reqs + load.num_waiting_reqs
-            )
-            self.total_tokens[load.dp_rank] = load.num_total_tokens
-
-    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
-        if method == LoadBalanceMethod.TOTAL_REQUESTS:
-            target_rank = self.total_requests.index(min(self.total_requests))
-        elif method == LoadBalanceMethod.TOTAL_TOKENS:
-            # Use total_requests as a tie-breaker when total_tokens are equal
-            target_rank = min(
-                range(self.num_dp_ranks),
-                key=lambda i: (self.total_tokens[i], self.total_requests[i]),
-            )
-        else:
-            return None
-
-        # Increment the load of that worker by one as a heuristic
-        self.total_requests[target_rank] += 1
-        self.total_tokens[target_rank] += estimated_tokens
-        return target_rank
 
 
 class DataParallelController:
@@ -346,16 +293,11 @@ class DataParallelController:
         self._active_count_cache = len(self._active_workers)
 
     def refresh_load_budget(self):
-        # Throttle to at most once per 20ms.  When a burst of requests
-        # arrives, dispatching_with_trace() calls this before every
-        # dispatch.  Each call reads the latest scheduler snapshot and
-        # overwrites the speculative +1 increments that DPBudget.dispatch()
-        # added for previously dispatched requests in this burst.  Without
-        # throttling, the budget resets to the (stale) scheduler-reported
-        # value on every request, causing the entire burst to land on a
-        # single DP rank.  The 20ms interval lets the burst complete
-        # using speculative counters, then refreshes from the real
-        # scheduler load for the next batch.
+        """Refresh source loads at most every 20 ms, preserving unconfirmed work.
+
+        Returns:
+            None. Updates the controller's per-rank dispatch budget.
+        """
         now = time.perf_counter()
         if now - self._last_refresh_time < 0.02:
             return
@@ -889,18 +831,34 @@ class DataParallelController:
         sock_send(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):
+        """Reserve and send req to the rank with the fewest requests.
+
+        Args:
+            req: Tokenized request to dispatch.
+        Returns:
+            None.
+        """
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        req.dp_budget_ticket = self.dp_budget.ticket(target_worker)
         sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
+        """Reserve and send req to the rank with the fewest tokens.
+
+        Args:
+            req: Tokenized request whose input length estimates its token load.
+        Returns:
+            None.
+        """
         if self.maybe_external_dp_rank_routing(req):
             return
         estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
+        req.dp_budget_ticket = self.dp_budget.ticket(target_worker)
         sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
