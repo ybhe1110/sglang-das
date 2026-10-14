@@ -45,6 +45,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.dp_budget import SchedulerDPBudget
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
@@ -69,6 +70,7 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    dp_budget_source: Optional[SchedulerDPBudget] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -232,7 +234,8 @@ class SchedulerRequestReceiver:
             and get_disagg().encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
         ):
-            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            incoming = recv_reqs
+            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(incoming)
             for req, error_msg, error_code in abort_reqs:
                 if error_code is None:
                     status_code = HTTPStatus.INTERNAL_SERVER_ERROR
@@ -242,6 +245,8 @@ class SchedulerRequestReceiver:
                     status_code = HTTPStatus(int(error_code))
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
+            if self.dp_budget_source is not None:
+                self.dp_budget_source.accept_mm_inputs(incoming)
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:

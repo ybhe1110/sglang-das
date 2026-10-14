@@ -1154,6 +1154,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
 
+    # Internal controller epoch, rank, sequence, cumulative token reservation.
+    dp_budget_ticket: Optional[Tuple[str, int, int, int]] = None
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 
@@ -1505,6 +1508,9 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
+    # Internal controller epoch, rank, sequence, cumulative token reservation.
+    dp_budget_ticket: Optional[Tuple[str, int, int, int]] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

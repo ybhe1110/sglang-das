@@ -121,6 +121,7 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
+from sglang.srt.managers.dp_budget import SchedulerDPBudget
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -794,6 +795,13 @@ class Scheduler(
         self.metrics_collector = self.metrics_collector_context.collector
 
     def init_ipc_channels(self, port_args: PortArgs):
+        """Initialize scheduler IPC, load publication and dispatch accounting.
+
+        Args:
+            port_args: Resolved process and load-snapshot endpoints.
+        Returns:
+            None.
+        """
         is_rank_zero = (
             get_parallel().pp_rank == 0
             and get_parallel().attn_tp_rank == 0
@@ -815,13 +823,14 @@ class Scheduler(
         )
 
         self.load_snapshot_writer = None
+        dp_rank = get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
+        self.dp_budget_source = SchedulerDPBudget(dp_rank) if is_rank_zero else None
         self.recv_from_tokenizer = None
 
         if not is_rank_zero:
             return
 
         self.recv_from_tokenizer = self.ipc_channels.recv_from_tokenizer
-        dp_rank = get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
                 port_args,
@@ -863,6 +872,7 @@ class Scheduler(
         writer.publish_counter = 0
         try:
             load = self.load_inquirer.get_loads()
+            self.dp_budget_source.attach(self, load)
             writer.write(load)
             return load
         except Exception as e:
@@ -2205,10 +2215,20 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
+        """Handle recv_reqs in FIFO order and confirm routed dispatch tickets.
+
+        Args:
+            recv_reqs: Requests and control messages received from IPC.
+        Returns:
+            None. Request handlers enqueue work or emit terminal responses.
+        """
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
 
+        budget = self.dp_budget_source
         for recv_req in recv_reqs:
+            if budget is not None:
+                budget.begin(recv_req)
             vmm_errors = None
             if get_mm().mm_feature_transport == "cuda_vmm":
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
@@ -2220,24 +2240,23 @@ class Scheduler(
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
-                continue
-
-            if vmm_errors is not None and any(vmm_errors):
+            elif vmm_errors is not None and any(vmm_errors):
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
-                continue
-
-            output = self._request_dispatcher(recv_req)
-            if output is not None:
-                if self.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.rust_server.push_control_output(recv_req, output)
-                elif isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                else:
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+            else:
+                output = self._request_dispatcher(recv_req)
+                if output is not None:
+                    if self.rust_server is not None:
+                        # Embedded Rust server: every control-request response goes
+                        # back through the egress ring (the zmq tokenizer socket is
+                        # not consumed); the Rust api_server shapes it per-endpoint.
+                        self.rust_server.push_control_output(recv_req, output)
+                    elif isinstance(output, RpcReqOutput):
+                        if self.ipc_channels.recv_from_rpc is not None:
+                            sock_send(self.ipc_channels.recv_from_rpc, output)
+                    else:
+                        self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+            if budget is not None:
+                budget.complete()
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -2428,6 +2447,7 @@ class Scheduler(
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
+            dp_budget_source=self.dp_budget_source,
             server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
