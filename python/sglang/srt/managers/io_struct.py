@@ -1044,6 +1044,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # the external cache; later stages reuse it instead of querying again.
     external_cache_hit_length: Optional[int] = None
 
+    # Internal controller epoch, rank, sequence, cumulative token reservation.
+    dp_budget_ticket: Optional[Tuple[str, int, int, int]] = None
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 
@@ -1329,6 +1332,9 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
+    # Internal controller epoch, rank, sequence, cumulative token reservation.
+    dp_budget_ticket: Optional[Tuple[str, int, int, int]] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

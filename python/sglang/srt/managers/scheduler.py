@@ -118,6 +118,7 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
+from sglang.srt.managers.dp_budget import SchedulerDPBudget
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -772,6 +773,13 @@ class Scheduler(
         self.metrics_collector = self.metrics_collector_context.collector
 
     def init_ipc_channels(self, port_args: PortArgs):
+        """Initialize scheduler IPC, load publication and dispatch accounting.
+
+        Args:
+            port_args: Resolved process and load-snapshot endpoints.
+        Returns:
+            None.
+        """
         is_rank_zero = (
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
@@ -793,6 +801,9 @@ class Scheduler(
         )
 
         self.load_snapshot_writer = None
+        self.dp_budget_source = SchedulerDPBudget(
+            self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        )
         self.recv_from_tokenizer = None
 
         if not is_rank_zero:
@@ -827,6 +838,13 @@ class Scheduler(
             self.idle_sleeper = None
 
     def publish_load_snapshot(self, force: bool = False):
+        """Publish scheduler load and the dispatch prefix it includes.
+
+        Args:
+            force: Bypass the periodic publication interval when True.
+        Returns:
+            None. Failed publications are logged and retried on later iterations.
+        """
         writer = self.load_snapshot_writer
         if writer is None:
             return
@@ -836,7 +854,9 @@ class Scheduler(
                 return
         writer.publish_counter = 0
         try:
-            writer.write(self.load_inquirer.get_loads())
+            snapshot = self.load_inquirer.get_loads()
+            self.dp_budget_source.attach(self, snapshot)
+            writer.write(snapshot)
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
 
@@ -2078,6 +2098,13 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
+        """Handle recv_reqs in FIFO order and confirm routed dispatch tickets.
+
+        Args:
+            recv_reqs: Requests and control messages received from IPC.
+        Returns:
+            None. Request handlers enqueue work or emit terminal responses.
+        """
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         if get_mm().mm_feature_transport == "cuda_vmm":
@@ -2085,6 +2112,7 @@ class Scheduler(
                 self._materialize_cuda_vmm_inputs(recv_req)
 
         for recv_req in recv_reqs:
+            self.dp_budget_source.begin(recv_req)
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
@@ -2092,9 +2120,11 @@ class Scheduler(
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
+                self.dp_budget_source.complete()
                 continue
 
             output = self._request_dispatcher(recv_req)
+            self.dp_budget_source.complete()
             if output is not None:
                 if self.rust_server is not None:
                     # Embedded Rust server: every control-request response goes

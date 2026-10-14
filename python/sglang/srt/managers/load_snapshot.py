@@ -52,6 +52,7 @@ import msgspec.msgpack
 import msgspec.structs
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.dp_budget import DPBudgetSnapshot
 from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.utils.network import is_zmq_endpoint_ipv6
 
@@ -219,6 +220,8 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     lora: Optional[LoRAMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
+    # Internal causal dispatch accounting, excluded from /v1/loads output.
+    dp_budget: Optional[DPBudgetSnapshot] = None
 
     VALID_SECTIONS = frozenset(
         {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
@@ -253,9 +256,11 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
         return load
 
 
-# Flat scalar fields returned under "core": every struct field but the sections.
+# Public "core" fields exclude nested sections and internal dispatch accounting.
 _CORE_KEYS = tuple(
-    f for f in LoadSnapshot.__struct_fields__ if f not in _SECTION_FIELDS
+    f
+    for f in LoadSnapshot.__struct_fields__
+    if f not in _SECTION_FIELDS and f != "dp_budget"
 )
 
 
