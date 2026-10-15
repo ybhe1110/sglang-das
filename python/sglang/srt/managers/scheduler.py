@@ -3478,6 +3478,15 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
         ):
             self.tree_cache.check_hicache_events()
+            if self.enable_unified_cache_external_linker:
+                # External-linker loads can finish between two forwards.  Do
+                # not wait for (or restrict handling to) the next
+                # ``run_batch`` result: in overlap mode the failed RID may be
+                # in ``running_batch``, ``waiting_queue`` or the chunked/PD
+                # queues rather than in the batch whose result is being
+                # retired.  The sweep keeps the failure sticky and prevents
+                # that request from probing the same Mooncake pages forever.
+                self._mark_failed_linker_loads(running_batch)
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.

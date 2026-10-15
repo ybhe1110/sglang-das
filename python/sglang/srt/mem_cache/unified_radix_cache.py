@@ -244,6 +244,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        # A completed load can belong to a request outside the batch whose
+        # result is being retired (the overlap scheduler has a handoff
+        # window). Keep unmatched failures until the queue-wide scheduler
+        # sweep can find and abort the live request.
+        self._failed_linker_rids: set[str] = set()
         # Failed external loads are detached from the tree before the
         # request's final lock release. Keep nodes that another request still
         # owns and retry them when that owner finishes.
@@ -352,6 +357,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
+        self._failed_linker_rids.clear()
         self._stranded_linker_nodes.clear()
         self._reset_full()
 
@@ -2657,6 +2663,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return []
         failed_rids = set(self.linker.finish_loads())
         failed = [req for req in reqs if req.rid in failed_rids]
+        # Do not drop a failure just because overlap retired a different
+        # batch.  The scheduler will match these RIDs against all live
+        # request queues on the next prefill scheduling pass.
+        self._failed_linker_rids.update(
+            failed_rids.difference(req.rid for req in failed)
+        )
         if failed:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
@@ -2674,7 +2686,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Compatibility wrapper for the release scheduler cleanup path."""
         if self.linker is None:
             return []
-        return self.linker.drain_linker_loads()
+        failed = set(self._failed_linker_rids)
+        self._failed_linker_rids.clear()
+        failed.update(self.linker.drain_linker_loads())
+        return list(failed)
 
     def has_outstanding_failed_linker_chains(self) -> bool:
         if self.linker is None:

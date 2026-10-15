@@ -739,6 +739,19 @@ class TestReclaimFailedLinkerChain(CustomTestCase):
         )
         return cache, attempts
 
+    def test_unmatched_completed_load_failure_is_retained_for_scheduler_sweep(self):
+        """Overlap may retire a different batch than the failed load's RID."""
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.linker = MagicMock()
+        cache.linker.finish_loads.return_value = ["rid-late"]
+        cache.linker.drain_linker_loads.return_value = []
+        cache._failed_linker_rids = set()
+
+        self.assertEqual(cache.finish_external_linker_loads([]), [])
+        self.assertEqual(cache.drain_linker_loads(), ["rid-late"])
+
     def test_frees_the_whole_chain_endpoint_first(self):
         # Deleting the endpoint does not cascade, and a parent only becomes a
         # device leaf once its child is gone.
