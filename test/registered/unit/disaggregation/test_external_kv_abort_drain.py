@@ -10,6 +10,7 @@ import importlib.util
 import pathlib
 import sys
 import threading
+import time
 import unittest
 from collections import defaultdict
 from http import HTTPStatus
@@ -88,6 +89,12 @@ class TestAbortDrain(unittest.TestCase):
             FINISH_ABORT=Reason,
             EXTERNAL_KV_LOAD_ERR_TYPE="external",
             logger=Mock(),
+            time=time,
+            envs=SimpleNamespace(
+                SGLANG_DISAGGREGATION_PREFILL_ABORT_CLEANUP_TIMEOUT=SimpleNamespace(
+                    get=lambda: 1.0
+                )
+            ),
             CleanupOutcomeUnknown=type("CleanupOutcomeUnknown", (RuntimeError,), {}),
             maybe_release_metadata_buffer=Mock(),
             release_kv_cache=Mock(),
@@ -99,6 +106,11 @@ class TestAbortDrain(unittest.TestCase):
             [
                 "prefill_abort_sender_terminal",
                 "prefill_abort_forward_drained",
+                "_external_kv_cleanup_timeout_s",
+                "_mark_external_kv_cleanup_started",
+                "_external_kv_cleanup_expired",
+                "_quarantine_external_kv_request",
+                "process_external_kv_cleanup_quarantine",
                 "abort_external_kv_request",
             ],
             self.env,
@@ -137,6 +149,10 @@ class TestAbortDrain(unittest.TestCase):
             "cleanup_done",
         ):
             setattr(self.req, "external_kv_" + flag, False)
+        self.req.external_kv_cleanup_started_at = None
+        self.req.external_kv_cleanup_quarantined = False
+        self.req.external_kv_cleanup_ready = False
+        self.req.external_kv_cleanup_timeout_logged = False
 
         def apply_finish():
             self.req.finished_reason = self.req.to_finish
@@ -148,6 +164,7 @@ class TestAbortDrain(unittest.TestCase):
         s = self.s
         s._external_kv_abort_rids = {"r"}
         s._external_kv_cleanup_rids = {"r"}
+        s._external_kv_cleanup_quarantine = {}
         s._pending_chunked_abort_req = self.req
         s.chunked_req = self.req
         s.result_queue = []
@@ -244,6 +261,66 @@ class TestAbortDrain(unittest.TestCase):
         )
         self.assertFalse(self.finalize(sender_terminal=True))
         self.env["release_kv_cache"].assert_not_called()
+
+    def test_expired_abort_is_quarantined_without_releasing_kv(self):
+        self.s._pending_chunked_abort_req = None
+        self.req.external_kv_cleanup_started_at = time.monotonic() - 2.0
+        self.assertFalse(
+            self.finalize(forward_drained=False, sender_terminal=False)
+        )
+        self.assertIn(self.req.rid, self.s._external_kv_cleanup_quarantine)
+        self.assertTrue(self.req.external_kv_cleanup_quarantined)
+        self.env["release_kv_cache"].assert_not_called()
+        self.env["maybe_release_metadata_buffer"].assert_not_called()
+
+    def test_expired_sender_abort_exception_is_quarantined(self):
+        self.s._pending_chunked_abort_req = None
+        self.req.external_kv_cleanup_started_at = time.monotonic() - 2.0
+        self.req.disagg_kv_sender.abort.side_effect = RuntimeError("transport")
+        self.assertFalse(self.finalize())
+        self.assertIn(self.req.rid, self.s._external_kv_cleanup_quarantine)
+        self.env["release_kv_cache"].assert_not_called()
+
+    def test_quarantine_retries_cleanup_without_collective_poll(self):
+        self.s._pending_chunked_abort_req = None
+        self.req.external_kv_cleanup_started_at = time.monotonic() - 2.0
+        self.assertFalse(
+            self.finalize(forward_drained=False, sender_terminal=False)
+        )
+        self.req.disagg_kv_sender.is_transfer_drained.return_value = True
+        self.s.process_external_kv_cleanup_quarantine()
+        self.assertTrue(self.req.external_kv_cleanup_done)
+        self.assertIs(
+            self.s._external_kv_cleanup_quarantine[self.req.rid], self.req
+        )
+        self.assertTrue(self.req.external_kv_cleanup_ready)
+        self.env["release_kv_cache"].assert_called_once()
+
+    def test_forget_source_transfers_precedes_buffer_release(self):
+        class Sender:
+            def __init__(self):
+                self.forget_results = iter((False, True))
+
+            def poll(self):
+                return KVPoll.Failed
+
+            def is_transfer_drained(self):
+                return True
+
+            def abort(self):
+                pass
+
+            def forget_source_transfers(self):
+                return next(self.forget_results)
+
+        self.req.disagg_kv_sender = Sender()
+        self.s._pending_chunked_abort_req = None
+        self.assertFalse(self.finalize())
+        self.env["release_kv_cache"].assert_not_called()
+        self.env["maybe_release_metadata_buffer"].assert_not_called()
+        self.assertTrue(self.finalize())
+        self.env["release_kv_cache"].assert_called_once()
+        self.env["maybe_release_metadata_buffer"].assert_called_once()
 
     def test_poll_exception_retains_resources(self):
         self.req.disagg_kv_sender.poll.side_effect = RuntimeError("poll")
@@ -450,6 +527,31 @@ class TestSourceDrain(unittest.TestCase):
         self.tracker.complete(self.chunk)
         self.tracker.close(7)
         self.assertTrue(self.tracker.drained(7))
+
+    def test_worker_exit_publishes_failure_to_active_decode_rooms(self):
+        class StopWorker(BaseException):
+            pass
+
+        cls = load_methods(
+            CONN,
+            ["_run_transfer_worker"],
+            dict(KVPoll=KVPoll, logger=Mock()),
+        )
+        mgr = cls()
+        mgr.transfer_worker = Mock(side_effect=StopWorker())
+        mgr._source_drain = Mock()
+        mgr._source_drain.worker_failed.return_value = {(7, 1), (8, 2)}
+        mgr.request_status = {7: KVPoll.Transferring, 8: KVPoll.Failed}
+        mgr.conclude_failure = Mock()
+        with self.assertRaises(StopWorker):
+            mgr._run_transfer_worker(Mock(), Mock())
+        mgr.conclude_failure.assert_called_once_with(
+            bootstrap_room=7,
+            failure_reason=(
+                "Mooncake transfer worker exited while the KV transfer for room "
+                "7 was active"
+            ),
+        )
 
     def test_all_running_futures_drain_after_status_failure_or_exception(self):
         cls = load_methods(

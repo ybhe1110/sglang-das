@@ -1206,6 +1206,11 @@ class Scheduler(
         # proper lifecycle and prevent duplicate releases.
         self._external_kv_abort_rids: Set[str] = set()
         self._external_kv_cleanup_rids: Set[str] = set()
+        # Requests whose transfer cleanup exceeded the scheduler-side
+        # deadline stay strongly reachable here.  Their native sender is
+        # replaced by a nonblocking poll placeholder while KV buffers remain
+        # retained until the transfer engine reports a terminal state.
+        self._external_kv_cleanup_quarantine = {}
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata as importlib_metadata
 import json
 import logging
 import os
@@ -106,6 +107,52 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
     )
 
 
+def configure_mooncake_transfer_timeout() -> None:
+    """Set Mooncake's native transfer deadline without overriding operators."""
+    # Mooncake reads MC_TRANSFER_TIMEOUT while constructing the native
+    # TransferEngine.  This must happen before that construction; a Python
+    # Future timeout would only abandon the caller while the native WR could
+    # still access the registered KV buffers.
+    transfer_timeout_s = envs.SGLANG_DISAGGREGATION_MOONCAKE_TRANSFER_TIMEOUT.get()
+    if transfer_timeout_s > 0 and "MC_TRANSFER_TIMEOUT" not in os.environ:
+        os.environ["MC_TRANSFER_TIMEOUT"] = str(transfer_timeout_s)
+        logger.info(
+            "Configured MC_TRANSFER_TIMEOUT=%.3fs for Mooncake transfers",
+            transfer_timeout_s,
+        )
+
+
+def get_mooncake_package_version() -> str:
+    """Return the installed Mooncake distribution and version for diagnostics."""
+    # CUDA 13 images use the suffixed distribution name; CUDA 12 images use
+    # the generic package.  The import name is ``mooncake`` for both.
+    for distribution in (
+        "mooncake-transfer-engine-cuda13",
+        "mooncake-transfer-engine",
+    ):
+        try:
+            return f"{distribution}=={importlib_metadata.version(distribution)}"
+        except importlib_metadata.PackageNotFoundError:
+            continue
+    return "unknown"
+
+
+def log_mooncake_runtime_configuration(engine) -> None:
+    """Log the effective native timeout and API surface once at startup."""
+    configured_timeout = envs.SGLANG_DISAGGREGATION_MOONCAKE_TRANSFER_TIMEOUT.get()
+    native_timeout = os.environ.get("MC_TRANSFER_TIMEOUT", "<unset>")
+    logger.info(
+        "Mooncake runtime configuration: package=%s, "
+        "sglang_timeout=%.3fs, MC_TRANSFER_TIMEOUT=%s, "
+        "batch_transfer_sync_write=%s, MC_FORCE_TCP=%s",
+        get_mooncake_package_version(),
+        configured_timeout,
+        native_timeout,
+        hasattr(engine, "batch_transfer_sync_write"),
+        os.environ.get("MC_FORCE_TCP", "0"),
+    )
+
+
 class MooncakeTransferEngine:
     """Shared Mooncake transfer engine for RDMA/transfer operations."""
 
@@ -115,6 +162,7 @@ class MooncakeTransferEngine:
         gpu_id: Optional[int] = None,
         ib_device: Optional[str] = None,
     ):
+        configure_mooncake_transfer_timeout()
         try:
             from mooncake.engine import TransferEngine
         except ImportError as e:
@@ -125,6 +173,7 @@ class MooncakeTransferEngine:
             ) from e
 
         self.engine = TransferEngine()
+        log_mooncake_runtime_configuration(self.engine)
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         # MC_FORCE_TCP=1 makes mooncake install TcpTransport instead of RDMA,

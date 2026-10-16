@@ -662,6 +662,16 @@ class Envs:
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
+    # Bound the time a failed prefill KV request remains in the scheduler's
+    # inflight collective.  A timed-out request is quarantined until its
+    # source transfer becomes terminal; its RDMA-backed buffers are not freed
+    # while the transfer engine may still be touching them.  Set to 0 to
+    # disable this scheduler-side fallback.
+    SGLANG_DISAGGREGATION_PREFILL_ABORT_CLEANUP_TIMEOUT = EnvFloat(10.0)
+    # Mooncake reads MC_TRANSFER_TIMEOUT when the TransferEngine is
+    # initialized.  Keep the SGLang default explicit while preserving an
+    # operator-provided MC_TRANSFER_TIMEOUT value.
+    SGLANG_DISAGGREGATION_MOONCAKE_TRANSFER_TIMEOUT = EnvFloat(30.0)
     # Deferred decode-side KV release: on abort, hold an in-flight request's KV
     # pages/slot until the prefill acks the transfer drained, or the timeout
     # below fires. Off by default (no behavior/perf impact when disabled).

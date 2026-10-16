@@ -2077,6 +2077,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     worker_index,
                     len(affected),
                 )
+                # ``worker_failed`` poisons the local source-drain state, but
+                # decode otherwise has no way to learn that its peer stopped
+                # producing KV chunks.  Publish one terminal failure per room
+                # so decode releases the receiver-side allocation instead of
+                # waiting for its bootstrap/heartbeat timeout.
+                for room, _generation in affected:
+                    if self.request_status.get(room) == KVPoll.Failed:
+                        continue
+                    try:
+                        self.conclude_failure(
+                            bootstrap_room=room,
+                            failure_reason=(
+                                "Mooncake transfer worker exited while the KV "
+                                f"transfer for room {room} was active"
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to publish worker-exit status for room %s", room
+                        )
 
     def transfer_worker(
         self,

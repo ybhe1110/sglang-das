@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_min_flags,
     build_kv_layer_ids,
     get_dsv4_c128_state_indices,
     get_kv_class,
@@ -98,6 +99,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+class _QuarantinedKVSender:
+    """Nonblocking placeholder kept in the rank-synchronized poll list."""
+
+    def poll(self) -> int:
+        return KVPoll.Transferring
 
 
 def should_force_retry(req: Req) -> bool:
@@ -1552,6 +1560,126 @@ class SchedulerDisaggregationPrefillMixin:
             for batch, _ in getattr(self, "result_queue", ())
         )
 
+    def _external_kv_cleanup_timeout_s(self: Scheduler) -> float:
+        """Return the scheduler-side deadline for a failed source cleanup."""
+        setting = getattr(
+            envs, "SGLANG_DISAGGREGATION_PREFILL_ABORT_CLEANUP_TIMEOUT", None
+        )
+        try:
+            return max(0.0, float(setting.get())) if setting is not None else 0.0
+        except Exception:
+            logger.exception("Failed to read external KV cleanup timeout")
+            return 0.0
+
+    def _mark_external_kv_cleanup_started(self: Scheduler, req: Req) -> None:
+        """Start one monotonic deadline for an abort cleanup retry sequence."""
+        if getattr(req, "external_kv_cleanup_started_at", None) is None:
+            req.external_kv_cleanup_started_at = time.monotonic()
+
+    def _external_kv_cleanup_expired(self: Scheduler, req: Req) -> bool:
+        timeout_s = self._external_kv_cleanup_timeout_s()
+        started_at = getattr(req, "external_kv_cleanup_started_at", None)
+        return (
+            timeout_s > 0
+            and started_at is not None
+            and time.monotonic() - started_at >= timeout_s
+        )
+
+    def _quarantine_external_kv_request(
+        self: Scheduler,
+        req: Req,
+        *,
+        abort_message: str,
+        emit_response: bool,
+    ) -> bool:
+        """Quarantine a stuck request while retaining its transfer buffers.
+
+        A Python-side timeout must not pretend that a native RDMA operation has
+        stopped.  The request therefore remains strongly reachable and its KV
+        allocation remains held until ``forget_source_transfers`` succeeds.
+        The inflight queue uses a nonblocking placeholder until all ranks agree
+        that deferred cleanup is complete, so one broken transfer cannot force
+        a native sender poll on every scheduler step.
+        """
+        quarantine = getattr(self, "_external_kv_cleanup_quarantine", None)
+        if quarantine is None:
+            quarantine = self._external_kv_cleanup_quarantine = {}
+        quarantine[req.rid] = req
+        req.external_kv_cleanup_quarantined = True
+        req.external_kv_cleanup_ready = False
+
+        if not req.external_kv_finish_state_applied:
+            if req.to_finish is not None:
+                req.update_finish_state()
+            elif req.finished_reason is None:
+                req.finished_reason = FINISH_ABORT(
+                    message=abort_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+                )
+            if req.return_logprob:
+                reason = req.finished_reason
+                prepare_abort(req, reason.message, status_code=reason.status_code)
+                req.finished_reason = reason
+            req.external_kv_finish_state_applied = True
+
+        if emit_response and not req.external_kv_response_sent:
+            req.time_stats.set_completion_time()
+            self.output_streamer.stream_output([req], req.return_logprob)
+            req.external_kv_response_sent = True
+
+        if not getattr(req, "external_kv_cleanup_timeout_logged", False):
+            logger.error(
+                "Quarantining external KV request %s after %.3fs; "
+                "source transfer is not terminal and KV buffers remain retained",
+                req.rid,
+                self._external_kv_cleanup_timeout_s(),
+            )
+            req.external_kv_cleanup_timeout_logged = True
+        return False
+
+    def process_external_kv_cleanup_quarantine(self: Scheduler) -> None:
+        """Retry quarantined source cleanup without entering the Gloo poll."""
+        quarantine = getattr(self, "_external_kv_cleanup_quarantine", None)
+        if not quarantine:
+            return
+        for req in tuple(quarantine.values()):
+            try:
+                forward_drained = self.prefill_abort_forward_drained(req)
+                sender_terminal = self.prefill_abort_sender_terminal(req)
+                if not forward_drained or not sender_terminal:
+                    continue
+                reason = req.to_finish or req.finished_reason
+                if self.abort_external_kv_request(
+                    req,
+                    forward_drained=True,
+                    sender_terminal=True,
+                    abort_message=getattr(
+                        reason, "message", "External KV load failed"
+                    ),
+                    is_insert=False,
+                    emit_response=False,
+                ):
+                    # Keep the request in the quarantine map until every
+                    # participating rank has observed the same terminal state.
+                    # The inflight queue performs that agreement below.
+                    req.external_kv_cleanup_ready = True
+            except Exception:
+                logger.exception(
+                    "Failed to retry quarantined external KV request %s", req.rid
+                )
+
+    def _hold_external_kv_cleanup_until_collective(
+        self: Scheduler, req: Req
+    ) -> None:
+        """Keep a locally finished cleanup in the rank-synchronized queue."""
+        quarantine = getattr(self, "_external_kv_cleanup_quarantine", None)
+        if quarantine is None:
+            quarantine = self._external_kv_cleanup_quarantine = {}
+        quarantine[req.rid] = req
+        req.external_kv_cleanup_quarantined = True
+        req.external_kv_cleanup_ready = True
+
     def abort_external_kv_request(
         self: Scheduler,
         req: Req,
@@ -1589,6 +1717,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 req.external_kv_abort_requested = True
                 self._external_kv_abort_rids.add(req.rid)
+            self._mark_external_kv_cleanup_started(req)
 
             if not req.external_kv_pending_chunk_cleared:
                 self.clear_pending_chunk_send(req)
@@ -1602,17 +1731,58 @@ class SchedulerDisaggregationPrefillMixin:
             if sender is None:
                 req.external_kv_sender_abort_requested = True
             elif not req.external_kv_sender_abort_requested:
-                sender.abort()
+                try:
+                    sender.abort()
+                except Exception:
+                    logger.exception(
+                        "External KV sender abort failed for request %s", req.rid
+                    )
+                    if self._external_kv_cleanup_expired(req):
+                        return self._quarantine_external_kv_request(
+                            req,
+                            abort_message=abort_message,
+                            emit_response=emit_response,
+                        )
+                    return False
                 req.external_kv_sender_abort_requested = True
 
-            if (
-                not forward_drained
-                or not sender_terminal
-                # Recheck after abort closes publication; the caller's earlier
-                # observation may precede the final enqueue.
-                or not self.prefill_abort_sender_terminal(req)
-            ):
+            sender_terminal = sender_terminal and self.prefill_abort_sender_terminal(
+                req
+            )
+            if not forward_drained or not sender_terminal:
+                if self._external_kv_cleanup_expired(req):
+                    return self._quarantine_external_kv_request(
+                        req,
+                        abort_message=abort_message,
+                        emit_response=emit_response,
+                    )
                 return False
+
+            # Do not release metadata or KV pages until the source drain has
+            # been forgotten.  ``forget`` is a nonblocking predicate; false
+            # means a native transfer may still reference the buffers.
+            forget = (
+                getattr(type(sender), "forget_source_transfers", None)
+                if sender
+                else None
+            )
+            if forget is not None:
+                try:
+                    forgotten = forget.__get__(sender, type(sender))()
+                except Exception:
+                    logger.exception(
+                        "External KV source cleanup probe failed for request %s",
+                        req.rid,
+                    )
+                    forgotten = False
+                if not forgotten:
+                    if self._external_kv_cleanup_expired(req):
+                        return self._quarantine_external_kv_request(
+                            req,
+                            abort_message=abort_message,
+                            emit_response=emit_response,
+                        )
+                    return False
 
             if not req.external_kv_finish_state_applied:
                 if req.to_finish is not None:
@@ -1657,14 +1827,6 @@ class SchedulerDisaggregationPrefillMixin:
                 ):
                     release_kv_cache(req, self.tree_cache, is_insert=is_insert)
                 req.external_kv_cache_released = True
-
-            forget = (
-                getattr(type(sender), "forget_source_transfers", None)
-                if sender
-                else None
-            )
-            if forget is not None and not forget.__get__(sender, type(sender))():
-                return False
 
             if emit_response and not req.external_kv_response_sent:
                 req.time_stats.set_completion_time()
@@ -1943,6 +2105,9 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         transfer_status: For PP, the globally agreed successful and failed rids.
         """
+        # Quarantined requests are retried independently of the Gloo collective;
+        # a stuck native transfer must not keep this scheduler step in poll.
+        self.process_external_kv_cleanup_quarantine()
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -1950,15 +2115,71 @@ class SchedulerDisaggregationPrefillMixin:
         success_rids = set(transfer_status[0]) if transfer_status is not None else set()
         failed_rids = set(transfer_status[1]) if transfer_status is not None else set()
 
+        # Keep the queue shape identical on every rank while a request is
+        # quarantined.  Only remove it after a MIN reduction agrees that all
+        # ranks have completed the deferred cleanup.
+        cleanup_ready = all_reduce_min_flags(
+            [
+                0
+                if (
+                    (
+                        getattr(req, "external_kv_cleanup_quarantined", False)
+                        and not getattr(req, "external_kv_cleanup_ready", False)
+                    )
+                    or (
+                        (
+                            req.rid in self._external_kv_abort_rids
+                            or getattr(req, "external_kv_abort_requested", False)
+                        )
+                        and not getattr(req, "external_kv_cleanup_done", False)
+                    )
+                )
+                else 1
+                for req in self.disagg_prefill_inflight_queue
+            ],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            [
+                _QuarantinedKVSender()
+                if getattr(req, "external_kv_cleanup_quarantined", False)
+                else req.disagg_kv_sender
+                for req in self.disagg_prefill_inflight_queue
+            ],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        for index, (req, poll) in enumerate(
+            zip(self.disagg_prefill_inflight_queue, polls)
+        ):
+            if getattr(req, "external_kv_cleanup_quarantined", False):
+                if cleanup_ready[index] and getattr(
+                    req, "external_kv_cleanup_ready", False
+                ):
+                    req.external_kv_cleanup_quarantined = False
+                    req.external_kv_cleanup_ready = False
+                    self._external_kv_cleanup_quarantine.pop(req.rid, None)
+                    done_reqs.append(req)
+                else:
+                    undone_reqs.append(req)
+                continue
+
+            # A rank can finish cleanup before its peers.  Keep the request in
+            # the same queue until the cleanup flag has converged, and never
+            # re-enter the normal Success/Failed release paths locally.
+            if getattr(req, "external_kv_cleanup_done", False):
+                if cleanup_ready[index]:
+                    done_reqs.append(req)
+                else:
+                    self._hold_external_kv_cleanup_until_collective(req)
+                    undone_reqs.append(req)
+                continue
+
             # Check if this request was marked for external KV abort
             external_abort_pending = req.rid in self._external_kv_abort_rids
 
@@ -1973,7 +2194,11 @@ class SchedulerDisaggregationPrefillMixin:
                     emit_response=True,
                 )
                 if cleanup_done:
-                    done_reqs.append(req)
+                    if cleanup_ready[index]:
+                        done_reqs.append(req)
+                    else:
+                        self._hold_external_kv_cleanup_until_collective(req)
+                        undone_reqs.append(req)
                 else:
                     undone_reqs.append(req)
                 continue
@@ -1996,7 +2221,11 @@ class SchedulerDisaggregationPrefillMixin:
                         sender_terminal=self.prefill_abort_sender_terminal(req),
                     )
                     if cleanup_done:
-                        done_reqs.append(req)
+                        if cleanup_ready[index]:
+                            done_reqs.append(req)
+                        else:
+                            self._hold_external_kv_cleanup_until_collective(req)
+                            undone_reqs.append(req)
                     else:
                         undone_reqs.append(req)
                     continue
@@ -2021,7 +2250,11 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                 elif req.external_kv_abort_requested:
                     if req.external_kv_cleanup_done:
-                        done_reqs.append(req)
+                        if cleanup_ready[index]:
+                            done_reqs.append(req)
+                        else:
+                            self._hold_external_kv_cleanup_until_collective(req)
+                            undone_reqs.append(req)
                     else:
                         undone_reqs.append(req)
                 elif poll != KVPoll.Failed:
@@ -2044,7 +2277,11 @@ class SchedulerDisaggregationPrefillMixin:
                     req, sender_terminal=self.prefill_abort_sender_terminal(req)
                 )
                 if cleanup_done:
-                    done_reqs.append(req)
+                    if cleanup_ready[index]:
+                        done_reqs.append(req)
+                    else:
+                        self._hold_external_kv_cleanup_until_collective(req)
+                        undone_reqs.append(req)
                 else:
                     undone_reqs.append(req)
             else:

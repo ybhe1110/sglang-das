@@ -990,6 +990,14 @@ class Req(ReqDllmMixin):
         self.external_kv_response_sent = False
         self.external_kv_abort_response_via_chunked = False
         self.external_kv_cleanup_done = False
+        # Monotonic deadline state for failed external-KV cleanup.  A request
+        # may be quarantined when the source transfer is not terminal; keeping
+        # it reachable prevents the transfer engine from touching freed KV
+        # pages while the scheduler replaces its native poll with a placeholder.
+        self.external_kv_cleanup_started_at = None
+        self.external_kv_cleanup_quarantined = False
+        self.external_kv_cleanup_ready = False
+        self.external_kv_cleanup_timeout_logged = False
         self.external_kv_cleanup_steps = {}
         self.stream = stream
         self.eos_token_ids = eos_token_ids
