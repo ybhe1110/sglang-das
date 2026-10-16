@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use super::disaggregation::bootstrap as pd_bootstrap;
-use super::{common, log, native_api, openai};
+use super::{common, loads, log, native_api, openai};
 use crate::message::config::ServerArgs;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
@@ -51,6 +51,7 @@ pub async fn serve(
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
         .merge(common::routes())
+        .merge(loads::routes())
         .merge(native_api::routes())
         .merge(openai::routes());
 

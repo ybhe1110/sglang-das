@@ -756,6 +756,15 @@ class RustServer:
 
         sa = scheduler.server_args
         mc = scheduler.model_config
+        from sglang.srt.entrypoints.v1_loads import (
+            _accelerator_name,
+            _num_accelerators_per_dp_rank,
+        )
+        from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
+
+        shm_writer = scheduler.load_snapshot_writer
+        if not isinstance(shm_writer, ShmLoadSnapshotWriter):
+            shm_writer = None
         disaggregation_mode = {
             "null": ext.DisaggregationMode.Null,
             "prefill": ext.DisaggregationMode.Prefill,
@@ -811,6 +820,13 @@ class RustServer:
             # can serve them statically (no scheduler round-trip).
             version=__version__,
             max_total_num_tokens=scheduler.max_total_num_tokens,
+            load_snapshot_path=shm_writer.path if shm_writer else None,
+            load_snapshot_dp_size=shm_writer.dp_size if shm_writer else 0,
+            load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,
+            accelerator=_accelerator_name(),
+            num_accelerators=_num_accelerators_per_dp_rank(
+                sa.tp_size, sa.pp_size, sa.dp_size, sa.enable_dp_attention
+            ),
         )
 
     @staticmethod

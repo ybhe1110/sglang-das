@@ -9,6 +9,7 @@ mod disaggregation;
 mod frame;
 mod guard;
 mod log;
+mod loads;
 mod native_api;
 mod openai;
 mod prefetch;

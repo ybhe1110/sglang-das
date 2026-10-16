@@ -145,6 +145,17 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// The scheduler's shared-memory load snapshot file, its DP rank count and
+    /// this listener's own slot, which `/v1/loads` reads (`None` when snapshots
+    /// go over ZMQ instead), plus the accelerator name and per-rank count that
+    /// endpoint reports.
+    pub load_snapshot_path: Option<String>,
+    pub load_snapshot_dp_size: usize,
+    pub load_snapshot_dp_rank: usize,
+    pub accelerator: Option<String>,
+    pub num_accelerators: u32,
+
+
 }
 
 #[pyo3::pymethods]
@@ -177,6 +188,12 @@ impl ServerArgs {
         num_reserved_tokens,
         version,
         max_total_num_tokens,
+        load_snapshot_path,
+        load_snapshot_dp_size,
+        load_snapshot_dp_rank,
+        accelerator,
+        num_accelerators,
+
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
     #[allow(clippy::too_many_arguments)]
@@ -207,6 +224,12 @@ impl ServerArgs {
         num_reserved_tokens: u64,
         version: String,
         max_total_num_tokens: u64,
+        load_snapshot_path: Option<String>,
+        load_snapshot_dp_size: usize,
+        load_snapshot_dp_rank: usize,
+        accelerator: Option<String>,
+        num_accelerators: u32,
+
     ) -> Self {
         Self {
             model_path,
@@ -235,6 +258,12 @@ impl ServerArgs {
             num_reserved_tokens,
             version,
             max_total_num_tokens,
+            load_snapshot_path,
+            load_snapshot_dp_size,
+            load_snapshot_dp_rank,
+            accelerator,
+            num_accelerators,
+
         }
     }
 }
@@ -271,6 +300,12 @@ impl Default for ServerArgs {
             num_reserved_tokens: 0,
             version: String::new(),
             max_total_num_tokens: 0,
+            load_snapshot_path: None,
+            load_snapshot_dp_size: 0,
+            load_snapshot_dp_rank: 0,
+            accelerator: None,
+            num_accelerators: 0,
+
         }
     }
 }
