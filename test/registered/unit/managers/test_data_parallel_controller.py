@@ -58,6 +58,54 @@ def _make_controller(num_dp_ranks: int) -> DataParallelController:
     return ctl
 
 
+class _PollOnlyReader:
+    """Minimal stand-in for the ZMQ owner reader used by the DPC timer."""
+
+    def __init__(self):
+        self.poll_count = 0
+
+    def poll(self):
+        self.poll_count += 1
+
+
+class TestLoadSnapshotDrain(CustomTestCase):
+    def test_owner_reader_drains_without_dispatch(self):
+        ctl = DataParallelController.__new__(DataParallelController)
+        reader = _PollOnlyReader()
+        ctl.load_snapshot_reader = reader
+        ctl._last_load_snapshot_drain_time = 0.0
+
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.time.perf_counter",
+            return_value=1.0,
+        ):
+            ctl._drain_load_snapshot_if_due()
+
+        self.assertEqual(reader.poll_count, 1)
+
+    def test_owner_reader_drain_is_throttled(self):
+        ctl = DataParallelController.__new__(DataParallelController)
+        reader = _PollOnlyReader()
+        ctl.load_snapshot_reader = reader
+        ctl._last_load_snapshot_drain_time = 0.0
+
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.time.perf_counter",
+            side_effect=(1.0, 1.01, 1.021),
+        ):
+            ctl._drain_load_snapshot_if_due()
+            ctl._drain_load_snapshot_if_due()
+            ctl._drain_load_snapshot_if_due()
+
+        self.assertEqual(reader.poll_count, 2)
+
+    def test_shm_reader_does_not_require_a_poll_method(self):
+        ctl = DataParallelController.__new__(DataParallelController)
+        ctl.load_snapshot_reader = object()
+        ctl._last_load_snapshot_drain_time = 0.0
+        ctl._drain_load_snapshot_if_due()
+
+
 def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
