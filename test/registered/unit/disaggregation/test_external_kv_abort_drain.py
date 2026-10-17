@@ -37,6 +37,7 @@ spec = importlib.util.spec_from_file_location("source_drain_under_test", TRACKER
 tracker_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tracker_module)
 SourceDrainTracker = tracker_module.SourceDrainTracker
+SourceTransferTimeout = tracker_module.SourceTransferTimeout
 KVPoll = SimpleNamespace(Success=1, Failed=2, Transferring=3)
 
 
@@ -445,6 +446,39 @@ class TestSourceDrain(unittest.TestCase):
         self.assertTrue(self.tracker.finish_quiesced(self.chunk))
         self.tracker.poison(7)
         self.assertTrue(self.tracker.terminal(7))
+
+    def test_watchdog_detaches_native_call_and_retains_hazard_until_return(self):
+        queue = Mock()
+        self.tracker.publish(self.chunk, queue, lambda: True)
+        self.tracker.begin(self.chunk)
+        started = threading.Event()
+        finished = threading.Event()
+        release = threading.Event()
+
+        def blocked_native_call():
+            started.set()
+            release.wait(2)
+            finished.set()
+            return 0
+
+        self.assertRaises(
+            SourceTransferTimeout,
+            self.tracker.run_with_deadline,
+            blocked_native_call,
+            timeout_s=0.02,
+            success=lambda ret: ret == 0,
+        )
+        self.assertTrue(started.wait(1))
+        # The caller returned, but the source is not safe to release while the
+        # detached native operation still owns its RDMA buffer.
+        self.tracker.mark_unresolved(self.chunk)
+        self.tracker.poison(7)
+        self.assertFalse(self.tracker.terminal(7))
+
+        release.set()
+        self.assertTrue(finished.wait(1))
+        self.assertTrue(self.tracker.terminal(7))
+        self.assertTrue(self.tracker.forget(7))
 
     def test_failed_future_completion_releases_hazard(self):
         queue = Mock()
