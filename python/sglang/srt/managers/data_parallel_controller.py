@@ -83,6 +83,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
+LOAD_SNAPSHOT_DRAIN_INTERVAL_S = 0.02
 
 
 class DataParallelController:
@@ -140,6 +141,7 @@ class DataParallelController:
             caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
+        self._last_load_snapshot_drain_time = 0.0
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -269,6 +271,24 @@ class DataParallelController:
             return
         self._last_refresh_time = now
         self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
+
+    def _drain_load_snapshot_if_due(self):
+        """Drain the owner socket periodically, even when no request is dispatched.
+
+        In ZMQ mode the DPC owns the PULL socket for load-aware methods.  The
+        reader's ``poll`` method is deliberately called from this event-loop
+        thread because ZMQ sockets are not thread-safe.  SHM readers do not
+        expose ``poll`` and are therefore left untouched.
+        """
+        poll = getattr(self.load_snapshot_reader, "poll", None)
+        if poll is None:
+            return
+
+        now = time.perf_counter()
+        if now - self._last_load_snapshot_drain_time < LOAD_SNAPSHOT_DRAIN_INTERVAL_S:
+            return
+        self._last_load_snapshot_drain_time = now
+        poll()
 
     def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
         if refresh_load_budget and self.refresh_load_budget_on_dispatch:
@@ -771,6 +791,8 @@ class DataParallelController:
 
     def event_loop(self):
         while True:
+            self.soft_watchdog.feed()
+            self._drain_load_snapshot_if_due()
             while True:
                 self.soft_watchdog.feed()
                 try:
