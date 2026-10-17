@@ -1,11 +1,21 @@
 """Track source ownership across queueing, transfer execution and aborts."""
 
+import concurrent.futures
 import threading
 from itertools import count
 
 
 class SourceTransferUnresolved(RuntimeError):
     """The synchronous call returned a failure code without completion proof."""
+
+
+class SourceTransferTimeout(TimeoutError):
+    """The caller deadline expired while the native source operation was active.
+
+    A timeout does not cancel the native call.  The operation's hazard is kept
+    until the detached call returns so callers can quarantine the source
+    buffers instead of releasing memory while RDMA may still be writing it.
+    """
 
 
 class _SourceOp:
@@ -142,6 +152,62 @@ class SourceDrainTracker:
         finally:
             with self.lock:
                 op.hazards.discard(hazard)
+        if success is not None and not success(result):
+            raise SourceTransferUnresolved("Synchronous transfer did not complete")
+        return result
+
+    def run_with_deadline(self, fn, *args, timeout_s, success=None):
+        """Run a native source operation without blocking its owner forever.
+
+        The Mooncake Python binding normally enforces ``MC_TRANSFER_TIMEOUT``
+        in native code.  This watchdog is a second line of defense for a
+        broken transport or CQ path that ignores that deadline.  Python cannot
+        safely kill a thread executing a native RDMA call, so a timed-out call
+        is deliberately detached.  Its hazard remains active until the call
+        returns, which makes ``terminal``/``forget`` retain the source buffers
+        and lets the scheduler quarantine the request safely.
+        """
+        op = getattr(self._context, "op", None)
+        if op is None:
+            raise RuntimeError("Source access outside a tracked transfer")
+        if timeout_s is None or timeout_s <= 0:
+            return self.run(fn, *args, success=success)
+
+        future = concurrent.futures.Future()
+        hazard = object()
+        with self.lock:
+            op.hazards.add(hazard)
+            op.futures.add(future)
+
+        def invoke():
+            try:
+                result = fn(*args)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+            finally:
+                with self.lock:
+                    op.hazards.discard(hazard)
+                # This may complete an unresolved operation after the caller
+                # has already quarantined its request.
+                self.finish_quiesced(op.chunk)
+
+        thread = threading.Thread(
+            target=invoke,
+            name=f"source-transfer-{op.room}-{op.token}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            result = future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError as exc:
+            with self.lock:
+                if op.state == "active":
+                    op.state = "unresolved"
+            raise SourceTransferTimeout(
+                f"Source transfer exceeded watchdog deadline ({timeout_s:.3f}s)"
+            ) from exc
         if success is not None and not success(result):
             raise SourceTransferUnresolved("Synchronous transfer did not complete")
         return result

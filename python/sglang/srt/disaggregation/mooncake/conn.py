@@ -48,7 +48,10 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_string_list,
 )
 from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
-from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
+from sglang.srt.disaggregation.mooncake.source_drain import (
+    SourceDrainTracker,
+    SourceTransferTimeout,
+)
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
@@ -80,6 +83,37 @@ from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+
+def _mooncake_source_transfer_watchdog_timeout_s() -> float:
+    """Return a Python fail-safe deadline after Mooncake's native deadline.
+
+    ``MC_TRANSFER_TIMEOUT`` is consumed by Mooncake's native transfer wrapper.
+    Keep a small grace period so normal native timeout handling wins, while a
+    broken CQ/transport path cannot strand the SGLang transfer worker forever.
+    """
+    configured = float(
+        envs.SGLANG_DISAGGREGATION_MOONCAKE_TRANSFER_TIMEOUT.get()
+    )
+    raw_native = os.environ.get("MC_TRANSFER_TIMEOUT")
+    if raw_native is not None:
+        try:
+            configured = float(raw_native)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring invalid MC_TRANSFER_TIMEOUT=%r for source watchdog",
+                raw_native,
+            )
+    if configured <= 0:
+        # A non-positive native setting may disable Mooncake's own deadline;
+        # never let that disable the SGLang liveness guard as well.
+        logger.warning(
+            "Using a 5s minimum source watchdog because the native "
+            "Mooncake timeout is non-positive (%s)",
+            configured,
+        )
+    return max(configured + 5.0, 5.0)
+
 
 _is_hcu = is_hcu()
 _kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
@@ -820,7 +854,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             gather_all_layers_to_staging,
         )
 
-        self._source_drain.run(
+        self._run_source_with_watchdog(
             gather_all_layers_to_staging,
             k_buffers,
             v_buffers,
@@ -830,6 +864,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             num_heads_to_send,
             page_size,
             self.kv_args.gpu_id,
+            operation="staging_gather",
         )
 
         if pairs is None:
@@ -859,18 +894,57 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         return ret
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
-        if not transfer_blocks:
-            return 0
+    def _run_source_with_watchdog(
+        self,
+        fn,
+        *args,
+        operation,
+        success=None,
+    ):
+        timeout_s = _mooncake_source_transfer_watchdog_timeout_s()
+        try:
+            return self._source_drain.run_with_deadline(
+                fn,
+                *args,
+                timeout_s=timeout_s,
+                success=success,
+            )
+        except SourceTransferTimeout:
+            logger.error(
+                "Mooncake source operation %s watchdog expired after %.3fs; "
+                "retaining source buffers until native operation returns",
+                operation,
+                timeout_s,
+            )
+            raise
 
-        src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self._source_drain.run(
+    def _run_mooncake_batch_transfer(
+        self,
+        mooncake_session_id,
+        src_addrs,
+        dst_addrs,
+        lengths,
+    ):
+        return self._run_source_with_watchdog(
             self.engine.batch_transfer_sync,
             mooncake_session_id,
             list(src_addrs),
             list(dst_addrs),
             list(lengths),
+            operation=f"batch_transfer_sync:{mooncake_session_id}",
             success=lambda ret: ret == 0,
+        )
+
+    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+        if not transfer_blocks:
+            return 0
+
+        src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+        return self._run_mooncake_batch_transfer(
+            mooncake_session_id,
+            src_addrs,
+            dst_addrs,
+            lengths,
         )
 
     def _send_kvcache_generic(
@@ -1405,13 +1479,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [transfer_slice_len] * total_slices
-            return self._source_drain.run(
-                self.engine.batch_transfer_sync,
+            return self._run_mooncake_batch_transfer(
                 mooncake_session_id,
                 src_addr_list,
                 dst_addr_list,
                 length_list,
-                success=lambda ret: ret == 0,
             )
 
         futures = []
@@ -2144,7 +2216,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     kv_chunk.staging_counted = True
 
                 if kv_chunk.source_event is not None:
-                    self._source_drain.run(kv_chunk.source_event.synchronize)
+                    self._run_source_with_watchdog(
+                        kv_chunk.source_event.synchronize,
+                        operation="cuda_event_synchronize",
+                    )
                     kv_chunk.source_event = None
 
                 if (
