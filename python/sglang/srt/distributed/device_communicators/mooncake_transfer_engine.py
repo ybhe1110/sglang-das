@@ -177,7 +177,12 @@ class MooncakeTransferEngine:
         self.engine = TransferEngine()
         self._shutdown = False
         self._registered_regions = set()
+        # Peer endpoint ids are learned from transfer/probe calls.  Keeping a
+        # process-local set lets shutdown explicitly tear down every session
+        # before destroying the native endpoint and its QPs.
+        self._peer_sessions = set()
         self._region_lock = threading.RLock()
+        self._session_lock = threading.RLock()
         log_mooncake_runtime_configuration(self.engine)
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
@@ -262,7 +267,7 @@ class MooncakeTransferEngine:
                 }
         return ret_value
 
-    def shutdown(self) -> None:
+    def shutdown(self, force_sessions: bool = True) -> None:
         """Deregister buffers and destroy the native endpoint/QP.
 
         Mooncake has exposed several names for the native endpoint teardown
@@ -276,26 +281,129 @@ class MooncakeTransferEngine:
                 return
             self._shutdown = True
             regions = list(self._registered_regions)
+        if force_sessions:
+            self.force_destroy_sessions()
         if regions:
             self.batch_deregister([ptr for ptr, _ in regions])
 
-        for method_name in ("shutdown", "close", "destroy", "finalize", "stop"):
-            method = getattr(self.engine, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                method()
-                logger.info("Mooncake Transfer Engine endpoint shut down via %s", method_name)
-            except Exception:
-                logger.exception(
-                    "Mooncake Transfer Engine endpoint shutdown via %s failed",
-                    method_name,
-                )
-            return
+        for target in self._native_targets():
+            for method_name in ("shutdown", "close", "destroy", "finalize", "stop"):
+                method = getattr(target, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    method()
+                    logger.info(
+                        "Mooncake Transfer Engine endpoint shut down via %s",
+                        method_name,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Mooncake Transfer Engine endpoint shutdown via %s failed",
+                        method_name,
+                    )
+                return
         logger.warning(
             "Mooncake Transfer Engine exposes no endpoint shutdown API; "
             "native QP cleanup is deferred to process teardown"
         )
+
+    def _track_peer_session(self, session_id: str) -> None:
+        if session_id:
+            added = False
+            with self._session_lock:
+                added = session_id not in self._peer_sessions
+                self._peer_sessions.add(session_id)
+                count = len(self._peer_sessions)
+            if added:
+                logger.info("Mooncake peer sessions tracked: count=%d", count)
+
+    def peer_session_count(self) -> int:
+        """Return the number of unique peer endpoints tracked by this process."""
+        with self._session_lock:
+            return len(self._peer_sessions)
+
+    def _native_targets(self):
+        """Yield wrapper and underlying native endpoint exactly once."""
+        targets = [self.engine]
+        get_engine = getattr(self.engine, "get_engine", None)
+        if callable(get_engine):
+            try:
+                native = get_engine()
+            except Exception:
+                native = None
+            if native is not None and native is not self.engine:
+                targets.append(native)
+        return targets
+
+    def destroy_session(self, session_id: str) -> bool:
+        """Destroy one native peer session when the installed API supports it.
+
+        Mooncake has used several names for this operation.  Endpoint
+        shutdown remains the final fallback because older wheels do not expose
+        a per-session method.
+        """
+        if not session_id:
+            return True
+        for target in self._native_targets():
+            for method_name in (
+                "destroy_session",
+                "close_session",
+                "remove_session",
+                "unregister_session",
+                "disconnect",
+            ):
+                method = getattr(target, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    result = method(session_id)
+                except TypeError:
+                    # A method with the same name but endpoint-level signature
+                    # is not a per-session API; try the next candidate.
+                    continue
+                except Exception:
+                    logger.exception(
+                        "Mooncake session %s destroy via %s failed",
+                        session_id,
+                        method_name,
+                    )
+                    return False
+                if result is None or result == 0 or result is True:
+                    with self._session_lock:
+                        self._peer_sessions.discard(session_id)
+                    logger.debug(
+                        "Mooncake session %s destroyed via %s",
+                        session_id,
+                        method_name,
+                    )
+                    return True
+                logger.warning(
+                    "Mooncake session %s destroy via %s returned %r",
+                    session_id,
+                    method_name,
+                    result,
+                )
+                return False
+        return False
+
+    def force_destroy_sessions(self) -> bool:
+        """Destroy all tracked peer sessions before endpoint teardown."""
+        with self._session_lock:
+            sessions = list(self._peer_sessions)
+        if not sessions:
+            return True
+        all_destroyed = True
+        for session_id in sessions:
+            if not self.destroy_session(session_id):
+                all_destroyed = False
+        if not all_destroyed:
+            logger.warning(
+                "Mooncake native wheel has no usable per-session destroy API; "
+                "endpoint shutdown will be used for sessions=%s",
+                sessions,
+            )
+        return all_destroyed
 
     def initialize(
         self,
@@ -327,6 +435,7 @@ class MooncakeTransferEngine:
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
+        self._track_peer_session(session_id)
         try:
             ret = self.engine.transfer_sync_write(
                 session_id, buffer, peer_buffer_address, length
@@ -352,6 +461,7 @@ class MooncakeTransferEngine:
         lengths: List[int],
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
+        self._track_peer_session(session_id)
         try:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
@@ -379,6 +489,7 @@ class MooncakeTransferEngine:
         return self.session_id
 
     def send_probe(self, peer_session_id: str) -> int:
+        self._track_peer_session(peer_session_id)
         return self.engine.send_probe(peer_session_id)
 
     def get_engine(self):
@@ -415,14 +526,14 @@ def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
         return _mooncake_transfer_engine
 
 
-def shutdown_mooncake_transfer_engine() -> None:
+def shutdown_mooncake_transfer_engine(force: bool = True) -> None:
     """Shutdown the process-level Mooncake engine, if one is initialized."""
     global _mooncake_transfer_engine
     with _mooncake_transfer_engine_lock:
         engine = _mooncake_transfer_engine
         _mooncake_transfer_engine = None
     if engine is not None:
-        engine.shutdown()
+        engine.shutdown(force_sessions=force)
 
 
 def maybe_init_shared_mooncake_transfer_engine(

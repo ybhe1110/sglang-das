@@ -97,6 +97,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_with_timeout,
     get_dsa_seed_metadata_dim,
     prepare_abort,
     resolve_disagg_metadata_config,
@@ -354,7 +355,11 @@ logger = logging.getLogger(__name__)
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
-    torch.distributed.all_reduce(warmup_tensor, group=group)
+    all_reduce_with_timeout(
+        warmup_tensor,
+        op=torch.distributed.ReduceOp.SUM,
+        group=group,
+    )
     device_module.synchronize()
 
 
@@ -1841,7 +1846,7 @@ class Scheduler(
                     shutdown_mooncake_transfer_engine,
                 )
 
-                shutdown_mooncake_transfer_engine()
+                shutdown_mooncake_transfer_engine(force=True)
             except Exception:
                 logger.exception("Failed to shut down Mooncake Transfer Engine")
         else:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import logging
 import threading
+from datetime import timedelta
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -172,6 +173,60 @@ def unified_memory_disagg_move_gate(scheduler):
 #########################
 
 
+class DisaggregationCollectiveError(RuntimeError):
+    """A P/D collective failed and the scheduler must leave the event loop."""
+
+
+def _collective_timeout_s() -> float:
+    """Return a positive timeout for every disaggregation collective."""
+    try:
+        value = float(envs.SGLANG_DISAGGREGATION_COLLECTIVE_TIMEOUT.get())
+    except (AttributeError, TypeError, ValueError):
+        value = 30.0
+    return max(value, 0.1)
+
+
+def _abort_collective_group(group: dist.ProcessGroup) -> None:
+    """Best-effort abort that wakes peers after a collective failure."""
+    abort = getattr(group, "abort", None)
+    if callable(abort):
+        try:
+            abort()
+            return
+        except Exception:
+            logger.exception("Failed to abort disaggregation process group")
+    destroy = getattr(dist, "destroy_process_group", None)
+    if callable(destroy):
+        try:
+            destroy(group)
+        except Exception:
+            logger.exception("Failed to destroy disaggregation process group")
+
+
+def all_reduce_with_timeout(
+    tensor: torch.Tensor,
+    *,
+    op,
+    group: dist.ProcessGroup,
+    timeout_s: Optional[float] = None,
+) -> None:
+    """Run an all-reduce with bounded wait and fail-fast group teardown."""
+    timeout = _collective_timeout_s() if timeout_s is None else max(float(timeout_s), 0.1)
+    try:
+        work = dist.all_reduce(tensor, op=op, group=group, async_op=True)
+        if work is not None:
+            completed = work.wait(timeout=timedelta(seconds=timeout))
+            if completed is False:
+                raise TimeoutError(
+                    f"all_reduce did not complete within {timeout:.3f}s"
+                )
+    except Exception as exc:
+        _abort_collective_group(group)
+        raise DisaggregationCollectiveError(
+            f"disaggregation all_reduce failed or timed out after {timeout:.3f}s"
+        ) from exc
+
+
 def _poll_with_failure_injection(pollers) -> List[int]:
     if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
         return [
@@ -209,7 +264,11 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    all_reduce_with_timeout(
+        tensor_to_reduce,
+        op=dist.ReduceOp.MIN,
+        group=group,
+    )
     return tensor_to_reduce.tolist()
 
 

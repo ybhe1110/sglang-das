@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.disaggregation.kv_events import OffloadedState
+from sglang.srt.disaggregation.utils import all_reduce_with_timeout
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -211,7 +212,7 @@ class DecodeKVCacheOffloadManager:
             dtype=torch.int,
         )
         if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
+            all_reduce_with_timeout(
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 

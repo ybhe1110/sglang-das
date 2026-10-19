@@ -29,6 +29,7 @@ from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_mooncake_transfer_engine,
 )
+from sglang.srt.disaggregation.utils import all_reduce_with_timeout
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -2160,7 +2161,7 @@ class MMReceiverBase(ABC):
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
 
-        torch.distributed.all_reduce(
+        all_reduce_with_timeout(
             local_status,
             op=torch.distributed.ReduceOp.MIN,
             group=self.tp_group.cpu_group,

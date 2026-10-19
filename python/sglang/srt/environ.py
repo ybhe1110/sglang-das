@@ -650,6 +650,9 @@ class Envs:
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    # Bound every cross-rank P/D collective. A timeout aborts the affected
+    # process group and lets the scheduler fail the rank instead of wedging.
+    SGLANG_DISAGGREGATION_COLLECTIVE_TIMEOUT = EnvFloat(30.0)
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)

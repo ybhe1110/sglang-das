@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_with_timeout,
     all_reduce_min_flags,
     build_kv_layer_ids,
     get_dsv4_c128_state_indices,
@@ -775,12 +776,12 @@ class PrefillBootstrapQueue:
             hidden_row_credits -= hidden_cost
 
         ready_tensor = torch.tensor(ready, dtype=torch.uint8, device="cpu")
-        torch.distributed.all_reduce(
+        all_reduce_with_timeout(
             ready_tensor,
             op=torch.distributed.ReduceOp.MIN,
             group=self.scheduler.attn_tp_cpu_group,
         )
-        torch.distributed.all_reduce(
+        all_reduce_with_timeout(
             ready_tensor,
             op=torch.distributed.ReduceOp.MIN,
             group=self.scheduler.attn_cp_cpu_group,
@@ -805,12 +806,12 @@ class PrefillBootstrapQueue:
             dtype=torch.int64,
             device="cpu",
         )
-        torch.distributed.all_reduce(
+        all_reduce_with_timeout(
             prefix_tensor,
             op=torch.distributed.ReduceOp.MAX,
             group=self.scheduler.attn_tp_cpu_group,
         )
-        torch.distributed.all_reduce(
+        all_reduce_with_timeout(
             prefix_tensor,
             op=torch.distributed.ReduceOp.MAX,
             group=self.scheduler.attn_cp_cpu_group,
