@@ -1728,8 +1728,8 @@ class CommonKVManager(BaseKVManager):
         threading.Thread(target=self._run_heartbeat_checker_loop, daemon=True).start()
 
     def _run_heartbeat_checker_loop(self):
-        while True:
-            time.sleep(self.heartbeat_interval)
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        while shutdown_event is None or not shutdown_event.wait(self.heartbeat_interval):
             try:
                 self._run_one_heartbeat_pass()
             except Exception:

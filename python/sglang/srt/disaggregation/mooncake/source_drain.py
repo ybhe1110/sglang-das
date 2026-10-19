@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import threading
+import time
 from itertools import count
 
 
@@ -33,6 +34,7 @@ class _SourceOp:
 class SourceDrainTracker:
     def __init__(self):
         self.lock = threading.RLock()
+        self._condition = threading.Condition(self.lock)
         self._sequence = count(1)
         self._generations = {}
         self._ops = {}
@@ -93,6 +95,7 @@ class SourceDrainTracker:
                 return False
             op.state = "active"
             self._context.op = op
+            self._condition.notify_all()
             return True
 
     @staticmethod
@@ -110,6 +113,7 @@ class SourceDrainTracker:
                 self.poison(op.room, op.generation)
                 return False
             op.state = "cancelled" if (op.room, op.generation) in self._closed else "pending"
+            self._condition.notify_all()
             return True
 
     def complete(self, chunk):
@@ -123,6 +127,7 @@ class SourceDrainTracker:
                 return False
             op.state = "done"
             self._context.op = None
+            self._condition.notify_all()
             return True
 
     def mark_unresolved(self, chunk):
@@ -130,6 +135,7 @@ class SourceDrainTracker:
             op = self._op(chunk)
             if op is not None and op.state == "active":
                 op.state = "unresolved"
+                self._condition.notify_all()
 
     def finish_quiesced(self, chunk):
         with self.lock:
@@ -137,6 +143,7 @@ class SourceDrainTracker:
             if op is None or op.state != "unresolved" or not self._safe(op):
                 return False
             op.state = "done"
+            self._condition.notify_all()
             return True
 
     def run(self, fn, *args, success=None):
@@ -152,6 +159,7 @@ class SourceDrainTracker:
         finally:
             with self.lock:
                 op.hazards.discard(hazard)
+                self._condition.notify_all()
         if success is not None and not success(result):
             raise SourceTransferUnresolved("Synchronous transfer did not complete")
         return result
@@ -189,6 +197,7 @@ class SourceDrainTracker:
             finally:
                 with self.lock:
                     op.hazards.discard(hazard)
+                    self._condition.notify_all()
                 # This may complete an unresolved operation after the caller
                 # has already quarantined its request.
                 self.finish_quiesced(op.chunk)
@@ -205,6 +214,14 @@ class SourceDrainTracker:
             with self.lock:
                 if op.state == "active":
                     op.state = "unresolved"
+                # A timed-out native call remains quarantined until its
+                # detached thread returns.  Closing/poisoning here prevents a
+                # new chunk from being published into the same room while the
+                # source buffer is still potentially in use.
+                self._closed.add((op.room, op.generation))
+                self._poisoned.add((op.room, op.generation))
+                self._context.op = None
+                self._condition.notify_all()
             raise SourceTransferTimeout(
                 f"Source transfer exceeded watchdog deadline ({timeout_s:.3f}s)"
             ) from exc
@@ -241,6 +258,7 @@ class SourceDrainTracker:
             op = self._op(chunk)
             if op is not None:
                 op.futures.update(futures)
+            self._condition.notify_all()
 
     def _quiesced(self, key):
         return not any(
@@ -260,6 +278,7 @@ class SourceDrainTracker:
                 for op in self._ops.values():
                     if (op.room, op.generation) == key and op.state == "pending":
                         op.state = "cancelled"
+            self._condition.notify_all()
 
     def poison(self, room, generation=None):
         self.close(room, generation, poisoned=True)
@@ -291,7 +310,44 @@ class SourceDrainTracker:
                     self.finish_quiesced(op.chunk)
             for key in affected:
                 self.poison(*key)
+            self._condition.notify_all()
             return affected
+
+    def shutdown(self, timeout_s=5.0):
+        """Poison all rooms and wait for detached native calls to quiesce.
+
+        A Python timeout cannot cancel a native RDMA call safely.  Shutdown
+        therefore keeps every room's buffers quarantined until its hazards and
+        futures are complete.  The returned keys are still live after the
+        deadline and must not be deregistered by the caller.
+        """
+        timeout_s = max(float(timeout_s or 0.0), 0.0)
+        deadline = time.monotonic() + timeout_s
+        with self.lock:
+            keys = set(self._generations.items())
+            for room, generation in keys:
+                key = (room, generation)
+                self._closed.add(key)
+                self._poisoned.add(key)
+                for op in self._ops.values():
+                    if (op.room, op.generation) == key and op.state == "pending":
+                        op.state = "cancelled"
+            self._condition.notify_all()
+
+            while True:
+                remaining = {
+                    key for key in keys if not self._quiesced(key)
+                }
+                if not remaining:
+                    break
+                wait_s = deadline - time.monotonic()
+                if wait_s <= 0:
+                    return sorted(remaining)
+                self._condition.wait(timeout=wait_s)
+
+            for room, generation in keys:
+                self.forget(room, generation)
+            return []
 
     def forget(self, room, generation=None):
         with self.lock:
@@ -304,4 +360,5 @@ class SourceDrainTracker:
             self._closed.discard(key)
             self._poisoned.discard(key)
             self._generations.pop(room, None)
+            self._condition.notify_all()
             return True

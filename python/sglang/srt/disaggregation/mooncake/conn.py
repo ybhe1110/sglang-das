@@ -289,6 +289,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._shutdown_event = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = False
+        self._worker_threads = []
+        self._receiver_threads = []
         self.init_engine()
         self.register_buffer_to_engine()
         self.pd_hidden_pool = None
@@ -334,7 +339,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             for i, (transfer_queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
-                threading.Thread(
+                thread = threading.Thread(
                     target=self._run_transfer_worker,
                     args=(
                         transfer_queue,
@@ -347,7 +352,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         i,
                     ),
                     daemon=True,
-                ).start()
+                )
+                self._worker_threads.append(thread)
+                thread.start()
             self.enable_failed_session_probe = (
                 envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
             )
@@ -611,6 +618,87 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
                 self.connection_pool.clear()
+
+    def shutdown(self, timeout_s: float = 10.0) -> bool:
+        """Stop Mooncake workers and release native transport resources."""
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return not bool(getattr(self, "_shutdown_source_remaining", ()))
+            self._shutdown_complete = True
+            self._shutdown_event.set()
+
+        probe_event = getattr(self, "_failed_session_probe_shutdown", None)
+        if probe_event is not None:
+            probe_event.set()
+
+        drain = getattr(self, "_source_drain", None)
+        if drain is not None:
+            remaining = drain.shutdown(timeout_s=timeout_s)
+            self._shutdown_source_remaining = remaining
+            if remaining:
+                logger.error(
+                    "Mooncake source drain still active during shutdown; "
+                    "retaining buffers for rooms=%s",
+                    remaining,
+                )
+
+        # Wake transfer workers blocked in FastQueue.get().  Pending chunks
+        # have already been cancelled by source-drain shutdown.
+        for queue in getattr(self, "transfer_queues", []):
+            queue.put(None)
+
+        self._close_zmq_resources()
+        deadline = time.monotonic() + max(float(timeout_s or 0.0), 0.0)
+        for thread in list(self._worker_threads) + list(self._receiver_threads):
+            remaining_s = max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining_s)
+
+        for executor in getattr(self, "executors", []):
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=True)
+        executor = getattr(self, "_prefill_recompute_executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=True)
+
+        # Never deregister a buffer that a detached native call may still be
+        # accessing.  The process-level engine remains alive in that case and
+        # owns the quarantined MR until process teardown.
+        if not getattr(self, "_shutdown_source_remaining", ()):
+            self.deregister_buffer_to_engine()
+        return not bool(getattr(self, "_shutdown_source_remaining", ()))
+
+    def _close_zmq_resources(self) -> None:
+        with self._socket_lock:
+            for sock in list(self._socket_cache.values()):
+                try:
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+            for monitor in list(self._monitor_cache.values()):
+                try:
+                    monitor.close(linger=0)
+                except Exception:
+                    pass
+            self._socket_cache.clear()
+            self._monitor_cache.clear()
+            self._socket_send_locks.clear()
+        server_socket = getattr(self, "server_socket", None)
+        if server_socket is not None:
+            try:
+                server_socket.close(linger=0)
+            except Exception:
+                pass
+        context = getattr(self, "_zmq_ctx", None)
+        if context is not None:
+            try:
+                context.term()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -2189,6 +2277,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             kv_chunk = None
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if kv_chunk is None:
+                    return
                 if not self._source_drain.begin(kv_chunk):
                     logger.debug(
                         "Skipping cancelled source chunk for room %s", kv_chunk.room
@@ -2908,13 +2998,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         transfers on this prefill (decode sees no incoming chunks and
         eventually times out its bootstrap window).
         """
-        threading.Thread(target=self._run_bootstrap_receiver_loop).start()
+        thread = threading.Thread(
+            target=self._run_bootstrap_receiver_loop,
+            name="MooncakePrefillReceiver",
+            daemon=True,
+        )
+        self._receiver_threads.append(thread)
+        thread.start()
 
     def _run_bootstrap_receiver_loop(self):
-        while True:
+        while not self._shutdown_event.is_set():
             try:
                 msg = self.server_socket.recv_multipart()
             except Exception:
+                if self._shutdown_event.is_set():
+                    return
                 logger.exception(
                     "bootstrap_thread recv_multipart failed; retrying after 50ms"
                 )
@@ -3153,7 +3251,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ``start_prefill_thread``, it must not die on a single bad
         message: dispatch errors are logged and the loop advances.
         """
-        threading.Thread(target=self._run_decode_receiver_loop).start()
+        thread = threading.Thread(
+            target=self._run_decode_receiver_loop,
+            name="MooncakeDecodeReceiver",
+            daemon=True,
+        )
+        self._receiver_threads.append(thread)
+        thread.start()
         # Exactly once per manager - keep this out of the per-message
         # receiver/dispatch path (see the latch + rationale in
         # CommonKVManager._start_heartbeat_checker_thread).
@@ -3165,8 +3269,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         poller = zmq.Poller()
         poller.register(self.server_socket, zmq.POLLIN)
         poller.register(self.pd_hidden_events.ack_wakeup_receiver, zmq.POLLIN)
-        while True:
-            events = dict(poller.poll())
+        while not self._shutdown_event.is_set():
+            events = dict(poller.poll(1000))
             if self.pd_hidden_events.ack_wakeup_receiver in events:
                 while True:
                     try:
@@ -3179,6 +3283,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             try:
                 msg = self.server_socket.recv_multipart()
             except Exception:
+                if self._shutdown_event.is_set():
+                    return
                 logger.exception(
                     "decode_thread recv_multipart failed; retrying after 50ms"
                 )

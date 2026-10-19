@@ -4,6 +4,7 @@ import importlib.metadata as importlib_metadata
 import json
 import logging
 import os
+import threading
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
 _mooncake_transfer_engine: Optional[MooncakeTransferEngine] = None
+_mooncake_transfer_engine_lock = threading.RLock()
 
 
 def parse_ib_device_config(
@@ -173,6 +175,9 @@ class MooncakeTransferEngine:
             ) from e
 
         self.engine = TransferEngine()
+        self._shutdown = False
+        self._registered_regions = set()
+        self._region_lock = threading.RLock()
         log_mooncake_runtime_configuration(self.engine)
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
@@ -200,6 +205,9 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             logger.debug("Mooncake memory registration %s failed.", ptr)
+        else:
+            with self._region_lock:
+                self._registered_regions.add((ptr, length))
 
     def deregister(self, ptr):
         try:
@@ -210,6 +218,11 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             logger.debug("Mooncake memory deregistration %s failed.", ptr)
+        else:
+            with self._region_lock:
+                self._registered_regions = {
+                    region for region in self._registered_regions if region[0] != ptr
+                }
 
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
         """Batch register multiple memory regions."""
@@ -226,6 +239,9 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             logger.debug("Mooncake batch memory registration failed.")
+        else:
+            with self._region_lock:
+                self._registered_regions.update(zip(ptrs, lengths))
         return ret_value
 
     def batch_deregister(self, ptrs: List[int]) -> int:
@@ -238,7 +254,48 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             logger.debug("Mooncake batch memory deregistration failed.")
+        else:
+            with self._region_lock:
+                ptr_set = set(ptrs)
+                self._registered_regions = {
+                    region for region in self._registered_regions if region[0] not in ptr_set
+                }
         return ret_value
+
+    def shutdown(self) -> None:
+        """Deregister buffers and destroy the native endpoint/QP.
+
+        Mooncake has exposed several names for the native endpoint teardown
+        across releases.  Use the strongest available method exactly once;
+        the native implementation owns QP destruction and its completion
+        queues.  If an old package has no teardown API, log loudly and rely on
+        process teardown instead of pretending the endpoint was destroyed.
+        """
+        with self._region_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            regions = list(self._registered_regions)
+        if regions:
+            self.batch_deregister([ptr for ptr, _ in regions])
+
+        for method_name in ("shutdown", "close", "destroy", "finalize", "stop"):
+            method = getattr(self.engine, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method()
+                logger.info("Mooncake Transfer Engine endpoint shut down via %s", method_name)
+            except Exception:
+                logger.exception(
+                    "Mooncake Transfer Engine endpoint shutdown via %s failed",
+                    method_name,
+                )
+            return
+        logger.warning(
+            "Mooncake Transfer Engine exposes no endpoint shutdown API; "
+            "native QP cleanup is deferred to process teardown"
+        )
 
     def initialize(
         self,
@@ -343,17 +400,29 @@ def init_mooncake_transfer_engine(
     mooncake transfer is needed.
     """
     global _mooncake_transfer_engine
-    if _mooncake_transfer_engine is not None:
+    with _mooncake_transfer_engine_lock:
+        if _mooncake_transfer_engine is not None:
+            return _mooncake_transfer_engine
+        _mooncake_transfer_engine = MooncakeTransferEngine(
+            hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
+        )
         return _mooncake_transfer_engine
-    _mooncake_transfer_engine = MooncakeTransferEngine(
-        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
-    )
-    return _mooncake_transfer_engine
 
 
 def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
     """Return the shared MooncakeTransferEngine if initialized, else None."""
-    return _mooncake_transfer_engine
+    with _mooncake_transfer_engine_lock:
+        return _mooncake_transfer_engine
+
+
+def shutdown_mooncake_transfer_engine() -> None:
+    """Shutdown the process-level Mooncake engine, if one is initialized."""
+    global _mooncake_transfer_engine
+    with _mooncake_transfer_engine_lock:
+        engine = _mooncake_transfer_engine
+        _mooncake_transfer_engine = None
+    if engine is not None:
+        engine.shutdown()
 
 
 def maybe_init_shared_mooncake_transfer_engine(

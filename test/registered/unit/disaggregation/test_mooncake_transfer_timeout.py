@@ -110,6 +110,54 @@ def load_source_watchdog():
 
 
 class TestMooncakeTransferTimeout(unittest.TestCase):
+    def test_engine_and_manager_expose_ordered_shutdown(self):
+        engine_tree = ast.parse(ENGINE.read_text(encoding="utf-8"))
+        engine_shutdown = next(
+            n
+            for n in ast.walk(engine_tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "shutdown"
+        )
+        native_methods = {
+            n.func.attr
+            for n in ast.walk(engine_shutdown)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+        native_method_names = {
+            n.value
+            for n in ast.walk(engine_shutdown)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        }
+        self.assertTrue(
+            native_methods.intersection({"shutdown", "close", "destroy"})
+            or {"shutdown", "close", "destroy"}.issubset(native_method_names)
+        )
+        self.assertTrue(
+            any(
+                isinstance(n, ast.FunctionDef)
+                and n.name == "shutdown_mooncake_transfer_engine"
+                for n in ast.walk(engine_tree)
+            )
+        )
+
+        conn_tree = ast.parse(CONN.read_text(encoding="utf-8"))
+        manager_class = next(
+            n
+            for n in ast.walk(conn_tree)
+            if isinstance(n, ast.ClassDef) and n.name == "MooncakeKVManager"
+        )
+        manager_shutdown = next(
+            n
+            for n in manager_class.body
+            if isinstance(n, ast.FunctionDef) and n.name == "shutdown"
+        )
+        shutdown_attrs = {
+            n.func.attr
+            for n in ast.walk(manager_shutdown)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+        self.assertIn("shutdown", shutdown_attrs)
+        self.assertIn("deregister_buffer_to_engine", shutdown_attrs)
+
     def test_sync_batch_paths_use_source_watchdog(self):
         tree = ast.parse(CONN.read_text(encoding="utf-8"))
         helper = next(
