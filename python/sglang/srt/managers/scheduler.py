@@ -714,11 +714,23 @@ class Scheduler(
             else self.tp_group.rank_in_group
         )
         logger.info("HCCL DP prewarm start: rank=%s", rank)
-        _prewarm_hccl_group(
-            device=self.tp_group.device,
-            group=self.tp_group.device_group,
-            device_module=self.tp_group.device_module,
-        )
+        try:
+            _prewarm_hccl_group(
+                device=self.tp_group.device,
+                group=self.tp_group.device_group,
+                device_module=self.tp_group.device_module,
+            )
+        except Exception:
+            # A collective timeout or failure during warmup must not crash
+            # Scheduler.__init__: the parent process would never receive the
+            # init-info pipe write and the whole cluster would hang at startup.
+            # Degrade gracefully; serving continues without the DP prewarm.
+            logger.warning(
+                "HCCL DP prewarm failed at rank=%s; continuing without it",
+                rank,
+                exc_info=True,
+            )
+            return
         logger.info("HCCL DP prewarm done: rank=%s", rank)
 
     def init_zbal_on_npu(self):

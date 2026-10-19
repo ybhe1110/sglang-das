@@ -242,14 +242,25 @@ class SourceDrainTracker:
                 self._context.op = None
 
         hazard = object()
+        future = None
         with self.lock:
             op.hazards.add(hazard)
-            try:
-                future = executor.submit(invoke)
-            finally:
+        try:
+            future = executor.submit(invoke)
+        finally:
+            with self.lock:
                 op.hazards.discard(hazard)
-        with self.lock:
-            op.futures.add(future)
+                # Register the future inside the same lock acquisition that
+                # removes the hazard.  Without this there is a window between
+                # the two separate `with self.lock` blocks where op.hazards is
+                # empty AND op.futures is still empty, making _safe(op) return
+                # True prematurely.  A concurrent finish_quiesced callback
+                # could then mark the op "done" while this future is still
+                # in flight.
+                if future is not None:
+                    op.futures.add(future)
+        if future is None:
+            raise RuntimeError("executor.submit did not return a future")
         future.add_done_callback(lambda _: self.finish_quiesced(op.chunk))
         return future
 
