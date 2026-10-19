@@ -480,6 +480,33 @@ class TestSourceDrain(unittest.TestCase):
         self.assertTrue(self.tracker.terminal(7))
         self.assertTrue(self.tracker.forget(7))
 
+    def test_shutdown_quarantines_timed_out_native_call_then_forgets(self):
+        """Manager shutdown must not release a buffer before native return."""
+        queue = Mock()
+        self.tracker.publish(self.chunk, queue, lambda: True)
+        self.tracker.begin(self.chunk)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_native_call():
+            started.set()
+            release.wait(2)
+            return 0
+
+        with self.assertRaises(SourceTransferTimeout):
+            self.tracker.run_with_deadline(
+                blocked_native_call, timeout_s=0.02, success=lambda ret: ret == 0
+            )
+        self.assertTrue(started.wait(1))
+
+        # The first shutdown call times out and leaves the room quarantined.
+        self.assertTrue(self.tracker.shutdown(timeout_s=0.01))
+        self.assertFalse(self.tracker.terminal(7))
+
+        release.set()
+        self.assertTrue(self.tracker.shutdown(timeout_s=1.0) == [])
+        self.assertFalse(self.tracker._generations)
+
     def test_failed_future_completion_releases_hazard(self):
         queue = Mock()
         self.tracker.publish(self.chunk, queue, lambda: True)

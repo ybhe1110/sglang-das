@@ -331,6 +331,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._shutdown_event = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = False
         self.init_engine()
         self.register_buffer_to_engine()
         self.pd_hidden_pool = None
@@ -798,16 +801,63 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         except Exception:
             logger.exception("Failed to destroy mooncake zmq context during teardown")
 
-        # Deregister memory from the transfer engine.
-        try:
-            self.deregister_buffer_to_engine()
-        except Exception:
-            logger.exception("Failed to deregister buffers during teardown")
+        # Never deregister a buffer that a detached native call may still be
+        # accessing (see shutdown()).  The process-level engine stays alive in
+        # that case and owns the quarantined MR until process teardown.
+        if getattr(self, "_shutdown_source_remaining", ()):
+            logger.error(
+                "Skipping Mooncake buffer deregistration: source transfers "
+                "still unresolved for rooms=%s",
+                self._shutdown_source_remaining,
+            )
+        else:
+            try:
+                self.deregister_buffer_to_engine()
+            except Exception:
+                logger.exception("Failed to deregister buffers during teardown")
 
         logger.info(
             "MooncakeKVManager torn down (was role=%s)",
             self.disaggregation_mode.value,
         )
+
+    def shutdown(self, timeout_s: float = 10.0) -> bool:
+        """Stop Mooncake workers and release native transport resources.
+
+        Settles the source-drain tracker first, then runs ``teardown()``.
+        Returns ``True`` when no detached native source operation is still
+        active, i.e. the caller may destroy the process-level transfer engine
+        endpoint; ``False`` keeps the quarantined MR buffers registered until
+        process teardown.
+        """
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return not bool(getattr(self, "_shutdown_source_remaining", ()))
+            self._shutdown_complete = True
+            self._shutdown_event.set()
+
+        drain = getattr(self, "_source_drain", None)
+        if drain is not None:
+            remaining = drain.shutdown(timeout_s=timeout_s)
+            self._shutdown_source_remaining = remaining
+            if remaining:
+                logger.error(
+                    "Mooncake source drain still active during shutdown; "
+                    "retaining buffers for rooms=%s",
+                    remaining,
+                )
+
+        executor = getattr(self, "_prefill_recompute_executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=True)
+
+        # teardown() wakes and joins the workers, closes the ZMQ resources and
+        # deregisters buffers unless a source operation is still unresolved.
+        self.teardown()
+        return not bool(getattr(self, "_shutdown_source_remaining", ()))
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)

@@ -2084,6 +2084,50 @@ class Scheduler(
 
         rank_consensus_checker.shutdown()
 
+    def shutdown_disaggregation_resources(self) -> None:
+        """Stop Mooncake workers before tearing down the process.
+
+        The transfer engine is process-global, so manager teardown must happen
+        first: source hazards and registered MR buffers must be gone before
+        the native endpoint/QPs are destroyed.
+        """
+        managers = []
+        for queue_name in (
+            "disagg_prefill_bootstrap_queue",
+            "disagg_decode_transfer_queue",
+        ):
+            queue = getattr(self, queue_name, None)
+            manager = getattr(queue, "kv_manager", None)
+            if manager is not None:
+                managers.append(manager)
+        seen = set()
+        shutdown_safe = True
+        for manager in managers:
+            if id(manager) in seen:
+                continue
+            seen.add(id(manager))
+            shutdown = getattr(manager, "shutdown", None)
+            if shutdown is not None:
+                try:
+                    shutdown_safe = bool(shutdown()) and shutdown_safe
+                except Exception:
+                    shutdown_safe = False
+                    logger.exception("Failed to shut down disaggregation manager")
+        if shutdown_safe:
+            try:
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    shutdown_mooncake_transfer_engine,
+                )
+
+                shutdown_mooncake_transfer_engine()
+            except Exception:
+                logger.exception("Failed to shut down Mooncake Transfer Engine")
+        else:
+            logger.error(
+                "Mooncake endpoint shutdown deferred because source-drain "
+                "operations are still active; native buffers remain quarantined"
+            )
+
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
@@ -7301,6 +7345,10 @@ def run_scheduler_process(
             if scheduler.async_d2h_worker is not None:
                 scheduler.async_d2h_worker.shutdown()
                 scheduler.async_d2h_worker = None
+            # Always close disaggregation resources, including the exception
+            # path.  This is independent of GPU teardown and is safe when a
+            # scheduler rank is already failing.
+            scheduler.shutdown_disaggregation_resources()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
