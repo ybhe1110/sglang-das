@@ -637,5 +637,57 @@ class TestSourceDrain(unittest.TestCase):
                         self.assertEqual(outcome, [-1])
 
 
+class TestTransferWorkerFailure(unittest.TestCase):
+    def test_source_forget_is_idempotent_after_terminal_clear(self):
+        cls = load_methods(
+            CONN,
+            ["forget_source_transfers"],
+            dict(),
+        )
+        sender = cls()
+        sender._source_generation = None
+        sender.kv_mgr = SimpleNamespace(_source_drain=Mock())
+        self.assertTrue(cls.forget_source_transfers(sender))
+        sender.kv_mgr._source_drain.forget.assert_not_called()
+
+    def test_worker_failure_broadcasts_terminal_status_and_releases_bookkeeping(self):
+        cls = load_methods(
+            CONN,
+            ["_conclude_transfer_worker_failure"],
+            dict(KVPoll=KVPoll, logger=Mock()),
+        )
+        mgr = cls()
+        mgr._source_drain = Mock()
+        mgr._staging_outstanding = defaultdict(int, {7: 1})
+        mgr.enable_deferred_decode_kv_release = False
+        mgr._wake_pd_hidden_ack_waiters = Mock()
+        mgr._has_pd_hidden_state = Mock(return_value=False)
+        mgr.record_failure = Mock()
+        mgr.conclude_failure = Mock()
+        mgr.update_status = Mock()
+        chunk = SimpleNamespace(
+            room=7,
+            pd_hidden_start=None,
+            pd_hidden_sent=False,
+            state_indices=None,
+            staging_counted=True,
+        )
+
+        cls._conclude_transfer_worker_failure(
+            mgr, chunk, RuntimeError("synchronous transfer failed")
+        )
+
+        mgr._source_drain.mark_unresolved.assert_called_once_with(chunk)
+        mgr._source_drain.finish_quiesced.assert_called_once_with(chunk)
+        mgr._source_drain.poison.assert_called_once_with(7)
+        mgr.record_failure.assert_called_once_with(7, "synchronous transfer failed")
+        mgr.conclude_failure.assert_called_once_with(
+            bootstrap_room=7,
+            failure_reason="synchronous transfer failed",
+        )
+        mgr._wake_pd_hidden_ack_waiters.assert_called_once_with(7)
+        self.assertNotIn(7, mgr._staging_outstanding)
+
+
 if __name__ == "__main__":
     unittest.main()

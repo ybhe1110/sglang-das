@@ -2818,24 +2818,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self._source_drain.complete(kv_chunk)
 
             except Exception as e:
-                # Submission/event/allocator failure can have ambiguous side
-                # effects. Quarantine the room instead of asserting a drain.
                 if kv_chunk is not None:
-                    self._source_drain.mark_unresolved(kv_chunk)
-                    self._source_drain.finish_quiesced(kv_chunk)
-                    self._source_drain.poison(kv_chunk.room)
                     logger.error(
                         "Source drain is unknown for room %s; retaining resources",
                         kv_chunk.room,
                     )
-                    self.record_failure(kv_chunk.room, str(e))
-                    self.update_status(kv_chunk.room, KVPoll.Failed)
-                # The failed chunk's request will be surfaced as failed by
-                # the normal transfer-failure path (update_status +
-                # sync_status_to_decode_endpoint above); do not let a
-                # single chunk kill the whole transfer thread, which
-                # would silently stall every other in-flight KV transfer
-                # on this prefill.
+                    self._conclude_transfer_worker_failure(kv_chunk, e)
+                # Do not let a single chunk kill the whole transfer thread,
+                # which would silently stall every other in-flight KV transfer.
                 logger.exception(
                     "transfer_worker chunk failed (bootstrap_port=%s): %s; "
                     "continuing to next chunk",
@@ -2843,6 +2833,69 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     e,
                 )
                 continue
+
+    def _conclude_transfer_worker_failure(
+        self, kv_chunk: TransferKVChunk, failure: BaseException
+    ) -> None:
+        """Quarantine one failed chunk and publish a terminal room failure.
+
+        Updating ``request_status`` alone leaves Decode waiting forever and
+        leaves PD-hidden/staging bookkeeping attached to the failed room.  The
+        source-drain calls remain conservative, while the common conclusion
+        path broadcasts the terminal state to every Decode endpoint.
+        """
+        room = kv_chunk.room
+        reason = str(failure)
+        try:
+            self._source_drain.mark_unresolved(kv_chunk)
+            self._source_drain.finish_quiesced(kv_chunk)
+            self._source_drain.poison(room)
+        except Exception:
+            logger.exception(
+                "Failed to quarantine source drain for failed room %s", room
+            )
+
+        try:
+            if kv_chunk.pd_hidden_start is not None:
+                with self.pd_hidden_events.inflight_lock:
+                    self.pd_hidden_events.inflight_chunks.pop(room, None)
+            if not kv_chunk.pd_hidden_sent and self._has_pd_hidden_state(
+                kv_chunk.state_indices
+            ):
+                self._release_or_mark_pd_hidden_done(kv_chunk)
+        except Exception:
+            logger.exception(
+                "Failed to release PD-hidden bookkeeping for room %s", room
+            )
+
+        if getattr(kv_chunk, "staging_counted", False):
+            remaining = self._staging_outstanding.get(room, 0) - 1
+            if remaining > 0:
+                self._staging_outstanding[room] = remaining
+            else:
+                self._staging_outstanding.pop(room, None)
+        try:
+            if self.enable_deferred_decode_kv_release:
+                self._maybe_ack_drained_abort(room)
+            self._wake_pd_hidden_ack_waiters(room)
+        except Exception:
+            logger.exception(
+                "Failed to wake deferred abort waiters for room %s", room
+            )
+
+        self.record_failure(room, reason)
+        try:
+            self.conclude_failure(
+                bootstrap_room=room,
+                failure_reason=reason,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to broadcast worker failure for room %s", room
+            )
+            # Keep local failure state latched so the scheduler can retry
+            # cleanup and source-drain forget on its next poll.
+            self.update_status(room, KVPoll.Failed)
 
     def start_prefill_thread(self):
         """Start the prefill-side bootstrap receiver thread.
@@ -3221,7 +3274,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 page_start,
                 num_pages,
                 session_id,
-                self._chunk_writer_counts,
             )
             return
 
@@ -3279,7 +3331,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         handler = self._staging_handler
                         if handler.is_staging_room(bootstrap_room):
                             handler.submit_last_scatter_async(bootstrap_room)
-                        self._chunk_writer_counts.pop(bootstrap_room, None)
                     self.update_status(bootstrap_room, KVPoll.Success)
         elif status == KVPoll.Failed:
             self.record_failure(
@@ -3620,6 +3671,11 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         )
 
     def forget_source_transfers(self):
+        # ``clear()`` may retire an already-terminal generation before the
+        # scheduler's resource cleanup retry.  Treat the second probe as
+        # success so that cleanup does not quarantine a request forever.
+        if self._source_generation is None:
+            return True
         if self.kv_mgr._source_drain.forget(
             self.bootstrap_room, self._source_generation
         ):
@@ -3628,11 +3684,11 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         return False
 
     def clear(self):
-        # The success path releases KV pages immediately before clear(). At
-        # that point the source generation is terminal and can be retired;
-        # failed cleanup uses forget_source_transfers() only after its retryable
-        # resource release has completed.
-        if self.conclude_state == KVPoll.Success:
+        # Failed ``failure_exception`` can clear the sender before the
+        # scheduler's retry loop reaches abort_external_kv_request().  Retire a
+        # generation whenever it is already terminal; a non-terminal one is
+        # left intact and the retry loop will call this again.
+        if self.conclude_state in (KVPoll.Success, KVPoll.Failed):
             self.forget_source_transfers()
         super().clear()
 
@@ -3655,6 +3711,26 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         self.session_id = mgr.get_session_id()
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+
+    def clear(self):
+        """Release receiver-side staging state on every failure path.
+
+        The Decode queue normally unregisters staging rooms itself, but a
+        propagated prefill failure can enter ``failure_exception`` first.
+        ``unregister_decode_req`` is idempotent, so doing it here closes that
+        gap without changing the normal queue cleanup path.
+        """
+        room = self.bootstrap_room
+        handler = getattr(self.kv_mgr, "_staging_handler", None)
+        if room is not None and handler is not None:
+            try:
+                if handler.is_staging_room(room):
+                    handler.unregister_decode_req(room)
+            except Exception:
+                logger.exception(
+                    "Failed to unregister staging receiver for room %s", room
+                )
+        super().clear()
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:

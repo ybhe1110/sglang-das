@@ -12,6 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.mooncake.conn import (
@@ -124,6 +125,34 @@ class TestDispatchDecodeMsg(CustomTestCase):
         # (room, status, prefill_rank) — all ASCII int-encoded bytes.
         mgr._dispatch_decode_msg([b"7", b"3", b"0"])
         mgr._handle_prefill_response.assert_called_once_with(7, 3, 0)
+
+
+class TestReceiverFailureCleanup(CustomTestCase):
+    def test_clear_unregisters_staging_and_writer_state(self):
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVReceiver
+
+        receiver = MooncakeKVReceiver.__new__(MooncakeKVReceiver)
+        receiver.bootstrap_room = 7
+        receiver.bootstrap_addr = "10.0.0.1"
+        handler = MagicMock()
+        handler.is_staging_room.return_value = True
+        handler._writer_counts = {7: {0: [(0, 1, "writer")]}}
+        receiver.kv_mgr = SimpleNamespace(
+            _staging_handler=handler,
+            request_status={7: 2},
+            required_prefill_response_num_table={7: 1},
+            prefill_response_tracker={7: {0}},
+            addr_to_rooms_tracker={"10.0.0.1": {7}},
+        )
+
+        MooncakeKVReceiver.clear(receiver)
+
+        handler.unregister_decode_req.assert_called_once_with(7)
+        # unregister_decode_req owns writer-counter cleanup.
+        self.assertNotIn(7, receiver.kv_mgr.request_status)
+        self.assertNotIn(7, receiver.kv_mgr.required_prefill_response_num_table)
+        self.assertNotIn(7, receiver.kv_mgr.prefill_response_tracker)
+        self.assertNotIn(7, receiver.kv_mgr.addr_to_rooms_tracker["10.0.0.1"])
 
 
 if __name__ == "__main__":
