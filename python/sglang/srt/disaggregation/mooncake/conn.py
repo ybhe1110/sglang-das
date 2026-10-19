@@ -693,6 +693,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 server_socket.close(linger=0)
             except Exception:
                 pass
+        # ack_wakeup sockets are created from _zmq_ctx but are not in
+        # _socket_cache, so they must be closed explicitly before
+        # context.term() — an open socket blocks term() indefinitely.
+        pd_hidden = getattr(self, "pd_hidden_events", None)
+        if pd_hidden is not None:
+            for attr in ("ack_wakeup_receiver", "ack_wakeup_sender"):
+                sock = getattr(pd_hidden, attr, None)
+                if sock is not None:
+                    try:
+                        sock.close(linger=0)
+                    except Exception:
+                        pass
+                    setattr(pd_hidden, attr, None)
         context = getattr(self, "_zmq_ctx", None)
         if context is not None:
             try:

@@ -216,7 +216,11 @@ def all_reduce_with_timeout(
         work = dist.all_reduce(tensor, op=op, group=group, async_op=True)
         if work is not None:
             completed = work.wait(timeout=timedelta(seconds=timeout))
-            if completed is False:
+            # Some backends return False on timeout; others return None when
+            # the wait expires without completing.  Treat anything that is
+            # not explicitly True as a timeout so neither return value slips
+            # through silently.
+            if completed is not None and not completed:
                 raise TimeoutError(
                     f"all_reduce did not complete within {timeout:.3f}s"
                 )

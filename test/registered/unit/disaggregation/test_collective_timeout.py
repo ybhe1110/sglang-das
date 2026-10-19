@@ -95,6 +95,21 @@ class TestCollectiveTimeout(unittest.TestCase):
 
         group.abort.assert_called_once_with()
 
+    def test_collective_none_wait_result_is_a_timeout(self):
+        # Some backends (e.g. older HCCL) return None from work.wait() when
+        # the operation times out instead of returning False.  Both are treated
+        # as a failure so the group is aborted and the caller gets an error.
+        env = load_collective_helpers()
+        work = Mock()
+        work.wait.return_value = None
+        group = Mock()
+        env["dist"].all_reduce = Mock(return_value=work)
+
+        with self.assertRaises(env["DisaggregationCollectiveError"]):
+            env["all_reduce_with_timeout"](object(), op="min", group=group)
+
+        group.abort.assert_called_once_with()
+
     def test_group_destroy_is_fallback_when_abort_is_unavailable(self):
         env = load_collective_helpers()
         work = Mock()

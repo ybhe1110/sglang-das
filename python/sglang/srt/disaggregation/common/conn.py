@@ -1729,7 +1729,17 @@ class CommonKVManager(BaseKVManager):
 
     def _run_heartbeat_checker_loop(self):
         shutdown_event = getattr(self, "_shutdown_event", None)
-        while shutdown_event is None or not shutdown_event.wait(self.heartbeat_interval):
+        while True:
+            # Backends that set _shutdown_event (e.g. Mooncake) use an
+            # interruptible timed wait so the loop exits promptly on shutdown.
+            # Backends without it (nixl, mori) fall back to a plain sleep so
+            # they do not exit prematurely when shutdown_event is None.
+            if shutdown_event is not None:
+                if shutdown_event.wait(timeout=self.heartbeat_interval):
+                    return
+            else:
+                import time as _time
+                _time.sleep(self.heartbeat_interval)
             try:
                 self._run_one_heartbeat_pass()
             except Exception:
