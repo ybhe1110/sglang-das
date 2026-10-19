@@ -57,6 +57,7 @@ class TestCollectiveTimeout(unittest.TestCase):
     def test_collective_waits_asynchronously_with_configured_timeout(self):
         env = load_collective_helpers()
         work = Mock()
+        work.wait.return_value = True
         group = Mock()
         dist = env["dist"]
         dist.all_reduce = Mock(return_value=work)

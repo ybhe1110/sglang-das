@@ -625,7 +625,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if self._shutdown_complete:
                 return not bool(getattr(self, "_shutdown_source_remaining", ()))
             self._shutdown_complete = True
-            self._shutdown_event.set()
+            self._stop_heartbeat_checker(timeout_s=min(float(timeout_s or 0.0), 2.0))
 
         probe_event = getattr(self, "_failed_session_probe_shutdown", None)
         if probe_event is not None:

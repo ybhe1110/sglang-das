@@ -218,6 +218,13 @@ class CommonKVManager(BaseKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        # Every backend owns the same lifecycle event.  Mooncake used to
+        # create this in its subclass, while NIXL/Mori left it absent; the
+        # heartbeat loop then had no interruptible shutdown path for those
+        # backends.  Keep the event in the common manager so scheduler
+        # teardown can stop any backend uniformly.
+        self._shutdown_event = threading.Event()
+        self._heartbeat_checker_thread: Optional[threading.Thread] = None
         self.kv_args = args
         self.cp_cache_layer_split = bool(getattr(args, "cp_cache_layer_split", False))
         self.kv_cache_layout = getattr(args, "kv_cache_layout", None)
@@ -1725,21 +1732,15 @@ class CommonKVManager(BaseKVManager):
         if self._heartbeat_checker_started:
             return
         self._heartbeat_checker_started = True
-        threading.Thread(target=self._run_heartbeat_checker_loop, daemon=True).start()
+        self._heartbeat_checker_thread = threading.Thread(
+            target=self._run_heartbeat_checker_loop,
+            daemon=True,
+            name="DisaggregationHeartbeatChecker",
+        )
+        self._heartbeat_checker_thread.start()
 
     def _run_heartbeat_checker_loop(self):
-        shutdown_event = getattr(self, "_shutdown_event", None)
-        while True:
-            # Backends that set _shutdown_event (e.g. Mooncake) use an
-            # interruptible timed wait so the loop exits promptly on shutdown.
-            # Backends without it (nixl, mori) fall back to a plain sleep so
-            # they do not exit prematurely when shutdown_event is None.
-            if shutdown_event is not None:
-                if shutdown_event.wait(timeout=self.heartbeat_interval):
-                    return
-            else:
-                import time as _time
-                _time.sleep(self.heartbeat_interval)
+        while not self._shutdown_event.wait(timeout=self.heartbeat_interval):
             try:
                 self._run_one_heartbeat_pass()
             except Exception:
@@ -1747,6 +1748,28 @@ class CommonKVManager(BaseKVManager):
                     "heartbeat_checker outer loop caught unexpected exception; "
                     "continuing next tick"
                 )
+
+    def _stop_heartbeat_checker(self, timeout_s: float = 2.0) -> None:
+        """Stop and join the decode heartbeat thread, if one was started."""
+        self._shutdown_event.set()
+        thread = self._heartbeat_checker_thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=max(float(timeout_s), 0.0))
+
+    def shutdown(self, timeout_s: float = 2.0) -> bool:
+        """Stop common backend helpers during scheduler teardown.
+
+        Backend subclasses may extend this method for transport-specific
+        cleanup.  The base implementation is intentionally small so NIXL and
+        Mori at least release their heartbeat thread instead of leaving a
+        live daemon behind after the scheduler has begun shutting down.
+        """
+        self._stop_heartbeat_checker(timeout_s)
+        return True
 
     def _run_one_heartbeat_pass(self):
         with self.connection_lock:
