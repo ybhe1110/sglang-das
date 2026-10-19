@@ -34,13 +34,13 @@ compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, is_hcu
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
 # for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
@@ -71,6 +71,22 @@ def plan_c4_topk_workspace(
     if num_compressed <= 0 or num_queries <= 0 or topk <= 0:
         raise ValueError("C4 TopK workspace geometry must be positive")
     return num_queries, min(num_compressed, num_queries * topk)
+
+
+def validate_compact_seq_lens_cpu(
+    compact_seq_lens_cpu: Sequence[int], max_seq_len: int
+) -> None:
+    """Validate compact lengths against the global sequence-length bound.
+
+    A context-parallel rank may own only shorter local sequences, so a local
+    maximum below ``max_seq_len`` is valid.  A value above the global bound is
+    still rejected because it would address outside the planned workspace.
+    """
+    if (
+        any(type(length) is not int or length < 0 for length in compact_seq_lens_cpu)
+        or max(compact_seq_lens_cpu, default=0) > max_seq_len
+    ):
+        raise ValueError("compact sequence lengths must match request geometry")
 
 
 def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
@@ -126,9 +142,16 @@ class SparsePrefillWorkspace:
                 # is wrong: it protects a buffer that was just allocated and
                 # has no pending consumers, leaving the old one unprotected.
                 if self._buffer is not None and self._buffer.is_cuda:
-                    self._buffer.record_stream(
-                        torch.cuda.current_stream(self.device)
-                    )
+                    if is_hcu():
+                        # HCU does not use CUDA's stream-ordered caching
+                        # allocator.  Synchronize before releasing the old
+                        # allocation so an in-flight kernel cannot observe a
+                        # recycled address.
+                        torch.cuda.synchronize(self.device)
+                    else:
+                        self._buffer.record_stream(
+                            torch.cuda.current_stream(self.device)
+                        )
                 self._buffer = None
             self._buffer = torch.empty(
                 (num_tokens, 1, WORKSPACE_DIM),
@@ -460,15 +483,9 @@ class SparsePrefillChunkCache:
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
         if compact_seq_lens_cpu is not None:
-            if (
-                len(compact_seq_lens_cpu) != num_reqs
-                or any(
-                    type(length) is not int or length < 0
-                    for length in compact_seq_lens_cpu
-                )
-                or max(compact_seq_lens_cpu, default=0) != max_seq_len
-            ):
+            if len(compact_seq_lens_cpu) != num_reqs:
                 raise ValueError("compact sequence lengths must match request geometry")
+            validate_compact_seq_lens_cpu(compact_seq_lens_cpu, max_seq_len)
 
         if query_seq_lens is None:
             query_seq_lens = extend_seq_lens

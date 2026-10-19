@@ -1434,6 +1434,9 @@ class Envs:
     # Decode workers and graph routes retain their existing paths.
     # Opt in to dequantizing only the selected C4 TopK union within that layout.
     SGLANG_DSV4_PREFILL_C4_TOPK_KV_WORKSPACE = EnvBool(False)
+    # Emergency switch for disabling the HCU compact sparse-prefill workspace
+    # while validating device allocator and stream lifetime behavior.
+    SGLANG_DSV4_DISABLE_COMPACT_SPARSE_PREFILL = EnvBool(False)
 
     # ===================================================================
     # DeepSeek V4 - cache, GEMM, and distributed

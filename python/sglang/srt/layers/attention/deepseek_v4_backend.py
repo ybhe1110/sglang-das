@@ -145,7 +145,11 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 
 
 def _use_compact_sparse_prefill_workspace(forward_batch: ForwardBatch) -> bool:
-    if not _is_hcu or forward_batch.forward_mode != ForwardMode.EXTEND:
+    if (
+        not _is_hcu
+        or envs.SGLANG_DSV4_DISABLE_COMPACT_SPARSE_PREFILL.get()
+        or forward_batch.forward_mode != ForwardMode.EXTEND
+    ):
         return False
 
     from sglang.srt.layers.attention.dsa.forward_batch_utils import (
