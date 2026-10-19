@@ -347,6 +347,13 @@ class CommonKVManager(BaseKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        # Every backend owns the same lifecycle event.  Mooncake used to
+        # create this in its subclass, while NIXL/Mori left it absent; the
+        # heartbeat loop then had no interruptible shutdown path for those
+        # backends.  Keep the event in the common manager so scheduler
+        # teardown can stop any backend uniformly.
+        self._shutdown_event = threading.Event()
+        self._heartbeat_checker_thread: Optional[threading.Thread] = None
         self.kv_args = args
         self.kv_cache_layout = getattr(args, "kv_cache_layout", None)
         self.cp_cache_layer_split = bool(getattr(args, "cp_cache_layer_split", False))
@@ -2294,6 +2301,31 @@ class CommonKVManager(BaseKVManager):
 
         return src_kv_ptrs, sliced_dst
 
+    def _stop_heartbeat_checker(self, timeout_s: float = 2.0) -> None:
+        """Stop and join the decode heartbeat thread, if one was started."""
+        self._shutdown_event.set()
+        heartbeat_shutdown = getattr(self, "_heartbeat_shutdown", None)
+        if heartbeat_shutdown is not None:
+            heartbeat_shutdown.set()
+        thread = self._heartbeat_checker_thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=max(float(timeout_s), 0.0))
+
+    def shutdown(self, timeout_s: float = 2.0) -> bool:
+        """Stop common backend helpers during scheduler teardown.
+
+        Backend subclasses may extend this method for transport-specific
+        cleanup.  The base implementation is intentionally small so NIXL and
+        Mori at least release their heartbeat thread instead of leaving a
+        live daemon behind after the scheduler has begun shutting down.
+        """
+        self._stop_heartbeat_checker(timeout_s)
+        return True
+
     def _start_heartbeat_checker_thread(self) -> threading.Thread:
         """Start the heartbeat checker thread for Decode worker.
 
@@ -2350,6 +2382,9 @@ class CommonKVManager(BaseKVManager):
             daemon=True,
         )
         t.start()
+        # Recorded so shutdown()/_stop_heartbeat_checker() can join it for
+        # backends that do not track worker threads themselves (NIXL, Mori).
+        self._heartbeat_checker_thread = t
         return t
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
