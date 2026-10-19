@@ -127,7 +127,13 @@ class SparsePrefillWorkspace:
         if release_before_grow and self._buffer.is_cuda:
             # A later growth may drop this allocation while GPU work is still
             # pending. Record the consumer stream before returning its view.
-            self._buffer.record_stream(torch.cuda.current_stream(self.device))
+            # On HCU/DCU, PyTorch's CUDA caching allocator is not active and
+            # record_stream is a no-op at best, or raises with a mismatched
+            # CUDA stream on the HIP backend.  Skip it there; the DCU memory
+            # manager tracks liveness independently and does not need this hint.
+            from sglang.srt.utils import is_hcu
+            if not is_hcu():
+                self._buffer.record_stream(torch.cuda.current_stream(self.device))
         return self._buffer[:num_tokens]
 
 
@@ -459,7 +465,11 @@ class SparsePrefillChunkCache:
                     type(length) is not int or length < 0
                     for length in compact_seq_lens_cpu
                 )
-                or max(compact_seq_lens_cpu, default=0) != max_seq_len
+                # Use > instead of != so that a CP rank whose local max is
+                # shorter than the global max_seq_len (because longer sequences
+                # live on other ranks) still passes validation.  The global
+                # max is an upper-bound; local data exceeding it is still wrong.
+                or max(compact_seq_lens_cpu, default=0) > max_seq_len
             ):
                 raise ValueError("compact sequence lengths must match request geometry")
 
