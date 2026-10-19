@@ -158,6 +158,29 @@ class TestMooncakeTransferTimeout(unittest.TestCase):
         self.assertIn("shutdown", shutdown_attrs)
         self.assertIn("deregister_buffer_to_engine", shutdown_attrs)
 
+        self.assertTrue(
+            any(
+                isinstance(n, ast.FunctionDef)
+                and n.name == "force_destroy_sessions"
+                for n in ast.walk(engine_tree)
+            )
+        )
+        destroy_session = next(
+            n
+            for n in ast.walk(engine_tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "destroy_session"
+        )
+        destroy_names = {
+            n.value
+            for n in ast.walk(destroy_session)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        }
+        self.assertTrue(
+            destroy_names.intersection(
+                {"destroy_session", "close_session", "remove_session"}
+            )
+        )
+
     def test_sync_batch_paths_use_source_watchdog(self):
         tree = ast.parse(CONN.read_text(encoding="utf-8"))
         helper = next(

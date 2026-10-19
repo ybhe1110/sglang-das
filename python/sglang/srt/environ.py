@@ -759,6 +759,9 @@ class Envs:
     # Retained only to reject the removed setting during startup.
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(None)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    # Bound every cross-rank P/D collective. A timeout aborts the affected
+    # process group and lets the scheduler fail the rank instead of wedging.
+    SGLANG_DISAGGREGATION_COLLECTIVE_TIMEOUT = EnvFloat(30.0)
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
