@@ -124,6 +124,29 @@ class LayerWiseLoadCounter:
                 self.futures.pop(index, None)
                 self.reported.discard(index)
 
+    def finish(self, index: int) -> bool:
+        """Wait for every layer before publishing the batch completion.
+
+        A failed early layer must not short-circuit this barrier while a later
+        layer is still unresolved.  The model-forward hook is fail-soft, but
+        the completion queue is the ownership boundary for request-private
+        slots and therefore may only be published after every Future reaches a
+        terminal state.
+        """
+        futures = self.futures.get(index)
+        if futures is None:
+            return True
+        success = True
+        for future in futures:
+            try:
+                future.result()
+            except BaseException as error:
+                success = False
+                error.__traceback__ = None
+        self.futures.pop(index, None)
+        self.reported.discard(index)
+        return success
+
     def reset(self) -> None:
         self.producer_index = -1
         self.consumer_index = -1
@@ -185,6 +208,21 @@ class ReadPlanLoadCounter:
             if threshold == self.num_layers - 1:
                 self.plans.pop(index, None)
                 self.reported.discard(index)
+
+    def finish(self, index: int) -> bool:
+        """Wait for the read plan before publishing batch completion."""
+        future = self.plans.get(index)
+        if future is None:
+            return True
+        success = True
+        try:
+            future.result()
+        except BaseException as error:
+            success = False
+            error.__traceback__ = None
+        self.plans.pop(index, None)
+        self.reported.discard(index)
+        return success
 
     def reset(self) -> None:
         self.producer_index = self.consumer_index = -1
@@ -586,8 +624,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        # Already-published loads cannot be safely canceled without tree rollback.
-        return False
+        # External linker loads target request-private slots, so a load that
+        # has not been handed to the worker can be removed safely.  The old
+        # publish-then-rollback path always returned False here, which left a
+        # queued DMA writing into slots already released by an abort.
+        if rid not in self.pending_loads:
+            return False
+        self.pending_loads.pop(rid, None)
+        getattr(self, "pending_load_tokens", {}).pop(rid, None)
+        return True
 
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()
@@ -634,6 +679,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
+                    success = self.layer_done_counter.finish(counter_index) and success
                     self._finish_prefetch_metrics(list(pending), success is True)
                     self.completed_loads.put((list(pending), success))
             finally:

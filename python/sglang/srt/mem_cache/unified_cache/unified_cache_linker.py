@@ -19,15 +19,16 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationCollectiveError
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
-    InsertParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -41,6 +42,8 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.utils import get_hash_str
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -85,7 +88,7 @@ class UnifiedCacheLinker(ABC):
 
     @abstractmethod
     def cancel_queued_load(self, rid: str) -> bool:
-        """Cancel a load that has not started yet."""
+        """Cancel a request-private load that has not started yet."""
 
     @abstractmethod
     def num_completed_loads(self) -> int:
@@ -96,10 +99,10 @@ class UnifiedCacheLinker(ABC):
         """Consume the oldest completed load batch.
 
         Returns its request IDs and whether every transfer in it landed. A
-        failed batch must still be reported here, not raised, so the tree can
-        release the locks it pinned and abort the requests that were reading
-        it. Failure is per batch, not per request: the plans are merged, so
-        one bad key costs every request in the batch its hit.
+        failed batch must still be reported here, not raised, so the wrapper
+        can release request-private slots and abort the requests that were
+        reading them. Failure is per batch, not per request: the plans are
+        merged, so one bad key costs every request in the batch its hit.
         """
 
     @abstractmethod
@@ -142,6 +145,15 @@ class _PendingOffload(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+class _PrivateLoad(NamedTuple):
+    """State for an external load that has not been published to the tree."""
+
+    req: Req
+    transfers: list[tuple[TreeComponent, PoolTransfer]]
+    prefix_len: int
+    device_indices: torch.Tensor
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -154,12 +166,9 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker = cache_linker
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
-        # Loads in flight, each pinning its inserted endpoint until DMA
-        # completes. The anchor is the request's node before the load, so a
-        # failed load can walk back exactly the chain it published. Under PP
-        # nothing is inserted, so endpoint and anchor are both req.last_node
-        # and the loaded slots stay request-owned until the normal
-        # post-prefill insert.
+        # Legacy publish-then-rollback state.  The external load_back path
+        # below never populates these maps; they remain for older callers and
+        # focused compatibility tests while the API is retired.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams, NodeId]] = {}
         # rid -> the chain a failed load published for it, endpoint-first.
         # The nodes hold no valid KV and are already cut out of the tree; the
@@ -169,6 +178,10 @@ class UnifiedCacheLinkerWrapper:
         # Load batches popped by take_completed_loads and awaiting the reduced
         # verdict in commit_completed_loads.
         self.taken_loads: list[tuple[list[str], bool]] = []
+        # External linker loads use request-private slots.  They are deliberately
+        # kept separate from pending_loads, which is retained only for legacy
+        # callers that still use the publish-then-rollback helper.
+        self.private_loads: dict[str, _PrivateLoad] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
 
@@ -183,7 +196,13 @@ class UnifiedCacheLinkerWrapper:
         return rid in self.hit_markers
 
     def has_pending_operations(self) -> bool:
-        return bool(self.pending_loads or self.pending_offloads)
+        return bool(
+            self.pending_loads
+            or self.failed_chains
+            or self.private_loads
+            or self.pending_offloads
+            or self.taken_loads
+        )
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -202,21 +221,44 @@ class UnifiedCacheLinkerWrapper:
             if cache.pp_rank != 0:
                 return result
 
-        if device_hit_len >= len(key):
-            return result
-
-        tail_hashes = self._tail_hashes(key, result, device_hit_len)
-        if not tail_hashes:
-            return result
-
+        # Every rank in an attention group must reach the same collective in
+        # the same order.  In particular, do not return early when this rank
+        # has a full local hit, no hash anchor, or a component that cannot
+        # build a transfer.  Those are local facts; the other ranks still
+        # need a fixed-size preflight to learn that the external lookup must
+        # be skipped for the whole group.
+        tail_hashes = (
+            self._tail_hashes(key, result, device_hit_len)
+            if device_hit_len < len(key)
+            else []
+        )
         lookup_transfers = []
-        for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
+        local_valid = bool(tail_hashes)
+        if local_valid:
+            for component in cache._components_tuple:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, tail_hashes
+                )
+                if transfer is None:
+                    local_valid = False
+                    break
+                lookup_transfers.append(transfer)
+
+        if known_hit_len is None:
+            local_valid, common_tail_pages = self._match_preflight(
+                req.rid,
+                key_len=len(key),
+                device_hit_len=device_hit_len,
+                tail_pages=len(tail_hashes),
+                local_valid=local_valid,
             )
-            if transfer is None:
+            if not local_valid:
                 return result
-            lookup_transfers.append(transfer)
+            # The preflight guarantees that every rank has the same geometry,
+            # but retain the negotiated bound so a future backend cannot
+            # accidentally create different mask lengths.
+            tail_hashes = tail_hashes[:common_tail_pages]
+
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
@@ -256,6 +298,85 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _match_preflight(
+        self,
+        rid: str,
+        *,
+        key_len: int,
+        device_hit_len: int,
+        tail_pages: int,
+        local_valid: bool,
+    ) -> tuple[bool, int]:
+        """Negotiate match geometry before any variable-size collective.
+
+        The payload is always eight int64 values.  The first half carries
+        local values and the second half carries their negation, allowing one
+        MIN reduction to recover both the group minimum and maximum.  A
+        A geometry mismatch means that ranks are looking at different
+        radix-tree prefixes.  Continuing with local results would make the
+        subsequent forward collectives consume different KV layouts, so that
+        condition is fatal.  A validity-only mismatch is safe to handle by
+        abandoning the external lookup on every rank.
+        """
+        preflight = torch.tensor(
+            [
+                key_len,
+                -key_len,
+                device_hit_len,
+                -device_hit_len,
+                tail_pages,
+                -tail_pages,
+                int(local_valid),
+                -int(local_valid),
+            ],
+            dtype=torch.int64,
+        )
+        self.cache._all_reduce_attn_groups(
+            preflight, torch.distributed.ReduceOp.MIN
+        )
+
+        same_geometry = (
+            int(preflight[0]) == -int(preflight[1])
+            and int(preflight[2]) == -int(preflight[3])
+            and int(preflight[4]) == -int(preflight[5])
+        )
+        all_valid = int(preflight[6]) == 1 and int(preflight[7]) == -1
+        mixed_valid = int(preflight[6]) != -int(preflight[7])
+        if not same_geometry:
+            logger.error(
+                "External KV match preflight geometry mismatch: rid=%s "
+                "local=(key_len=%d,device_hit_len=%d,tail_pages=%d) "
+                "group=(key_len=[%d,%d],device_hit_len=[%d,%d],"
+                "tail_pages=[%d,%d])",
+                rid,
+                key_len,
+                device_hit_len,
+                tail_pages,
+                int(preflight[0]),
+                -int(preflight[1]),
+                int(preflight[2]),
+                -int(preflight[3]),
+                int(preflight[4]),
+                -int(preflight[5]),
+            )
+            raise DisaggregationCollectiveError(
+                "external KV match geometry differs across ranks"
+            )
+        if mixed_valid or not all_valid:
+            logger.warning(
+                "External KV match preflight rejected: rid=%s key_len=%d "
+                "device_hit=[%d,%d] tail_pages=[%d,%d] valid=%s",
+                rid,
+                key_len,
+                int(preflight[2]),
+                -int(preflight[3]),
+                int(preflight[4]),
+                -int(preflight[5]),
+                all_valid,
+            )
+            return False, 0
+        return True, int(preflight[4])
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -298,7 +419,7 @@ class UnifiedCacheLinkerWrapper:
             page_size=page,
         )
 
-    # ---- init_load_back: remote -> device, then insert ----
+    # ---- init_load_back: remote -> request-private device slots ----
 
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         cache = self.cache
@@ -318,12 +439,7 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
             if transfer is None:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
-                )
+                self._abort_component_transfers(req, component_transfers, prefix_len)
                 return empty_indices, req.last_node
             component_transfers.append((component, transfer))
 
@@ -335,103 +451,57 @@ class UnifiedCacheLinkerWrapper:
         if revalidate is not None and not revalidate(
             [transfer for _, transfer in component_transfers]
         ):
-            self._update_load(
-                ExternalLinkerLoadPhase.ABORT,
-                req,
-                component_transfers,
-                prefix_len,
-            )
+            self._abort_component_transfers(req, component_transfers, prefix_len)
             return empty_indices, req.last_node
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        prepared_transfers = self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
+        self._remember_private_slot_range(
+            req, prefix_len, full_transfer.device_indices
         )
-
-        if cache.pp_size > 1:
-            # Load into request-owned slots. The existing PP result ring delays
-            # normal insert/dedup until every stage has completed this prefill.
-            # This branch publishes no chain, so the anchor is the endpoint
-            # itself and a failed load's detach walk is a no-op.
-            try:
-                self._queue_load(
-                    req.rid,
-                    req.last_node,
-                    prepared_transfers,
-                    anchor=req.last_node,
-                )
-            except BaseException:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
-                )
-                raise
-            return full_transfer.device_indices, req.last_node
-
-        # Insert the newly loaded tail into the tree.
-        prefix_indices = torch.cat(
-            [req.prefix_indices.to(torch.int64), full_transfer.device_indices]
-        )
-        mamba_transfer = next(
-            (
-                transfer
-                for _, transfer in component_transfers
-                if transfer.name == PoolName.MAMBA
-            ),
-            None,
-        )
-        insert_result = cache.insert(
-            InsertParams(
-                key=hit.prefix_key,
-                value=prefix_indices,
-                mamba_value=(
-                    mamba_transfer.device_indices[:1]
-                    if mamba_transfer is not None
-                    else None
-                ),
-                prev_prefix_len=device_hit_len,
-                swa_evicted_seqlen=(
-                    req.kv.swa_evicted_seqlen if req.kv is not None else 0
-                ),
-                chunked=True,
-                priority=getattr(req, "priority", 0) or 0,
-                track_adopted_ranges=True,
+        # Prepare component metadata before handing the transfer to the
+        # backend worker.  A worker may consume a newly queued request
+        # immediately; preparing afterwards would let an exception race with
+        # an in-flight DMA and free request-private slots while the worker was
+        # still writing them.
+        try:
+            self._update_load(
+                ExternalLinkerLoadPhase.PREPARE,
+                req,
+                component_transfers,
+                prefix_len,
             )
-        )
-        if mamba_transfer is not None and insert_result.mamba_exist:
-            cache.req_to_token_pool.mamba_allocator.free(
-                mamba_transfer.device_indices[:1]
+        except BaseException:
+            self._abort_component_transfers(req, component_transfers, prefix_len)
+            raise
+
+        # Queue the prepared transfer without publishing any tree state.  The
+        # load owns only request-private slots until every layer and rank
+        # reports success; the normal request result path performs the single
+        # radix insertion after the forward.  This is the #40896 transaction
+        # boundary.
+        try:
+            queued = self.cache_linker.load(
+                req.rid, [transfer for _, transfer in component_transfers]
             )
+        except BaseException:
+            # A backend is allowed to enqueue before reporting an error.  Drop
+            # that not-yet-started entry first; only then return the private
+            # slots to the allocators.
+            self.cache_linker.cancel_queued_load(req.rid)
+            self._abort_component_transfers(req, component_transfers, prefix_len)
+            raise
+        if not queued:
+            self._abort_component_transfers(req, component_transfers, prefix_len)
+            return empty_indices, req.last_node
 
-        canonical_tail = cache.tree_core.collect_full_device_indices(
-            insert_result.last_device_node, req.last_node
+        self.private_loads[req.rid] = _PrivateLoad(
+            req=req,
+            transfers=component_transfers,
+            prefix_len=prefix_len,
+            device_indices=full_transfer.device_indices,
         )
-        assert canonical_tail.numel() == len(tail_hashes) * cache.page_size
-        load_transfers = self._update_load(
-            ExternalLinkerLoadPhase.COMMIT,
-            req,
-            component_transfers,
-            prefix_len,
-            insert_result=insert_result,
-            canonical_full=canonical_tail,
-        )
-
-        anchor = req.last_node
-        self._queue_load(
-            req.rid, insert_result.last_device_node, load_transfers, anchor=anchor
-        )
-
-        node = cache.resolve_node_handle(insert_result.last_device_node)
-        while node.id != anchor:
-            node.external_cache_stored = True
-            node = node.parent
-        return canonical_tail, insert_result.last_device_node
+        return full_transfer.device_indices, req.last_node
 
     def _queue_load(
         self,
@@ -440,6 +510,7 @@ class UnifiedCacheLinkerWrapper:
         transfers: list[PoolTransfer],
         anchor: NodeId,
     ) -> None:
+        """Legacy publish-then-rollback queue; external loads do not use it."""
         if not transfers:
             return
         assert rid not in self.pending_loads
@@ -476,7 +547,7 @@ class UnifiedCacheLinkerWrapper:
         for component, transfer in transfers:
             component_canonical = canonical_full
             if phase == ExternalLinkerLoadPhase.COMMIT:
-                assert insert_result.adopted_ranges is not None
+                assert insert_result is not None and insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [
                     (max(start, coverage_start), min(end, prefix_len))
@@ -518,6 +589,12 @@ class UnifiedCacheLinkerWrapper:
         prefix_len: int,
         keys: Sequence[str] | None = None,
     ) -> tuple[torch.Tensor, list[str]]:
+        """Legacy filtering for callers that still use publish-then-commit.
+
+        The external-linker ``load_back`` path no longer calls this helper; it
+        is retained for the legacy queue API and its focused compatibility
+        tests while that API is being retired.
+        """
         page = self.cache.page_size
         coverage_start = prefix_len - len(indices)
         pages = indices.reshape(-1, page)
@@ -625,22 +702,59 @@ class UnifiedCacheLinkerWrapper:
         This mirrors take_completed_offloads / commit_completed_offloads, which
         already reduce their verdict for the same reason.
         """
+        return [success for _rids, success in self.take_completed_load_batches(finish_count)]
+
+    def take_completed_load_batches(
+        self, finish_count: int
+    ) -> list[tuple[list[str], bool]]:
+        """Pop completed batches while retaining their RID order.
+
+        The scheduler performs a fixed-size cross-rank fingerprint before it
+        reduces the success bits.  Positional success reduction without this
+        identity check can apply rank A's result to rank B's request.
+        """
         taken = [self.cache_linker.pop_completed_load() for _ in range(finish_count)]
         self.taken_loads.extend(taken)
-        return [success for _rids, success in taken]
+        return taken
+
+    def finish_loads(
+        self, finish_count: int | None = None
+    ) -> list[tuple[list[str], bool]]:
+        """Move completed loads into the rank-consensus commit phase.
+
+        The completion queue is local to a linker worker.  This method only
+        takes descriptors and preserves their RID order; callers must run the
+        fixed-size RID preflight before passing verdicts to
+        :meth:`commit_completed_loads`.  Keeping the handoff separate makes it
+        impossible for a rank to clean up its private slots before peers have
+        identified the same batch.
+        """
+        if finish_count is None:
+            finish_count = self.num_completed_loads()
+        return self.take_completed_load_batches(finish_count)
 
     def commit_completed_loads(self, successes: Sequence[bool]) -> list[str]:
         """Apply the reduced verdict; return the rids of the failed batches.
 
-        A failed chain is cut out of the tree and filed under its rid, which
-        keeps its unfilled pages out of the store and out of every walk. The
-        nodes themselves go when that request runs its own cache_finished_req.
+        External linker loads use request-private slots and therefore have no
+        failed radix chain to detach.  The old pending_loads branch is kept for
+        legacy callers only; external load_back never populates it.
         """
         assert len(successes) <= len(self.taken_loads)
         failed: list[str] = []
         for success in successes:
             rids, _local_success = self.taken_loads.pop(0)
             for rid in rids:
+                private = self.private_loads.pop(rid, None)
+                if private is not None:
+                    if not success:
+                        self._abort_private_load(rid, private)
+                        failed.append(rid)
+                    else:
+                        # The request result path now owns these slots and is
+                        # the only path allowed to insert/free them.
+                        self._handoff_private_slots(private.req)
+                    continue
                 entry = self.pending_loads.pop(rid, None)
                 if entry is None:
                     # Released early by release_request while queued.
@@ -651,6 +765,90 @@ class UnifiedCacheLinkerWrapper:
                     failed.append(rid)
                 self.cache.dec_lock_ref(node_id, lock_params)
         return failed
+
+    @staticmethod
+    def _remember_private_slot_range(
+        req: Req, prefix_len: int, device_indices: torch.Tensor
+    ) -> None:
+        """Record the request-row interval owned by an external load."""
+        end = int(prefix_len)
+        start = max(0, end - int(device_indices.numel()))
+        req.external_kv_private_slots_start = start
+        req.external_kv_private_slots_end = end
+        req.external_kv_private_slots_released = False
+
+    @staticmethod
+    def _mark_private_slots_released(req: Req) -> None:
+        """Transfer release ownership to the linker exactly once."""
+        if getattr(req, "external_kv_private_slots_released", False):
+            logger.debug(
+                "External linker private slots already released: rid=%s", req.rid
+            )
+            return
+        req.external_kv_private_slots_released = True
+
+    def _abort_component_transfers(
+        self,
+        req: Req,
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]],
+        prefix_len: int,
+    ) -> None:
+        """Abort transfers before their indices are attached to the request."""
+        self._update_load(
+            ExternalLinkerLoadPhase.ABORT,
+            req,
+            component_transfers,
+            prefix_len,
+        )
+
+    @staticmethod
+    def _handoff_private_slots(req: Req) -> None:
+        """Make the normal request/radix path the sole owner after success."""
+        req.external_kv_private_slots_released = False
+        req.external_kv_private_slots_start = None
+        req.external_kv_private_slots_end = None
+
+    def _abort_private_load(
+        self, rid: str, private: _PrivateLoad | None = None
+    ) -> bool:
+        """Abort one request-private load, with a single ownership handoff.
+
+        Callers remove the entry from ``private_loads`` before invoking this
+        helper.  That makes scheduler failure scans, request cleanup and
+        backend completion handling idempotent: only the caller that owns the
+        popped entry may free its component slots.  The backend completion
+        queue is published only after its layer worker and storage session
+        have returned, so this helper is never used to free an in-flight DMA.
+        """
+        if private is None:
+            private = self.private_loads.pop(rid, None)
+        if private is None:
+            return False
+        # Mark before calling component abort. If a component raises after
+        # partially freeing, request cleanup must not retry the same range.
+        if getattr(private.req, "external_kv_private_slots_start", None) is None:
+            self._remember_private_slot_range(
+                private.req, private.prefix_len, private.device_indices
+            )
+        self._mark_private_slots_released(private.req)
+        try:
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT,
+                private.req,
+                private.transfers,
+                private.prefix_len,
+            )
+        except BaseException:
+            # The ownership is intentionally not reinserted: retrying an
+            # allocator free can double-release a partially freed component.
+            # Keep the failure visible for invariant checks and process-level
+            # shutdown diagnostics instead.
+            logger.exception(
+                "Failed to release private external load rid=%r after "
+                "backend completion; slots may require process teardown",
+                rid,
+            )
+        return True
 
     def _detach_failed_chain(self, rid: str, node_id: NodeId, anchor: NodeId) -> None:
         """Cut the chain this load published out of the tree, endpoint first.
@@ -710,6 +908,9 @@ class UnifiedCacheLinkerWrapper:
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
+        for rid in list(self.private_loads):
+            private = self.private_loads.pop(rid, None)
+            self._abort_private_load(rid, private)
         for node_id, lock_params, _anchor in self.pending_loads.values():
             self.cache.dec_lock_ref(node_id, lock_params)
         self.pending_loads.clear()
@@ -733,8 +934,12 @@ class UnifiedCacheLinkerWrapper:
         # commit_completed_loads retires the batch, which the linkers guarantee
         # happens even when the transfer fails.
         if self.cache_linker.cancel_queued_load(rid):
-            node_id, lock_params, _anchor = self.pending_loads.pop(rid)
-            self.cache.dec_lock_ref(node_id, lock_params)
+            private = self.private_loads.pop(rid, None)
+            if private is not None:
+                self._abort_private_load(rid, private)
+            elif rid in self.pending_loads:
+                node_id, lock_params, _anchor = self.pending_loads.pop(rid)
+                self.cache.dec_lock_ref(node_id, lock_params)
 
     def close(self) -> None:
         self.cache_linker.close()

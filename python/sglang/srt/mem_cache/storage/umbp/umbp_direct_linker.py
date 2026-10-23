@@ -126,6 +126,22 @@ class LayerWiseLoadCounter:
                 self._futures.pop(index, None)
                 self._reported.discard(index)
 
+    def finish(self, index: int) -> bool:
+        """Wait for every layer before publishing the completion record."""
+        futures = self._futures.get(index)
+        if futures is None:
+            return True
+        success = True
+        for future in futures:
+            try:
+                future.result()
+            except BaseException as error:
+                success = False
+                error.__traceback__ = None
+        self._futures.pop(index, None)
+        self._reported.discard(index)
+        return success
+
     def reset(self) -> None:
         self._producer_index = -1
         self.consumer_index = -1
@@ -553,9 +569,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        # The tree node is already visible in L1. Dropping its transfer would
-        # leave a device hit pointing at slots that were never populated.
-        return False
+        # External linker loads use request-private slots.  Remove a request
+        # that has not been handed to the worker; started batches are retained
+        # until their completion record is consumed.
+        if rid not in self._pending:
+            return False
+        self._pending.pop(rid, None)
+        return True
 
     def num_completed_loads(self) -> int:
         # The tree agrees on the drain count across ranks before calling pop.
@@ -723,6 +743,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         counter_index, plans, ready_event
                     )
                 finally:
+                    success = self.layer_done_counter.finish(counter_index) and success
                     # In a finally so the tree always gets its batch back and
                     # can release the node locks the load pinned.
                     self._completed_loads.put((rids, success))

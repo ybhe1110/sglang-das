@@ -4,12 +4,18 @@ import atexit
 import logging
 import threading
 import time
+import zlib
 from dataclasses import replace
+from functools import reduce
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
 
+from sglang.srt.disaggregation.utils import (
+    DisaggregationCollectiveError,
+    all_reduce_with_timeout,
+)
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -33,7 +39,10 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
-from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.common import (
+    RetractionBackup,
+    _request_kv_segments_excluding_released_private,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -286,10 +295,10 @@ class UnifiedRadixCache(BasePrefixCache):
         reduced = False
         for group in (self.attn_cp_group, self.attn_tp_group):
             if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.all_reduce(tensor, op=op, group=group)
+                all_reduce_with_timeout(tensor, op=op, group=group)
                 reduced = True
         if not reduced and self.tp_world_size > 1:
-            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+            all_reduce_with_timeout(tensor, op=op, group=self.tp_group)
 
     def _barrier_attn_groups(self):
         waited = False
@@ -769,6 +778,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        # A failed external load has already returned its private prefix to
+        # the component allocators.  Even callers that bypass release_kv_cache
+        # must not insert or free that prefix again.
+        if getattr(req, "external_kv_private_slots_released", False):
+            is_insert = False
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             # release_session has run the tree-lock release this needs.
             logger.debug(
@@ -844,9 +858,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 segments.append((kv_indices_full[tail_free_start:], tail_free_start))
             self.token_to_kv_pool_allocator.free_segments(segments)
         else:
-            self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.cache_protected_len :],
-                start_pos=req.cache_protected_len,
+            self.token_to_kv_pool_allocator.free_segments(
+                _request_kv_segments_excluding_released_private(
+                    req,
+                    kv_indices,
+                    req.cache_protected_len,
+                    kv_len_to_handle,
+                )
             )
 
         # Synthetic profiling requests may own KV without locking a tree node.
@@ -2766,7 +2784,29 @@ class UnifiedRadixCache(BasePrefixCache):
         # the rest serve it, and the rank owning the output stream commits
         # output over KV that never arrived. finish_count is already reduced,
         # so every rank builds a tensor of the same length here.
-        local_successes = self.linker.take_completed_loads(finish_count)
+        finish_loads = getattr(self.linker, "finish_loads", None)
+        take_batches = getattr(self.linker, "take_completed_load_batches", None)
+        if finish_loads is None and take_batches is None:
+            # Compatibility for lightweight test/fake linkers predating the
+            # RID-aware completion API. Production linkers implement the
+            # descriptor path and therefore always receive the preflight.
+            local_successes = self.linker.take_completed_loads(finish_count)
+        else:
+            local_batches = (
+                finish_loads(finish_count)
+                if finish_loads is not None
+                else take_batches(finish_count)
+            )
+            try:
+                self._preflight_linker_load_batches(local_batches)
+            except Exception:
+                # The batch has already been popped from the backend queue.
+                # Abort its private slots before propagating the fatal
+                # cross-rank identity error, otherwise shutdown would leave
+                # the request-owned allocations stranded.
+                self.linker.commit_completed_loads([False] * len(local_batches))
+                raise
+            local_successes = [success for _rids, success in local_batches]
         successes = torch.tensor(
             [int(success) for success in local_successes],
             dtype=torch.int,
@@ -2783,6 +2823,48 @@ class UnifiedRadixCache(BasePrefixCache):
                 failed,
             )
             self._failed_linker_rids.extend(failed)
+
+    def _preflight_linker_load_batches(self, batches) -> None:
+        """Verify completed load RID/order before positional verdict reduction.
+
+        The backend completion queue is local.  Two ranks can therefore pop
+        the same number of batches but associate a success bit with different
+        requests.  A fixed-size min/max payload detects count, batch size and
+        RID-order differences before the variable request state is committed.
+        """
+        values = [len(batches), 0x4C4F4144]
+        for rids, _success in batches:
+            encoded = [
+                zlib.crc32(str(rid).encode("utf-8")) & 0x7FFFFFFF
+                for rid in rids
+            ]
+            ordered = 0
+            for value in encoded:
+                ordered = ((ordered * 16777619) ^ value) & 0x7FFFFFFF
+            values.extend(
+                [
+                    len(encoded),
+                    sum(encoded) & 0x7FFFFFFF,
+                    reduce(lambda acc, value: acc ^ value, encoded, 0),
+                    ordered,
+                ]
+            )
+        payload = torch.tensor(
+            values + [-value for value in values], dtype=torch.int64, device="cpu"
+        )
+        self._all_reduce_attn_groups(payload, torch.distributed.ReduceOp.MIN)
+        width = len(values)
+        if any(int(payload[i]) != -int(payload[i + width]) for i in range(width)):
+            logger.error(
+                "External linker completion order mismatch across ranks: "
+                "local_batches=%d reduced_min=%s reduced_max=%s",
+                len(batches),
+                payload[:width].tolist(),
+                (-payload[width:]).tolist(),
+            )
+            raise DisaggregationCollectiveError(
+                "external linker completion RID/order differs across ranks"
+            )
 
     def _reclaim_failed_linker_chain(self, rid: str) -> None:
         """Free the tree chains a failed external-linker load published.

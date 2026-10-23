@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.disaggregation.utils import DisaggregationCollectiveError
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
@@ -28,8 +29,12 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    _PrivateLoad,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
+)
+from sglang.srt.mem_cache.common import (
+    _request_kv_segments_excluding_released_private,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -140,6 +145,128 @@ def test_restorable_prefix_intersects_sparse_rank_results():
     hit_pages = wrapper._sync_restorable_prefix([2, 4], num_pages=4, device_hit_pages=0)
 
     assert hit_pages == 2
+
+
+@pytest.mark.parametrize("remote_tail_pages", [14, 20])
+def test_match_preflight_rejects_rank_shape_mismatch_without_variable_collective(
+    remote_tail_pages,
+):
+    """The 60/12 and 84/12 shapes fail before the page-mask reduce."""
+
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOOKUP
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+    reduce_shapes = []
+
+    def mismatching_reduce(tensor, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        reduce_shapes.append((tensor.numel(), tensor.dtype))
+        # Simulate two ranks whose page tails are 2 and 14/20 pages long.
+        tensor.copy_(
+            torch.tensor(
+                [8, -8, 0, 0, 2, -remote_tail_pages, 0, -1],
+                dtype=torch.int64,
+            )
+        )
+
+    cache = _cache_for_wrapper(
+        page_size=2,
+        pp_size=1,
+        _components_tuple=(_Component(),),
+        _all_reduce_attn_groups=mismatching_reduce,
+        get_last_hash_value=lambda node: "ab" * 32,
+    )
+    backend = _FakeLinker()
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    key = RadixKey(array("q", range(8)))
+    result = MatchResult(
+        device_indices=torch.empty(0, dtype=torch.int64),
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+    req = SimpleNamespace(rid="shape-mismatch", external_cache_hit_length=None)
+
+    with pytest.raises(DisaggregationCollectiveError, match="geometry"):
+        wrapper.match(key, req, result)
+    assert backend.lookup_calls == []
+    # The preflight is fixed at eight int64 values; no rank-dependent mask
+    # tensor (3, 15, or 21 int32 values) is ever submitted.
+    assert reduce_shapes == [(8, torch.int64)]
+
+
+def test_match_preflight_validity_mismatch_falls_back_safely():
+    """A validity-only disagreement skips external lookup without aborting."""
+
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+    reduce_shapes = []
+
+    def validity_mismatch_reduce(tensor, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        reduce_shapes.append(tensor.numel())
+        # Geometry is identical (two pages), but one rank cannot build a
+        # transfer.  The group must take the safe local-cache fallback.
+        tensor.copy_(
+            torch.tensor(
+                [8, -8, 0, 0, 2, -2, 0, -1], dtype=torch.int64
+            )
+        )
+
+    cache = _cache_for_wrapper(
+        page_size=2,
+        pp_size=1,
+        _components_tuple=(_Component(),),
+        _all_reduce_attn_groups=validity_mismatch_reduce,
+        get_last_hash_value=lambda node: "ab" * 32,
+    )
+    backend = _FakeLinker()
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    key = RadixKey(array("q", range(8)))
+    result = MatchResult(
+        device_indices=torch.empty(0, dtype=torch.int64),
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+    req = SimpleNamespace(rid="validity-mismatch", external_cache_hit_length=None)
+
+    assert wrapper.match(key, req, result) is result
+    assert backend.lookup_calls == []
+    assert reduce_shapes == [8]
+
+
+def test_match_preflight_is_called_for_local_early_return():
+    """A full local hit still participates so peers cannot enter a new call."""
+
+    calls = []
+
+    def identity_reduce(tensor, op):
+        calls.append((tensor.numel(), tensor.dtype, op))
+
+    cache = _cache_for_wrapper(
+        page_size=2,
+        pp_size=1,
+        _components_tuple=(),
+        _all_reduce_attn_groups=identity_reduce,
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    key = RadixKey(array("q", range(4)))
+    result = MatchResult(
+        device_indices=torch.arange(len(key), dtype=torch.int64),
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+    req = SimpleNamespace(rid="full-local-hit", external_cache_hit_length=None)
+
+    assert wrapper.match(key, req, result) is result
+    assert len(calls) == 1
+    assert calls[0][0:2] == (8, torch.int64)
 
 
 @pytest.mark.parametrize("hit_pages", [0, 1, 2])
@@ -402,6 +529,120 @@ def test_release_request_cancels_queued_load():
     assert unlocks == [(7, lock_params)]
 
 
+def _private_load_wrapper(queued: bool):
+    """Build a wrapper with one request-private load and a traceable abort."""
+
+    calls = []
+
+    class _Component:
+        def update_external_linker_load(
+            self, phase, req, full_transfer, transfer, prefix_len, **kwargs
+        ):
+            calls.append((phase, req.rid))
+
+    linker = _FakeLinker()
+    if queued:
+        linker.queued_loads["private-rid"] = [object()]
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace()
+    wrapper.cache_linker = linker
+    wrapper.hit_markers = {}
+    wrapper.pending_loads = {}
+    wrapper.failed_chains = {}
+    wrapper.taken_loads = []
+    wrapper.private_loads = {}
+    wrapper.pending_offloads = []
+    req = SimpleNamespace(rid="private-rid")
+    req.external_kv_private_slots_start = 0
+    req.external_kv_private_slots_end = 1
+    req.external_kv_private_slots_released = False
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page"],
+        device_indices=torch.tensor([3], dtype=torch.int64),
+    )
+    wrapper.private_loads[req.rid] = _PrivateLoad(
+        req=req,
+        transfers=[(_Component(), transfer)],
+        prefix_len=1,
+        device_indices=transfer.device_indices,
+    )
+    return wrapper, linker, calls, req
+
+
+def test_private_load_abort_before_worker_start_releases_once():
+    wrapper, linker, calls, req = _private_load_wrapper(queued=True)
+
+    wrapper.release_request("private-rid")
+    wrapper.release_request("private-rid")
+
+    assert linker.queued_loads == {}
+    assert wrapper.private_loads == {}
+    assert calls == [(ExternalLinkerLoadPhase.ABORT, "private-rid")]
+    assert req.external_kv_private_slots_released
+
+
+def test_private_load_abort_during_worker_waits_for_completion():
+    wrapper, linker, calls, req = _private_load_wrapper(queued=False)
+
+    # start_layer_wise_loading moved the backend entry out of its pending map;
+    # release_request must not free slots while the worker can still write.
+    wrapper.release_request("private-rid")
+    assert wrapper.private_loads.keys() == {"private-rid"}
+    assert calls == []
+
+    wrapper.taken_loads = [(["private-rid"], False)]
+    assert wrapper.commit_completed_loads([False]) == ["private-rid"]
+    wrapper.release_request("private-rid")
+
+    assert wrapper.private_loads == {}
+    assert calls == [(ExternalLinkerLoadPhase.ABORT, "private-rid")]
+    assert req.external_kv_private_slots_released
+
+
+def test_private_load_success_releases_ownership_without_abort():
+    wrapper, _linker, calls, req = _private_load_wrapper(queued=False)
+    wrapper.taken_loads = [(["private-rid"], True)]
+
+    assert wrapper.commit_completed_loads([True]) == []
+    wrapper.release_request("private-rid")
+
+    assert wrapper.private_loads == {}
+    assert calls == []
+    assert not req.external_kv_private_slots_released
+    assert req.external_kv_private_slots_start is None
+    assert req.external_kv_private_slots_end is None
+
+
+def test_finish_loads_failure_has_the_only_release_owner():
+    wrapper, linker, calls, req = _private_load_wrapper(queued=False)
+    linker._completions.append((["private-rid"], False))
+
+    batches = wrapper.finish_loads(1)
+    assert batches == [(["private-rid"], False)]
+    assert wrapper.commit_completed_loads([False]) == ["private-rid"]
+    wrapper.release_request("private-rid")
+
+    assert calls == [(ExternalLinkerLoadPhase.ABORT, "private-rid")]
+    assert req.external_kv_private_slots_released
+
+
+def test_released_private_prefix_is_excluded_from_request_cleanup():
+    req = SimpleNamespace(
+        external_kv_private_slots_start=2,
+        external_kv_private_slots_end=6,
+        external_kv_private_slots_released=True,
+    )
+    row = torch.arange(8, dtype=torch.int64)
+
+    segments = _request_kv_segments_excluding_released_private(req, row, 0, 8)
+
+    assert [(start, values.tolist()) for values, start in segments] == [
+        (0, [0, 1]),
+        (6, [6, 7]),
+    ]
+
+
 def test_failed_offload_rolls_back_split_fragments():
     class _Component:
         def build_external_linker_transfer(self, phase, node, keys):
@@ -577,6 +818,20 @@ def test_check_hicache_events_commits_common_rank_results():
     cache.check_hicache_events()
 
     assert committed == [("load", [False]), [False]]
+
+
+def test_completed_external_load_preflight_rejects_rid_order_mismatch():
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+
+    def mismatch(payload, op):
+        # Simulate another rank reporting a different first batch descriptor.
+        payload[0] = payload[0] - 1
+
+    cache._all_reduce_attn_groups = mismatch
+    with pytest.raises(DisaggregationCollectiveError):
+        cache._preflight_linker_load_batches(
+            [(["rid-a", "rid-b"], True), (["rid-c"], False)]
+        )
 
 
 def test_component_commit_keeps_only_adopted_pages():

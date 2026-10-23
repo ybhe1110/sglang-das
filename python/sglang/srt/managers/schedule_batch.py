@@ -1055,6 +1055,13 @@ class Req(ReqDllmMixin):
         self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # External linker loads temporarily own a private prefix.  When a
+        # load fails, the linker releases that prefix before the normal
+        # request abort path runs.  Keep the range explicit so request cleanup
+        # cannot release the same device slots a second time.
+        self.external_kv_private_slots_start: Optional[int] = None
+        self.external_kv_private_slots_end: Optional[int] = None
+        self.external_kv_private_slots_released: bool = False
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1718,6 +1725,9 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.cache_protected_len = 0
+        self.external_kv_private_slots_start = None
+        self.external_kv_private_slots_end = None
+        self.external_kv_private_slots_released = False
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False

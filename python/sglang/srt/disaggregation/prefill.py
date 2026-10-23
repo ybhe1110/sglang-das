@@ -2109,8 +2109,6 @@ class SchedulerDisaggregationPrefillMixin:
         # Quarantined requests are retried independently of the Gloo collective;
         # a stuck native transfer must not keep this scheduler step in poll.
         self.process_external_kv_cleanup_quarantine()
-        if len(self.disagg_prefill_inflight_queue) == 0:
-            return []
 
         done_reqs = []
         success_rids = set(transfer_status[0]) if transfer_status is not None else set()
@@ -2140,7 +2138,14 @@ class SchedulerDisaggregationPrefillMixin:
             ],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            request_ids=[req.rid for req in self.disagg_prefill_inflight_queue],
         )
+
+        # The fixed-length preflight above also synchronizes the empty-queue
+        # case. Once it returns, all ranks are known to have no requests and
+        # must avoid a zero-length poll collective.
+        if len(self.disagg_prefill_inflight_queue) == 0:
+            return []
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [

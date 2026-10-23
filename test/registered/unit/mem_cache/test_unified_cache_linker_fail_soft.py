@@ -136,8 +136,7 @@ class _LoadBackComponent:
 
 def _cache_for_load_back(component, empty_indices):
     lock_params = object()
-    # insert publishes node 9; its parent is the request's pre-load node (5),
-    # which is where load_back stops marking external_cache_stored.
+    # The request anchor remains node 5 throughout an external linker load.
     node5 = SimpleNamespace(id=5, parent=None, external_cache_stored=False)
     node9 = SimpleNamespace(id=9, parent=node5, external_cache_stored=False)
     nodes = {5: node5, 9: node9}
@@ -145,22 +144,16 @@ def _cache_for_load_back(component, empty_indices):
         tree_core=SimpleNamespace(
             enable_external_cache_linker=False,
             empty_match_result=SimpleNamespace(device_indices=empty_indices),
-            # The two tail pages the load publishes, in root order.
-            collect_full_device_indices=lambda from_id, until_id: torch.arange(
-                2, dtype=torch.int64
-            ),
+        collect_full_device_indices=lambda from_id, until_id: torch.arange(
+            2, dtype=torch.int64
+        ),
         ),
         write_through_threshold=256,
         pp_size=1,
         pp_group=None,
         page_size=1,
         _components_tuple=(component,),
-        # prefix_len is 4 over a 2-page tail, so the adopted range is [2, 4).
-        insert=lambda params: SimpleNamespace(
-            last_device_node=9,
-            mamba_exist=False,
-            adopted_ranges={ComponentType.FULL: [(2, 4)]},
-        ),
+        insert=lambda params: SimpleNamespace(last_device_node=9, mamba_exist=False),
         inc_lock_ref=lambda node_id: SimpleNamespace(
             to_dec_params=lambda: lock_params
         ),
@@ -224,14 +217,13 @@ def test_revalidation_success_proceeds_to_prepare_and_load():
 
     (indices, last_node), _, component = _load_back(wrapper, component)
 
-    # The load proceeds: slots committed and the async load queued.
+    # The load proceeds into request-private slots and is queued.
     assert component.phases == [
         ExternalLinkerLoadPhase.PREPARE,
-        ExternalLinkerLoadPhase.COMMIT,
     ]
     assert "rid" in linker.queued_loads
     assert len(indices) == 2  # device prefix + loaded tail pages
-    assert last_node == 9
+    assert last_node == 5
 
 
 def test_backend_without_revalidation_keeps_legacy_path():
@@ -247,7 +239,5 @@ def test_backend_without_revalidation_keeps_legacy_path():
     (indices, last_node), _, component = _load_back(wrapper, component)
 
     assert "rid" in linker.queued_loads
-    assert component.phases == [
-        ExternalLinkerLoadPhase.PREPARE,
-        ExternalLinkerLoadPhase.COMMIT,
-    ]
+    assert component.phases == [ExternalLinkerLoadPhase.PREPARE]
+    assert last_node == 5

@@ -938,11 +938,13 @@ class TestLinkerFallback(unittest.TestCase):
         env = dict(
             LinkerTransferPhase=SimpleNamespace(LOOKUP="lookup", LOAD="load"),
             ExternalLinkerLoadPhase=SimpleNamespace(ABORT="abort"),
+            _PrivateLoad=SimpleNamespace,
         )
         exec(compile(module, str(path), "exec"), env)
         wrapper = env[cls.name]()
         wrapper.cache_linker = linker
         wrapper.hit_markers = {}
+        wrapper.private_loads = {}
         component = SimpleNamespace(
             build_external_linker_transfer=Mock(return_value=self.transfer)
         )

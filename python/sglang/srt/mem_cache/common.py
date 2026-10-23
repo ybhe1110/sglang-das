@@ -243,7 +243,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     effective_kv_committed_len = req.effective_kv_committed_len()
     tree_cache.cache_finished_req(
         req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+        is_insert=(
+            is_insert
+            and not getattr(req, "skip_radix_cache_insert", False)
+            and not getattr(req, "external_kv_private_slots_released", False)
+        ),
         kv_len_to_handle=effective_kv_committed_len,
     )
 
@@ -300,7 +304,11 @@ def _release_aborted_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: 
         "kv.cache_finished",
         lambda: tree_cache.cache_finished_req(
             req,
-            is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+            is_insert=(
+                is_insert
+                and not getattr(req, "skip_radix_cache_insert", False)
+                and not getattr(req, "external_kv_private_slots_released", False)
+            ),
             kv_len_to_handle=committed,
         ),
     )
@@ -370,12 +378,48 @@ def _release_overallocated_kv_indices(
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:
-        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-            start_p:end_p
-        ]
-        # start_p is aligned to the allocator's physical page size above, so it
-        # never shares a page with cache_finished_req's tail free in this group.
-        allocator.free_segment(indices_to_free, start_pos=start_p)
+        row = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx]
+        # A failed external linker load may already have returned a private
+        # prefix to its component allocators.  The normal request cleanup still
+        # owns the row, but must skip that released interval.  Keep this
+        # exclusion here as well as in cache_finished_req: the overallocated
+        # tail is a separate cleanup step and otherwise re-frees the same
+        # indices after the cache step has completed.
+        segments = _request_kv_segments_excluding_released_private(
+            req, row, start_p, end_p
+        )
+        allocator.free_segments(segments)
+
+
+def _request_kv_segments_excluding_released_private(
+    req: Req, row: torch.Tensor, start_p: int, end_p: int
+) -> list[tuple[torch.Tensor, int]]:
+    """Return request KV ranges excluding linker-released private slots.
+
+    The returned ``start_pos`` values remain positions in the original request
+    row, which is required by paged allocators for boundary-page de-duplication.
+    """
+    if end_p <= start_p:
+        return []
+    if not getattr(req, "external_kv_private_slots_released", False):
+        return [(row[start_p:end_p], start_p)]
+
+    private_start = getattr(req, "external_kv_private_slots_start", None)
+    private_end = getattr(req, "external_kv_private_slots_end", None)
+    if private_start is None or private_end is None or private_end <= private_start:
+        return [(row[start_p:end_p], start_p)]
+
+    overlap_start = max(start_p, int(private_start))
+    overlap_end = min(end_p, int(private_end))
+    if overlap_start >= overlap_end:
+        return [(row[start_p:end_p], start_p)]
+
+    segments: list[tuple[torch.Tensor, int]] = []
+    if start_p < overlap_start:
+        segments.append((row[start_p:overlap_start], start_p))
+    if overlap_end < end_p:
+        segments.append((row[overlap_end:end_p], overlap_end))
+    return segments
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

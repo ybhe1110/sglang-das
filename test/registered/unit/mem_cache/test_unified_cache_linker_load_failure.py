@@ -11,6 +11,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import inspect
+import threading
 import unittest
 from http import HTTPStatus
 from queue import Queue
@@ -27,6 +28,9 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    LayerWiseLoadCounter as MooncakeLayerWiseLoadCounter,
+)
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     LayerWiseLoadCounter,
     UMBPDirectLinker,
@@ -351,6 +355,37 @@ class TestFailedLoadDoesNotPinTheForward(CustomTestCase):
         self.assertIn("UMBP get failed for pool=swa", str(published))
         self.assertIn("ValueError", str(published))
 
+    def test_finish_waits_for_later_layer_after_early_failure(self):
+        """#45468: one failed layer must not retire an unfinished batch."""
+        for counter_type in (LayerWiseLoadCounter, MooncakeLayerWiseLoadCounter):
+            counter = counter_type(2)
+            index = counter.update_producer()
+            futures = getattr(counter, "_futures", None)
+            if futures is None:
+                futures = counter.futures
+            futures[index][0].set_exception(RuntimeError("layer 0 failed"))
+
+            result = []
+            worker = threading.Thread(
+                target=lambda: result.append(counter.finish(index)),
+                daemon=True,
+            )
+            worker.start()
+            # finish() must still wait for layer 1 after observing layer 0.
+            worker.join(timeout=0.05)
+            self.assertTrue(
+                worker.is_alive(),
+                f"{counter_type.__name__}.finish returned before all layers settled",
+            )
+            futures[index][1].set_result(None)
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, [False])
+            remaining = getattr(counter, "_futures", None)
+            if remaining is None:
+                remaining = counter.futures
+            self.assertNotIn(index, remaining)
+
 
 class TestUMBPLinkerCompletionChannel(CustomTestCase):
     def test_linker_is_concrete(self):
@@ -368,6 +403,11 @@ class TestUMBPLinkerCompletionChannel(CustomTestCase):
         linker._load_queue = Queue()
         linker._completed_loads = Queue()
         linker._run_layer_wise_batch = run_result
+        # The channel tests exercise publication/error propagation.  The
+        # dedicated counter regression above covers the real multi-layer
+        # barrier; keep this stub terminal so these tests do not block on
+        # synthetic plans that never complete a layer.
+        linker.layer_done_counter = SimpleNamespace(finish=lambda index: True)
         return linker
 
     # The load task carries the event guarding the batch's KV; the stubs below
