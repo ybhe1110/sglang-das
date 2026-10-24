@@ -894,6 +894,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        # A failed external load has already returned its private prefix to
+        # the component allocators. This guard also covers callers that
+        # bypass mem_cache.common.maybe_cache_unfinished_req (notably the
+        # chunked scheduler path), so a released row can never be published
+        # as a radix leaf.
+        if getattr(req, "external_kv_private_slots_released", False):
+            req.skip_radix_cache_insert = True
+            req.allow_radix_cache_insert_once = False
+            return
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 

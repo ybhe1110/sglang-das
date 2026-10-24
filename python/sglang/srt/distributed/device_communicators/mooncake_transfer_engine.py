@@ -302,13 +302,23 @@ class MooncakeTransferEngine:
                         "Mooncake Transfer Engine endpoint shutdown via %s failed",
                         method_name,
                     )
+                with self._session_lock:
+                    self._peer_sessions.clear()
                 return
         logger.warning(
             "Mooncake Transfer Engine exposes no endpoint shutdown API; "
             "native QP cleanup is deferred to process teardown"
         )
+        with self._session_lock:
+            self._peer_sessions.clear()
 
-    def _track_peer_session(self, session_id: str) -> None:
+    def _track_peer_session(self, session_id: str) -> bool:
+        if self._shutdown:
+            logger.warning(
+                "Ignoring Mooncake peer session %s after endpoint shutdown",
+                session_id,
+            )
+            return False
         if session_id:
             added = False
             with self._session_lock:
@@ -317,6 +327,7 @@ class MooncakeTransferEngine:
                 count = len(self._peer_sessions)
             if added:
                 logger.info("Mooncake peer sessions tracked: count=%d", count)
+        return True
 
     def peer_session_count(self) -> int:
         """Return the number of unique peer endpoints tracked by this process."""
@@ -435,7 +446,8 @@ class MooncakeTransferEngine:
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
-        self._track_peer_session(session_id)
+        if not self._track_peer_session(session_id):
+            return -1
         try:
             ret = self.engine.transfer_sync_write(
                 session_id, buffer, peer_buffer_address, length
@@ -461,7 +473,8 @@ class MooncakeTransferEngine:
         lengths: List[int],
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
-        self._track_peer_session(session_id)
+        if not self._track_peer_session(session_id):
+            return -1
         try:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
@@ -489,7 +502,8 @@ class MooncakeTransferEngine:
         return self.session_id
 
     def send_probe(self, peer_session_id: str) -> int:
-        self._track_peer_session(peer_session_id)
+        if not self._track_peer_session(peer_session_id):
+            return -1
         return self.engine.send_probe(peer_session_id)
 
     def get_engine(self):

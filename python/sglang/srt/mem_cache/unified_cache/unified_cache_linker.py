@@ -150,6 +150,7 @@ class _PrivateLoad(NamedTuple):
 
     req: Req
     transfers: list[tuple[TreeComponent, PoolTransfer]]
+    prev_prefix_len: int
     prefix_len: int
     device_indices: torch.Tensor
 
@@ -439,7 +440,10 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
             if transfer is None:
-                self._abort_component_transfers(req, component_transfers, prefix_len)
+                self._abort_component_transfers(
+                    req, component_transfers, device_hit_len, prefix_len
+                )
+                self._clear_private_slot_ownership(req)
                 return empty_indices, req.last_node
             component_transfers.append((component, transfer))
 
@@ -451,14 +455,15 @@ class UnifiedCacheLinkerWrapper:
         if revalidate is not None and not revalidate(
             [transfer for _, transfer in component_transfers]
         ):
-            self._abort_component_transfers(req, component_transfers, prefix_len)
+            self._abort_component_transfers(
+                req, component_transfers, device_hit_len, prefix_len
+            )
+            self._clear_private_slot_ownership(req)
             return empty_indices, req.last_node
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        self._remember_private_slot_range(
-            req, prefix_len, full_transfer.device_indices
-        )
+        self._remember_private_slot_range(req, device_hit_len, prefix_len)
         # Prepare component metadata before handing the transfer to the
         # backend worker.  A worker may consume a newly queued request
         # immediately; preparing afterwards would let an exception race with
@@ -472,7 +477,9 @@ class UnifiedCacheLinkerWrapper:
                 prefix_len,
             )
         except BaseException:
-            self._abort_component_transfers(req, component_transfers, prefix_len)
+            self._abort_component_transfers(
+                req, component_transfers, device_hit_len, prefix_len
+            )
             raise
 
         # Queue the prepared transfer without publishing any tree state.  The
@@ -488,16 +495,42 @@ class UnifiedCacheLinkerWrapper:
             # A backend is allowed to enqueue before reporting an error.  Drop
             # that not-yet-started entry first; only then return the private
             # slots to the allocators.
-            self.cache_linker.cancel_queued_load(req.rid)
-            self._abort_component_transfers(req, component_transfers, prefix_len)
+            cancelled = self.cache_linker.cancel_queued_load(req.rid)
+            if cancelled:
+                # The backend confirmed that no worker owns the request, so
+                # the component slots are safe to return immediately.
+                self._abort_component_transfers(
+                    req, component_transfers, device_hit_len, prefix_len
+                )
+            else:
+                # A false cancellation result means the backend may already
+                # have handed the request to a worker. Retain the private
+                # descriptor until completion/failure is published; do not
+                # release a buffer while native RDMA can still write it.
+                self.private_loads[req.rid] = _PrivateLoad(
+                    req=req,
+                    transfers=component_transfers,
+                    prev_prefix_len=device_hit_len,
+                    prefix_len=prefix_len,
+                    device_indices=full_transfer.device_indices,
+                )
+                logger.warning(
+                    "Retaining private external load after cancellation failed: "
+                    "rid=%s; waiting for backend terminal status",
+                    req.rid,
+                )
             raise
         if not queued:
-            self._abort_component_transfers(req, component_transfers, prefix_len)
+            self._abort_component_transfers(
+                req, component_transfers, device_hit_len, prefix_len
+            )
+            self._clear_private_slot_ownership(req)
             return empty_indices, req.last_node
 
         self.private_loads[req.rid] = _PrivateLoad(
             req=req,
             transfers=component_transfers,
+            prev_prefix_len=device_hit_len,
             prefix_len=prefix_len,
             device_indices=full_transfer.device_indices,
         )
@@ -768,14 +801,21 @@ class UnifiedCacheLinkerWrapper:
 
     @staticmethod
     def _remember_private_slot_range(
-        req: Req, prefix_len: int, device_indices: torch.Tensor
+        req: Req, prev_prefix_len: int, prefix_len: int
     ) -> None:
-        """Record the request-row interval owned by an external load."""
-        end = int(prefix_len)
-        start = max(0, end - int(device_indices.numel()))
+        """Record the request-row interval owned by an external load.
+
+        The interval is derived from request geometry, never from a
+        component's device-index count.  FULL and SWA components can expose
+        different physical index counts for the same request, while both
+        components share the request-row coordinate space used by cleanup.
+        """
+        end = max(0, int(prefix_len))
+        start = max(0, min(int(prev_prefix_len), end))
         req.external_kv_private_slots_start = start
         req.external_kv_private_slots_end = end
         req.external_kv_private_slots_released = False
+        req.external_kv_private_swa_slots_released = False
 
     @staticmethod
     def _mark_private_slots_released(req: Req) -> None:
@@ -787,13 +827,39 @@ class UnifiedCacheLinkerWrapper:
             return
         req.external_kv_private_slots_released = True
 
+    @staticmethod
+    def _clear_private_slot_ownership(req: Req) -> None:
+        """Forget a synchronously aborted load before cache-miss fallback.
+
+        ``load_back`` returns empty indices for a pre-queue miss and the
+        scheduler immediately recomputes the prefix. The old private range is
+        no longer present in the request row, so retaining its exclusion marker
+        would make later cleanup skip newly allocated request-owned slots at
+        the same row positions.
+        """
+        req.external_kv_private_slots_released = False
+        req.external_kv_private_swa_slots_released = False
+        req.external_kv_private_slots_start = None
+        req.external_kv_private_slots_end = None
+
     def _abort_component_transfers(
         self,
         req: Req,
         component_transfers: list[tuple[TreeComponent, PoolTransfer]],
+        prev_prefix_len: int,
         prefix_len: int,
     ) -> None:
         """Abort transfers before their indices are attached to the request."""
+        # Even a pre-queue failure can reach the normal request cleanup path.
+        # Claim the full private interval before releasing component buffers so
+        # cache_finished_req/release_kv_cache skip it on the next pass.
+        for _component, transfer in component_transfers:
+            if transfer.name == PoolName.KV and transfer.device_indices is not None:
+                self._remember_private_slot_range(
+                    req, prev_prefix_len, prefix_len
+                )
+                self._mark_private_slots_released(req)
+                break
         self._update_load(
             ExternalLinkerLoadPhase.ABORT,
             req,
@@ -805,6 +871,7 @@ class UnifiedCacheLinkerWrapper:
     def _handoff_private_slots(req: Req) -> None:
         """Make the normal request/radix path the sole owner after success."""
         req.external_kv_private_slots_released = False
+        req.external_kv_private_swa_slots_released = False
         req.external_kv_private_slots_start = None
         req.external_kv_private_slots_end = None
 
@@ -828,7 +895,7 @@ class UnifiedCacheLinkerWrapper:
         # partially freeing, request cleanup must not retry the same range.
         if getattr(private.req, "external_kv_private_slots_start", None) is None:
             self._remember_private_slot_range(
-                private.req, private.prefix_len, private.device_indices
+                private.req, private.prev_prefix_len, private.prefix_len
             )
         self._mark_private_slots_released(private.req)
         try:

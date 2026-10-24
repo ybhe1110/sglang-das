@@ -119,6 +119,15 @@ def free_swa_out_of_window_slots(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+    # The external linker owns this prefix while loading. If it has already
+    # returned the private slots after a failed load, the request may still
+    # pass through the chunked unfinished path before the scheduler removes
+    # it. Never copy those released indices into prefix_indices or publish
+    # them to the radix tree: they may already have been reassigned.
+    if getattr(req, "external_kv_private_slots_released", False):
+        req.skip_radix_cache_insert = True
+        req.allow_radix_cache_insert_once = False
+        return
     if getattr(req, "skip_radix_cache_insert", False):
         if getattr(req, "allow_radix_cache_insert_once", False):
             req.allow_radix_cache_insert_once = False
@@ -357,6 +366,30 @@ def _release_donated_swa_slots(req: Req, tree_cache: BasePrefixCache) -> None:
     # raises that watermark to cache_protected_len without freeing anything, so
     # for the donated prefix it reads as evicted while the slots are still held.
     indices = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx, :donated]
+    # A failed external KV load may already have returned the private SWA
+    # slots to the allocator.  The donated prefix uses the same request-row
+    # coordinates, so exclude that interval from normal cleanup.
+    private_start = getattr(req, "external_kv_private_slots_start", None)
+    private_end = getattr(req, "external_kv_private_slots_end", None)
+    if (
+        (
+            getattr(req, "external_kv_private_slots_released", False)
+            or getattr(req, "external_kv_private_swa_slots_released", False)
+        )
+        and private_start is not None
+        and private_end is not None
+    ):
+        private_start = max(0, int(private_start))
+        private_end = min(donated, int(private_end))
+        if private_end > private_start:
+            parts = []
+            if private_start > 0:
+                parts.append(indices[:private_start])
+            if private_end < donated:
+                parts.append(indices[private_end:])
+            if parts:
+                allocator.free_swa(torch.cat(parts))
+            return
     allocator.free_swa(indices)
 
 

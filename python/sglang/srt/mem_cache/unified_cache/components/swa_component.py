@@ -1002,6 +1002,13 @@ class SWAComponent(TreeComponent):
         canonical_full: Optional[torch.Tensor] = None,
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
+            # ABORT can be retried by scheduler cleanup after a sender
+            # failure. The request-level cleanup skips the private full range,
+            # but an independent SWA callback may still be repeated. Claim
+            # this physical range before freeing it so one owner releases it.
+            if getattr(req, "external_kv_private_swa_slots_released", False):
+                return None
+            req.external_kv_private_swa_slots_released = True
             self.cache.token_to_kv_pool_allocator.swa_attn_allocator.free(
                 transfer.device_indices
             )
@@ -1009,6 +1016,7 @@ class SWAComponent(TreeComponent):
 
         allocator = self.cache.token_to_kv_pool_allocator
         if phase == ExternalLinkerLoadPhase.PREPARE:
+            req.external_kv_private_swa_slots_released = False
             swa_len = len(transfer.device_indices)
             allocator.set_full_to_swa_mapping(
                 full_transfer.device_indices[-swa_len:], transfer.device_indices
@@ -1030,6 +1038,9 @@ class SWAComponent(TreeComponent):
         assert phase == ExternalLinkerLoadPhase.COMMIT
         assert insert_result is not None and canonical_full is not None
         assert len(canonical_full) == len(transfer.device_indices)
+        # Successful loads hand the translated range to the normal request /
+        # radix owner; a later request failure must be handled by that owner.
+        req.external_kv_private_swa_slots_released = False
         allocator.set_full_to_swa_mapping(canonical_full, transfer.device_indices)
         return transfer
 

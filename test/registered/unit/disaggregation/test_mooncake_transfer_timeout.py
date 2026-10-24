@@ -109,7 +109,37 @@ def load_source_watchdog():
     return env["_mooncake_source_transfer_watchdog_timeout_s"]
 
 
+def load_engine_session_guard():
+    tree = ast.parse(ENGINE.read_text(encoding="utf-8"))
+    nodes = [
+        next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == name
+        )
+        for name in ("_track_peer_session", "peer_session_count")
+    ]
+    for node in nodes:
+        node.decorator_list = []
+    module = ast.Module(body=nodes, type_ignores=[])
+    ast.fix_missing_locations(module)
+    env = {"logger": Mock()}
+    exec(compile(module, str(ENGINE), "exec"), env)
+    return env["_track_peer_session"], env["peer_session_count"]
+
+
 class TestMooncakeTransferTimeout(unittest.TestCase):
+    def test_shutdown_rejects_new_peer_sessions(self):
+        track, count = load_engine_session_guard()
+        engine = SimpleNamespace(
+            _shutdown=True,
+            _session_lock=__import__("threading").RLock(),
+            _peer_sessions=set(),
+        )
+
+        self.assertFalse(track(engine, "decode-rank-0"))
+        self.assertEqual(count(engine), 0)
+
     def test_engine_and_manager_expose_ordered_shutdown(self):
         engine_tree = ast.parse(ENGINE.read_text(encoding="utf-8"))
         engine_shutdown = next(

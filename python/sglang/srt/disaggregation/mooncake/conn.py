@@ -292,6 +292,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._shutdown_event = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
+        self._shutdown_buffers_deregistered = False
         self._worker_threads = []
         self._receiver_threads = []
         self.init_engine()
@@ -608,8 +609,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if regions:
             ptrs, lens = zip(*regions)
             self.engine.batch_register(list(ptrs), list(lens))
+        self._shutdown_buffers_deregistered = False
 
     def deregister_buffer_to_engine(self):
+        if getattr(self, "_shutdown_buffers_deregistered", False):
+            return
         regions = self._registerable_regions()
         if regions:
             ptrs, _ = zip(*regions)
@@ -618,12 +622,28 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
                 self.connection_pool.clear()
+        self._shutdown_buffers_deregistered = True
 
     def shutdown(self, timeout_s: float = 10.0) -> bool:
         """Stop Mooncake workers and release native transport resources."""
         with self._shutdown_lock:
             if self._shutdown_complete:
-                return not bool(getattr(self, "_shutdown_source_remaining", ()))
+                # A detached native call may outlive the first shutdown
+                # deadline. Re-probe the source tracker on subsequent calls;
+                # otherwise a transient timeout would permanently quarantine
+                # registered MR and prevent the process-level endpoint from
+                # ever reaching its final teardown.
+                drain = getattr(self, "_source_drain", None)
+                remaining = getattr(self, "_shutdown_source_remaining", ())
+                if drain is None or not remaining:
+                    return True
+                refreshed = drain.shutdown(timeout_s=timeout_s)
+                self._shutdown_source_remaining = refreshed
+                if refreshed:
+                    return False
+                if not self._shutdown_buffers_deregistered:
+                    self.deregister_buffer_to_engine()
+                return True
             self._shutdown_complete = True
             self._stop_heartbeat_checker(timeout_s=min(float(timeout_s or 0.0), 2.0))
 

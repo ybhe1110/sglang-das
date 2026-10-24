@@ -1062,6 +1062,10 @@ class Req(ReqDllmMixin):
         self.external_kv_private_slots_start: Optional[int] = None
         self.external_kv_private_slots_end: Optional[int] = None
         self.external_kv_private_slots_released: bool = False
+        # SWA has a separate physical allocator. Keep an independent
+        # ownership bit so repeated ABORT/cleanup callbacks cannot free the
+        # same translated SWA slots twice.
+        self.external_kv_private_swa_slots_released: bool = False
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1728,6 +1732,7 @@ class Req(ReqDllmMixin):
         self.external_kv_private_slots_start = None
         self.external_kv_private_slots_end = None
         self.external_kv_private_slots_released = False
+        self.external_kv_private_swa_slots_released = False
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False

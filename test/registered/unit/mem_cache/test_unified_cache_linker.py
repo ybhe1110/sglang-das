@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.common import (
+    maybe_cache_unfinished_req,
     _request_kv_segments_excluding_released_private,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -420,6 +421,10 @@ def test_pp_load_queue_failure_releases_full_and_swa_slots(pp_cache, raises):
 
     def fail_load(*args):
         if raises:
+            # Model a backend that inserted the request before surfacing an
+            # exception. cancel_queued_load() must succeed before the private
+            # full/SWA slots may be returned.
+            backend.queued_loads[req.rid] = [object()]
             raise RuntimeError("load failed")
         return False
 
@@ -429,6 +434,32 @@ def test_pp_load_queue_failure_releases_full_and_swa_slots(pp_cache, raises):
     assert allocator.full_available_size() == allocator.swa_available_size() == 32
     assert not cache.linker.pending_loads
     assert not cache.tree_core.root_node.children
+    if not raises:
+        # A synchronous cache miss falls back to recomputation. Its old
+        # private interval is gone from the request row, so the marker must be
+        # cleared before request-owned slots are allocated at those positions.
+        assert not req.external_kv_private_slots_released
+
+
+def test_pp_load_exception_with_failed_cancel_retains_private_slots(pp_cache):
+    cache, allocator, req, backend = pp_cache
+
+    def fail_load(*args):
+        raise RuntimeError("load worker accepted request")
+
+    backend.load = fail_load
+    with pytest.raises(RuntimeError):
+        cache.linker.load_back(req)
+
+    # A false cancellation result means the backend may still be writing the
+    # request-private buffers. Keep ownership until a terminal batch arrives.
+    assert req.rid in cache.linker.private_loads
+    assert allocator.full_available_size() < 32
+    assert allocator.swa_available_size() < 32
+
+    cache.linker.taken_loads = [([req.rid], False)]
+    assert cache.linker.commit_completed_loads([False]) == [req.rid]
+    assert allocator.full_available_size() == allocator.swa_available_size() == 32
 
 
 def test_async_offload_pins_node_until_completion():
@@ -564,10 +595,21 @@ def _private_load_wrapper(queued: bool):
     wrapper.private_loads[req.rid] = _PrivateLoad(
         req=req,
         transfers=[(_Component(), transfer)],
+        prev_prefix_len=0,
         prefix_len=1,
         device_indices=transfer.device_indices,
     )
     return wrapper, linker, calls, req
+
+
+def test_private_slot_range_uses_request_geometry_not_component_index_count():
+    """SWA-sized indices must not shorten the FULL request-row exclusion."""
+    req = SimpleNamespace()
+
+    UnifiedCacheLinkerWrapper._remember_private_slot_range(req, 1024, 4096)
+
+    assert req.external_kv_private_slots_start == 1024
+    assert req.external_kv_private_slots_end == 4096
 
 
 def test_private_load_abort_before_worker_start_releases_once():
@@ -632,6 +674,7 @@ def test_released_private_prefix_is_excluded_from_request_cleanup():
         external_kv_private_slots_start=2,
         external_kv_private_slots_end=6,
         external_kv_private_slots_released=True,
+        external_kv_private_swa_slots_released=False,
     )
     row = torch.arange(8, dtype=torch.int64)
 
@@ -641,6 +684,74 @@ def test_released_private_prefix_is_excluded_from_request_cleanup():
         (0, [0, 1]),
         (6, [6, 7]),
     ]
+
+
+def test_chunked_unfinished_skips_released_private_prefix():
+    calls = []
+    req = SimpleNamespace(
+        external_kv_private_slots_released=True,
+        skip_radix_cache_insert=False,
+    )
+    tree = SimpleNamespace(
+        cache_unfinished_req=lambda *args, **kwargs: calls.append(args)
+    )
+
+    maybe_cache_unfinished_req(req, tree, chunked=True)
+
+    assert req.skip_radix_cache_insert
+    assert calls == []
+
+
+def test_radix_cache_unfinished_guard_skips_released_private_prefix():
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    req = SimpleNamespace(
+        external_kv_private_slots_released=True,
+        skip_radix_cache_insert=False,
+    )
+
+    # The guard is deliberately before session/tree access; a failed load can
+    # reach this method after its request row has already been returned.
+    cache.cache_unfinished_req(req, chunked=True)
+
+    assert req.skip_radix_cache_insert
+
+
+def test_swa_private_abort_is_idempotent():
+    freed = []
+    allocator = SimpleNamespace(
+        swa_attn_allocator=SimpleNamespace(
+            free=lambda indices: freed.append(indices.clone())
+        )
+    )
+    component = SWAComponent.__new__(SWAComponent)
+    component.cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+    req = SimpleNamespace(
+        rid="swa-private",
+        external_kv_private_swa_slots_released=False,
+    )
+    transfer = PoolTransfer(
+        name=PoolName.SWA,
+        keys=["page"],
+        device_indices=torch.tensor([7, 8], dtype=torch.int64),
+    )
+
+    component.update_external_linker_load(
+        ExternalLinkerLoadPhase.ABORT,
+        req,
+        transfer,
+        transfer,
+        prefix_len=2,
+    )
+    component.update_external_linker_load(
+        ExternalLinkerLoadPhase.ABORT,
+        req,
+        transfer,
+        transfer,
+        prefix_len=2,
+    )
+
+    assert len(freed) == 1
+    assert freed[0].tolist() == [7, 8]
 
 
 def test_failed_offload_rolls_back_split_fragments():
@@ -885,6 +996,131 @@ def test_component_commit_keeps_only_adopted_pages():
     mapped_full, mapped_swa = mapping.mapping[0]
     assert mapped_full.tolist() == [102, 103, 106, 107]
     assert mapped_swa.tolist() == [202, 203, 206, 207]
+
+
+def test_release_donated_swa_slots_skips_released_private_interval():
+    """Normal SWA cleanup must not free linker-released private positions."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from sglang.srt.mem_cache.common import _release_donated_swa_slots
+
+    freed = []
+    allocator = SimpleNamespace(
+        free_swa=lambda indices: freed.append(indices.detach().cpu().tolist())
+    )
+    tree_cache = SimpleNamespace(
+        token_to_kv_pool_allocator=allocator,
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]])
+        ),
+    )
+    req = SimpleNamespace(
+        dsv4_donated_swa_len=8,
+        kv=object(),
+        req_pool_idx=0,
+        external_kv_private_slots_start=2,
+        external_kv_private_slots_end=6,
+        external_kv_private_slots_released=True,
+    )
+
+    _release_donated_swa_slots(req, tree_cache)
+    _release_donated_swa_slots(req, tree_cache)
+
+    assert freed == [[10, 11, 16, 17]]
+    assert req.dsv4_donated_swa_len == 0
+
+
+def test_release_donated_swa_slots_skips_fully_private_prefix():
+    """A donated prefix wholly owned by a failed linker load is not freed."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from sglang.srt.mem_cache.common import _release_donated_swa_slots
+
+    freed = []
+    tree_cache = SimpleNamespace(
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free_swa=lambda indices: freed.append(indices.detach().cpu().tolist())
+        ),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.tensor([[20, 21, 22, 23]])
+        ),
+    )
+    req = SimpleNamespace(
+        dsv4_donated_swa_len=4,
+        kv=object(),
+        req_pool_idx=0,
+        external_kv_private_slots_start=0,
+        external_kv_private_slots_end=8,
+        external_kv_private_slots_released=True,
+    )
+
+    _release_donated_swa_slots(req, tree_cache)
+
+    assert freed == []
+    assert req.dsv4_donated_swa_len == 0
+
+
+def test_release_donated_swa_slots_honors_swa_release_marker():
+    """The SWA component's own release marker also prevents a second free."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from sglang.srt.mem_cache.common import _release_donated_swa_slots
+
+    freed = []
+    tree_cache = SimpleNamespace(
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free_swa=lambda indices: freed.append(indices.detach().cpu().tolist())
+        ),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.tensor([[30, 31, 32, 33]])
+        ),
+    )
+    req = SimpleNamespace(
+        dsv4_donated_swa_len=4,
+        kv=object(),
+        req_pool_idx=0,
+        external_kv_private_slots_start=1,
+        external_kv_private_slots_end=3,
+        external_kv_private_slots_released=False,
+        external_kv_private_swa_slots_released=True,
+    )
+
+    _release_donated_swa_slots(req, tree_cache)
+
+    assert freed == [[30, 33]]
+
+
+def test_release_donated_swa_slots_keeps_non_overlapping_prefix_unchanged():
+    """A private interval after the donation must not alter normal cleanup."""
+    from sglang.srt.mem_cache.common import _release_donated_swa_slots
+
+    freed = []
+    tree_cache = SimpleNamespace(
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free_swa=lambda indices: freed.append(indices.detach().cpu().tolist())
+        ),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.tensor([[40, 41]])
+        ),
+    )
+    req = SimpleNamespace(
+        dsv4_donated_swa_len=2,
+        kv=object(),
+        req_pool_idx=0,
+        external_kv_private_slots_start=4,
+        external_kv_private_slots_end=8,
+        external_kv_private_slots_released=True,
+    )
+
+    _release_donated_swa_slots(req, tree_cache)
+
+    assert freed == [[40, 41]]
 
 
 if __name__ == "__main__":
