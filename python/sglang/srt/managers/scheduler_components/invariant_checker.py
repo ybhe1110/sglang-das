@@ -66,6 +66,7 @@ class SchedulerInvariantChecker:
     get_last_batch: Callable
     get_running_batch: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
+    get_inflight_req_count: Callable[[], int] = lambda: 0
     # The chunked-prefill request parked between chunks is in neither batch;
     # it still owns its KV row.
     get_chunked_req: Callable = field(default=lambda: None)
@@ -170,6 +171,17 @@ class SchedulerInvariantChecker:
             # Legacy DCP counters use different page/capacity units. Keep that
             # compatibility path separate from exact KV-shard conservation.
             return False, f"{msg}, dcp_physical_page_slack_allowed=True"
+        if leak:
+            self._log_pool_imbalance(
+                "full",
+                msg,
+                total,
+                full_available
+                + full_evictable_size
+                + protected
+                + session_held
+                + uncached,
+            )
         return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
@@ -183,14 +195,46 @@ class SchedulerInvariantChecker:
                 f"evictable={ps.swa_evictable_size}, "
                 f"total={self.swa_tokens_per_layer}"
             )
-        return self._check_pool_invariant(
+        protected = self.tree_cache.swa_protected_size()
+        session_held = self.pool_stats_observer.session_held_swa_tokens()
+        leak, msg = self._check_pool_invariant(
             "swa",
             ps.swa_available_size,
             ps.swa_evictable_size,
-            self.tree_cache.swa_protected_size(),
-            self.pool_stats_observer.session_held_swa_tokens(),
+            protected,
+            session_held,
             ps.swa_capacity,
             uncached,
+        )
+        if leak:
+            # Derive the difference from the same sample used for the verdict;
+            # ownership accessors must not be read again while logging.
+            self._log_pool_imbalance(
+                "swa",
+                msg,
+                ps.swa_capacity,
+                ps.swa_available_size
+                + ps.swa_evictable_size
+                + protected
+                + session_held
+                + uncached,
+            )
+        return leak, msg
+
+    def _log_pool_imbalance(self, pool: str, message: str, total: int, accounted: int):
+        linker = getattr(self.tree_cache, "linker", None)
+        logger.error(
+            "Pool invariant detail: pool=%s total=%d accounted=%s delta=%s "
+            "%s inflight_reqs=%d allocator=%s page_size=%d private_loads=%d",
+            pool,
+            total,
+            accounted,
+            accounted - total,
+            message,
+            self.get_inflight_req_count(),
+            type(self.token_to_kv_pool_allocator).__name__,
+            self.page_size,
+            len(getattr(linker, "private_loads", {})),
         )
 
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:

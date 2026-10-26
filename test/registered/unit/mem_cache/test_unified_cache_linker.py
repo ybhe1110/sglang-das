@@ -1416,6 +1416,25 @@ def test_inflight_count_or_same_size_rid_reordering_is_fatal(remote_rids):
         preflight(cache, 7, (1, ["a", "b"]), (2, 0, 0))
 
 
+@pytest.mark.parametrize("key_len", [0, 4, 26112])
+def test_full_local_hit_still_negotiates_without_warning(caplog, key_len):
+    calls = []
+    cache = _cache_for_wrapper(
+        page_size=256,
+        tree_core=SimpleNamespace(is_eagle=False),
+        get_last_hash_value=lambda node: None,
+        _all_reduce_attn_groups=lambda tensor, op: calls.append(tensor.numel()),
+    )
+    backend = _FakeLinker()
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    key = RadixKey(array("q", range(key_len)))
+    result = SimpleNamespace(device_prefix_len=key_len, last_device_node=0)
+    assert wrapper.match(key, SimpleNamespace(rid="full-local-hit"), result) is result
+    assert calls == [18]
+    assert backend.lookup_calls == []
+    assert not [record for record in caplog.records if record.levelno >= 30]
+
+
 def test_valid_only_divergence_is_safe_miss():
     from sglang.srt.mem_cache.unified_cache.linker_lifecycle import preflight
 

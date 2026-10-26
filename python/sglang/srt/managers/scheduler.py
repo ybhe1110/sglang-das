@@ -2524,6 +2524,9 @@ class Scheduler(
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+            get_inflight_req_count=lambda: len(
+                getattr(self, "disagg_prefill_inflight_queue", ())
+            ),
         )
 
     def init_rank_consensus_checker(self) -> None:
