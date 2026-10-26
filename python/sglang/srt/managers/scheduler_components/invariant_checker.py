@@ -55,6 +55,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_inflight_req_count: Callable[[], int] = lambda: 0
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -146,13 +147,11 @@ class SchedulerInvariantChecker:
             stranded_nodes_count = len(getattr(
                 self.tree_cache, "_stranded_linker_nodes", []
             ))
-            inflight_reqs_count = len(getattr(
-                self.scheduler, "disagg_prefill_inflight_queue", []
-            ))
+            inflight_reqs_count = self.get_inflight_req_count()
             logger.error(
                 "Pool invariant detail: pool=full total=%d accounted=%d delta=%d "
                 "available=%d evictable=%d protected=%d session_held=%d uncached=%d "
-                "failed_chains=%d stranded_nodes=%d inflight_reqs=%d",
+                "failed_chains=%d stranded_nodes=%d inflight_reqs=%d %s",
                 total,
                 accounted,
                 delta,
@@ -164,17 +163,21 @@ class SchedulerInvariantChecker:
                 failed_chains_count,
                 stranded_nodes_count,
                 inflight_reqs_count,
+                self._pool_owner_diagnostics(),
             )
 
         return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+        # Use the same ownership snapshot for the verdict and its diagnostics.
+        protected = self.tree_cache.swa_protected_size()
+        session_held = self.pool_stats_observer.session_held_swa_tokens()
         leak, msg = self._check_pool_invariant(
             "swa",
             ps.swa_available_size,
             ps.swa_evictable_size,
-            self.tree_cache.swa_protected_size(),
-            self.pool_stats_observer.session_held_swa_tokens(),
+            protected,
+            session_held,
             self.swa_tokens_per_layer,
             uncached,
         )
@@ -184,8 +187,8 @@ class SchedulerInvariantChecker:
             accounted = (
                 ps.swa_available_size
                 + ps.swa_evictable_size
-                + self.tree_cache.swa_protected_size()
-                + self.pool_stats_observer.session_held_swa_tokens()
+                + protected
+                + session_held
                 + uncached
             )
             delta = accounted - self.swa_tokens_per_layer
@@ -195,27 +198,35 @@ class SchedulerInvariantChecker:
             stranded_nodes_count = len(getattr(
                 self.tree_cache, "_stranded_linker_nodes", []
             ))
-            inflight_reqs_count = len(getattr(
-                self.scheduler, "disagg_prefill_inflight_queue", []
-            ))
+            inflight_reqs_count = self.get_inflight_req_count()
             logger.error(
                 "Pool invariant detail: pool=swa total=%d accounted=%d delta=%d "
                 "available=%d evictable=%d protected=%d session_held=%d uncached=%d "
-                "failed_chains=%d stranded_nodes=%d inflight_reqs=%d",
+                "failed_chains=%d stranded_nodes=%d inflight_reqs=%d %s",
                 self.swa_tokens_per_layer,
                 accounted,
                 delta,
                 ps.swa_available_size,
                 ps.swa_evictable_size,
-                self.tree_cache.swa_protected_size(),
-                self.pool_stats_observer.session_held_swa_tokens(),
+                protected,
+                session_held,
                 uncached,
                 failed_chains_count,
                 stranded_nodes_count,
                 inflight_reqs_count,
+                self._pool_owner_diagnostics(),
             )
 
         return leak, msg
+
+    def _pool_owner_diagnostics(self) -> str:
+        linker = getattr(self.tree_cache, "linker", None)
+        return (
+            f"allocator={type(self.token_to_kv_pool_allocator).__name__} "
+            f"page_size={self.page_size} "
+            f"private_loads={len(getattr(linker, 'private_loads', {}))} "
+            f"taken_load_batches={len(getattr(linker, 'taken_loads', []))}"
+        )
 
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
         ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)

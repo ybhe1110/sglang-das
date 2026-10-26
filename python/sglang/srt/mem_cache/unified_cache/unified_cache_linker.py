@@ -364,6 +364,15 @@ class UnifiedCacheLinkerWrapper:
             raise DisaggregationCollectiveError(
                 "external KV match geometry differs across ranks"
             )
+        if (
+            not mixed_valid
+            and not all_valid
+            and int(preflight[0]) == int(preflight[2])
+            and int(preflight[4]) == 0
+        ):
+            # Every rank has a complete local hit. This is a normal no-op, but
+            # only after preflight: an early return would desynchronize peers.
+            return False, 0
         if mixed_valid or not all_valid:
             logger.warning(
                 "External KV match preflight rejected: rid=%s key_len=%d "

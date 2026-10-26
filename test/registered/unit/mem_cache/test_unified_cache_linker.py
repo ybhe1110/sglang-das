@@ -198,7 +198,7 @@ def test_match_preflight_rejects_rank_shape_mismatch_without_variable_collective
     assert reduce_shapes == [(8, torch.int64)]
 
 
-def test_match_preflight_validity_mismatch_falls_back_safely():
+def test_match_preflight_validity_mismatch_falls_back_safely(caplog):
     """A validity-only disagreement skips external lookup without aborting."""
 
     class _Component:
@@ -239,9 +239,11 @@ def test_match_preflight_validity_mismatch_falls_back_safely():
     assert wrapper.match(key, req, result) is result
     assert backend.lookup_calls == []
     assert reduce_shapes == [8]
+    assert "External KV match preflight rejected" in caplog.text
 
 
-def test_match_preflight_is_called_for_local_early_return():
+@pytest.mark.parametrize("key_len", [0, 4, 26112])
+def test_match_preflight_is_called_for_local_early_return(caplog, key_len):
     """A full local hit still participates so peers cannot enter a new call."""
 
     calls = []
@@ -255,8 +257,9 @@ def test_match_preflight_is_called_for_local_early_return():
         _components_tuple=(),
         _all_reduce_attn_groups=identity_reduce,
     )
-    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
-    key = RadixKey(array("q", range(4)))
+    backend = _FakeLinker()
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    key = RadixKey(array("q", range(key_len)))
     result = MatchResult(
         device_indices=torch.arange(len(key), dtype=torch.int64),
         last_device_node=0,
@@ -268,6 +271,8 @@ def test_match_preflight_is_called_for_local_early_return():
     assert wrapper.match(key, req, result) is result
     assert len(calls) == 1
     assert calls[0][0:2] == (8, torch.int64)
+    assert backend.lookup_calls == []
+    assert "External KV match preflight rejected" not in caplog.text
 
 
 @pytest.mark.parametrize("hit_pages", [0, 1, 2])
