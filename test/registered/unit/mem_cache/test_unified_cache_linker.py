@@ -393,7 +393,7 @@ def test_pp_load_uses_normal_request_insert_and_release(pp_cache, overlap, outco
     req.prefix_indices = loaded
     req.set_extend_range(4, 5)
     values = torch.cat([loaded, allocator.alloc(1)])
-    cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), values)
+    cache.req_to_token_pool.write((req.req_pool_idx, slice(0, 5)), values)
     # Upstream drains with linker.drain_loads(1) and a bare rid list. On this
     # branch (#38352) that single call is split into take/commit around the
     # cross-rank MIN reduction, and pop_completed_load carries the verdict, so
@@ -434,8 +434,12 @@ def test_pp_load_queue_failure_releases_full_and_swa_slots(pp_cache, raises):
         return False
 
     backend.load = fail_load
-    with pytest.raises(RuntimeError):
-        cache.linker.load_back(req)
+    if raises:
+        with pytest.raises(RuntimeError):
+            cache.linker.load_back(req)
+    else:
+        indices, _ = cache.linker.load_back(req)
+        assert indices.numel() == 0
     assert allocator.full_available_size() == allocator.swa_available_size() == 32
     assert not cache.linker.pending_loads
     assert not cache.tree_core.root_node.children
@@ -663,7 +667,7 @@ def test_private_load_success_releases_ownership_without_abort():
 
 def test_finish_loads_failure_has_the_only_release_owner():
     wrapper, linker, calls, req = _private_load_wrapper(queued=False)
-    linker._completions.append((["private-rid"], False))
+    linker.completed_loads.append((["private-rid"], False))
 
     batches = wrapper.finish_loads(1)
     assert batches == [(["private-rid"], False)]

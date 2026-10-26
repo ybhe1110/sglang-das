@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import unittest
+import torch
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -137,6 +138,37 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_host_load_preserves_private_prefix_ownership_without_pp(self):
+        """TP/CP L3 admission must not mark private SWA pages as tree-owned."""
+        for private, expected in ((True, 256), (False, 3840)):
+            with self.subTest(private=private):
+                self.mock_token_allocator.available_size.return_value = 100000
+                self.mock_token_allocator.full_available_size.return_value = 100000
+                self.mock_token_allocator.swa_available_size.return_value = 100000
+                adder = self.create_adder(self.create_running_batch(), page_size=256)
+                adder.is_hybrid_swa = False
+                req = self.create_mock_req("l3-admission", 0, 8)
+                req.prefix_indices = torch.arange(256)
+                req.full_untruncated_fill_ids = list(range(4096))
+                req.host_hit_length = 3584
+                req.needs_host_load_back.return_value = True
+                req.last_node = 0
+                req.best_match_node = 0
+                req.cache_protected_len = 256
+                req.external_cache_hit_length = None  # non-PP production path
+                req.external_kv_private_slots_start = None
+                req.sampling_params.ignore_eos = False
+
+                def load_back(_params):
+                    req.external_kv_private_slots_start = 256 if private else None
+                    return torch.arange(256, 3840), 0
+
+                self.mock_tree_cache.init_load_back.side_effect = load_back
+                adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+                self.assertIn(req, adder.can_run_list)
+                self.assertEqual(req.cache_protected_len, expected)
+                self.assertEqual(len(req.prefix_indices), 3840)
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

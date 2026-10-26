@@ -1329,8 +1329,13 @@ class PrefillAdder:
                 req.host_loaded_length = len(new_indices)
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
-                # PP linker slots remain request-owned until post-prefill insert.
-                if req.external_cache_hit_length is None:
+                # External loads use private slots on TP/CP as well as PP.
+                # Advancing this boundary before insertion makes SWA eviction
+                # skip the loaded window, although no radix node owns it yet.
+                if (
+                    req.external_cache_hit_length is None
+                    and req.external_kv_private_slots_start is None
+                ):
                     req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(

@@ -26,7 +26,7 @@ from sglang.srt.disaggregation.utils import (
     EXTERNAL_KV_LOAD_ERR_TYPE,
     is_external_kv_load_failure,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     LayerWiseLoadCounter as MooncakeLayerWiseLoadCounter,
@@ -159,6 +159,8 @@ def _make_wrapper(completions, chain_len=3):
     wrapper.cache_linker = FakeLinker(completions)
     wrapper.hit_markers = {}
     wrapper.pending_loads = {}
+    wrapper.private_loads = {}
+    wrapper.cleanup_quarantine = {}
     wrapper.pending_offloads = []
     wrapper.failed_chains = {}
     wrapper.taken_loads = []
@@ -536,6 +538,13 @@ class TestSchedulerMarkHook(CustomTestCase):
         req.finished_reason = None
         req.to_finish = None
         req.skip_radix_cache_insert = False
+        req.external_kv_cleanup_done = False
+        req.external_kv_abort_requested = False
+        req.external_kv_pending_chunk_cleared = False
+        req.external_kv_linker_released = False
+        req.external_kv_sender_abort_requested = False
+        req.external_kv_cleanup_started_at = None
+        req.disagg_kv_sender = None
         return req
 
     def _run(
@@ -570,6 +579,10 @@ class TestSchedulerMarkHook(CustomTestCase):
         scheduler.chunked_req = chunked_req
         scheduler._pending_chunked_abort_req = None
         scheduler._deferred_linker_rids = set()
+        scheduler._external_kv_cleanup_rids = set()
+        scheduler._external_kv_abort_rids = set()
+        scheduler._external_kv_chunked_abort_reqs = {}
+        scheduler.disagg_prefill_pending_chunk_rids = set()
         scheduler._release_aborted_request = lambda rid: released.append(rid)
 
         with patch("sglang.srt.managers.scheduler.release_kv_cache") as release_kv:
@@ -643,14 +656,17 @@ class TestSchedulerMarkHook(CustomTestCase):
 
         self.assertEqual(released, ["rid-a"])
 
-    def test_leaves_an_already_finished_request_alone(self):
+    def test_finished_request_preserves_reason_but_still_drains_its_load(self):
         req = self._make_req("rid-a")
         req.finished.return_value = True
+        reason = req.finished_reason = FINISH_LENGTH(1)
 
         _scheduler, released, _release_kv = self._run(["rid-a"], [req])
 
         self.assertIsNone(req.to_finish)
-        self.assertEqual(released, [])
+        self.assertIs(req.finished_reason, reason)
+        self.assertTrue(req.skip_radix_cache_insert)
+        self.assertEqual(released, ["rid-a"])
 
     def test_no_failures_does_no_work(self):
         req = self._make_req("rid-a")
@@ -896,7 +912,8 @@ class TestCacheFinishedReqReclaimsAfterTheUnlock(CustomTestCase):
         req.rid = "rid-a"
         req.origin_input_ids = [1, 2]
         req.output_ids = []
-        req.kv.cache_protected_len = 0
+        req.cache_protected_len = 0
+        req.external_kv_private_slots_released = False
 
         self._cache(order).cache_finished_req(req, is_insert=False, kv_len_to_handle=2)
 
@@ -1046,6 +1063,10 @@ class TestSchedulerDefersUnmatchedRids(CustomTestCase):
         scheduler.chunked_req = None
         scheduler._pending_chunked_abort_req = None
         scheduler._deferred_linker_rids = set()
+        scheduler._external_kv_cleanup_rids = set()
+        scheduler._external_kv_abort_rids = set()
+        scheduler._external_kv_chunked_abort_reqs = {}
+        scheduler.disagg_prefill_pending_chunk_rids = set()
         scheduler._release_aborted_request = lambda rid: None
         return scheduler
 
@@ -1056,6 +1077,13 @@ class TestSchedulerDefersUnmatchedRids(CustomTestCase):
         req.finished_reason = None
         req.to_finish = None
         req.skip_radix_cache_insert = False
+        req.external_kv_cleanup_done = False
+        req.external_kv_abort_requested = False
+        req.external_kv_pending_chunk_cleared = False
+        req.external_kv_linker_released = False
+        req.external_kv_sender_abort_requested = False
+        req.external_kv_cleanup_started_at = None
+        req.disagg_kv_sender = None
         return req
 
     def _step(self, scheduler, drained, batch_reqs, running_reqs=()):
@@ -1170,6 +1198,13 @@ class TestLinkerLoadFailureIsDistinguishable(CustomTestCase):
         req.finished_reason = None
         req.to_finish = None
         req.skip_radix_cache_insert = False
+        req.external_kv_cleanup_done = False
+        req.external_kv_abort_requested = False
+        req.external_kv_pending_chunk_cleared = False
+        req.external_kv_linker_released = False
+        req.external_kv_sender_abort_requested = False
+        req.external_kv_cleanup_started_at = None
+        req.disagg_kv_sender = None
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.tree_cache = MagicMock()
@@ -1181,6 +1216,10 @@ class TestLinkerLoadFailureIsDistinguishable(CustomTestCase):
         scheduler.chunked_req = None
         scheduler._pending_chunked_abort_req = None
         scheduler._deferred_linker_rids = set()
+        scheduler._external_kv_cleanup_rids = set()
+        scheduler._external_kv_abort_rids = set()
+        scheduler._external_kv_chunked_abort_reqs = {}
+        scheduler.disagg_prefill_pending_chunk_rids = set()
         scheduler._release_aborted_request = lambda rid: None
         batch = MagicMock()
         batch.reqs = [req]

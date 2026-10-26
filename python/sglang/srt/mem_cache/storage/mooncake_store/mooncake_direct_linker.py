@@ -692,7 +692,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         while started:
             keys = started.pop(0)
             try:
-                self.storage.store.batch_get_session_end(keys)
+                # The deployed native ABI returns an integer status. A normal
+                # Python return alone does not establish that cleanup succeeded.
+                status = self.storage.store.batch_get_session_end(keys)
+                if type(status) is not int or status != 0:
+                    raise RuntimeError(f"Mooncake get session end failed: {status!r}")
             except BaseException as error:
                 self._quarantine_sessions(keys, f"session end: {type(error).__name__}")
                 self._storage_failed(error)

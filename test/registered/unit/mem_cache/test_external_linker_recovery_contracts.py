@@ -30,6 +30,7 @@ class TestSessionOwnership(CustomTestCase):
     def setUp(self):
         self.linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         self.store = Mock()
+        self.store.batch_get_session_end.return_value = 0
         self.linker.storage = NS(store=self.store, failed_get_cache=Mock())
         self.linker._storage_failed = Mock()
         self.linker.completed_loads = Queue()
@@ -87,7 +88,7 @@ class TestSessionOwnership(CustomTestCase):
     def test_end_failure_is_not_retried_and_other_sessions_are_closed(self):
         self.store.batch_get_session_end.side_effect = [
             RuntimeError("partial end"),
-            None,
+            0,
         ]
         started = [["a"], ["b"]]
         self.assertFalse(self.linker._end_load_sessions(started))
@@ -123,7 +124,9 @@ class TestSessionOwnership(CustomTestCase):
         linker.layer_done_counter = NS(finish=Mock(return_value=False), fail=Mock())
         linker._finish_prefetch_metrics = Mock()
         self.store.batch_get_session_start.side_effect = [[0, -1], [-1]]
-        self.store.batch_get_session_end.side_effect = lambda keys: events.append("end")
+        self.store.batch_get_session_end.side_effect = lambda keys: (
+            events.append("end") or 0
+        )
 
         def load(*args):
             started = []
@@ -140,6 +143,20 @@ class TestSessionOwnership(CustomTestCase):
         )
         linker.load_thread_func()
         self.assertEqual(events, ["end", "completion"])
+
+    def test_end_nonzero_or_unknown_status_quarantines_without_retry(self):
+        for status in (-1, 1, None, [0], False):
+            with self.subTest(status=status):
+                self.setUp()
+                self.store.batch_get_session_end.return_value = status
+                started = [["a"]]
+                self.assertFalse(self.linker._end_load_sessions(started))
+                self.assertEqual(started, [])
+                self.assertEqual(self.linker._uncertain_sessions, [("a",)])
+                self.assertTrue(self.linker._end_load_sessions(started))
+                self.store.batch_get_session_end.assert_called_once_with(["a"])
+                with self.assertRaisesRegex(RuntimeError, "ownership uncertain"):
+                    self.linker.num_completed_loads()
 
     def test_real_layer_loader_cleans_partial_start_on_failure(self):
         linker = self.linker
