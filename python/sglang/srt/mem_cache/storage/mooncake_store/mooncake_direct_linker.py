@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import threading
-from concurrent.futures import Future
 from queue import Empty, Queue
 
 import torch
-
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -19,6 +16,17 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
+)
+from sglang.srt.mem_cache.storage.mooncake_store.master_availability import (
+    MasterAvailability,
+    StoreUnavailable,
+    checked_exists,
+)
+from sglang.srt.mem_cache.unified_cache.linker_lifecycle import (
+    LayerWiseLoadCounter,
+    all_reduce_with_timeout,
+    identity_words,
+    wait_queue_drained,
 )
 from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
     LinkerMLADedupBroadcaster,
@@ -43,53 +51,6 @@ def _storage_suffix(
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
-
-
-class LayerWiseLoadCounter:
-    """CPU completion counter compatible with KV pools' layer wait hook."""
-
-    def __init__(self, num_layers: int, on_layer_ready=None):
-        self.num_layers = num_layers
-        self.on_layer_ready = on_layer_ready
-        self.producer_index = -1
-        self.consumer_index = -1
-        self.futures: dict[int, list[Future]] = {}
-
-    def update_producer(self) -> int:
-        self.producer_index += 1
-        self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
-        return self.producer_index
-
-    def set_consumer(self, index: int) -> None:
-        self.consumer_index = index
-
-    def complete(self, index: int, layer: int) -> None:
-        self.futures[index][layer].set_result(None)
-
-    def fail(self, index: int, error: BaseException) -> None:
-        for future in self.futures.get(index, ()):
-            if not future.done():
-                future.set_exception(error)
-
-    def wait_until(self, threshold: int) -> None:
-        index = self.consumer_index
-        futures = self.futures.get(index)
-        if futures is None:
-            return
-        try:
-            futures[threshold].result()
-            if self.on_layer_ready is not None:
-                self.on_layer_ready(index, threshold)
-        except BaseException as error:
-            raise RuntimeError("Mooncake layer-wise KV load failed.") from error
-        finally:
-            if threshold == self.num_layers - 1:
-                self.futures.pop(index, None)
-
-    def reset(self) -> None:
-        self.producer_index = -1
-        self.consumer_index = -1
-        self.futures.clear()
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -139,24 +100,48 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             model_name=get_model().model_path,
             extra_config=extra_config,
         )
-        if storage is None:
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStore,
-            )
-
-            self.storage = MooncakeStore(storage_config, mem_pool=None)
-        else:
-            self.storage = storage
-        self.storage.mem_pool_host = self.pool_group
-        self.storage.registered_pools = self.pools
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
         )
-        self.storage.mla_suffix = storage_suffix
-        self.storage.mha_suffix = storage_suffix
+        # Capture the scheduler's concrete device before metadata/load workers start.
+        self.device = torch.device(kvcache.device)
+        if self.device.index is None and self.device.type != "cpu":
+            self.device = torch.device(self.device.type, device_module.current_device())
+        self._closed = False
+
+        def create_storage():
+            if self.device.type != "cpu":
+                device_module.set_device(self.device)
+            created = storage
+            if created is None:
+                from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                    MooncakeStore,
+                )
+
+                created = MooncakeStore(storage_config, mem_pool=None)
+            created.mem_pool_host = self.pool_group
+            created.registered_pools = self.pools
+            created.mla_suffix = created.mha_suffix = storage_suffix
+            try:
+                self.register_buffers(created)
+            except BaseException:
+                # A failed registration must not leak a partially initialized
+                # store on every recovery attempt. No load has been admitted yet.
+                created.close()
+                raise
+            return created
+
+        self._availability = MasterAvailability(
+            create_storage,
+            lambda st: checked_exists(
+                st.store.batch_is_exist(["__sglang_master_health_probe__"]), 1
+            ),
+        )
+        self._availability.initialize()
+        self.storage = self._availability.storage
         logger.info(
             "Mooncake direct linker storage topology: "
             "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
@@ -167,7 +152,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             storage_suffix,
         )
 
-        self.register_buffers()
         self.mla_broadcaster = None
         self.tp_group = tp_group
         self.broadcast_loads = {}
@@ -187,12 +171,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
             )
+        self.batch_rids = {}
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
         ] = Queue()
-        self.completed_loads: Queue[list[str]] = Queue()
+        self.completed_loads: Queue[list[tuple[str, bool]]] = Queue()
         self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
             Queue()
         )
@@ -211,7 +196,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.offload_thread.start()
 
-    def register_buffers(self) -> None:
+    def _storage_ready(self):
+        if self._closed:
+            return False
+        ready = self._availability.ready()
+        self.storage = self._availability.storage
+        return ready
+
+    def register_buffers(self, backend=None) -> None:
+        backend = self.storage if backend is None else backend
         seen = set()
         for pool in self.pools.values():
             for buffer in pool.get_hybrid_pool_buffer():
@@ -220,7 +213,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if allocation in seen:
                     continue
                 seen.add(allocation)
-                result = self.storage.store.register_buffer(*allocation)
+                result = backend.store.register_buffer(*allocation)
                 if result not in (0, None):
                     raise RuntimeError(
                         "Failed to register GPU KV buffer with Mooncake, "
@@ -228,6 +221,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        if not self._storage_ready():
+            return []
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -235,7 +230,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         page_keys = list(kv.keys)
         if not page_keys:
             return []
-        result = self.storage.batch_exists_v2(page_keys, expanded)
+        try:
+            result = self._availability.query(
+                lambda: self.storage.batch_exists_v2(page_keys, expanded),
+                operation_source="lookup",
+                num_keys=len(page_keys),
+            )
+        except StoreUnavailable:
+            return []
         restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
         if restorable:
@@ -248,12 +250,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return restorable
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
-        # Query establishes a boundary at which every component is restorable;
-        # insert then removes pages already resident in L1. Loading is therefore
-        # intentionally partial and may contain only a side pool such as SWA.
-        expanded = self.pool_group.resolve_transfers(
-            transfers, allow_partial=True, allow_missing_kv=True
-        )
+        if not self._storage_ready():
+            return False
+        # Every tail page is private; no dedup or partial publication before I/O.
+        expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return False
         if rid in self.pending_loads:
@@ -262,17 +262,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        # Already-published loads cannot be safely canceled without tree rollback.
-        return False
+        return self.pending_loads.pop(rid, None) is not None
 
     def num_completed_loads(self) -> int:
-        while self.broadcast_events and self.broadcast_events[0][0].query():
-            _, rids = self.broadcast_events.pop(0)
-            self.completed_loads.put(rids)
         return self.completed_loads.qsize()
 
-    def pop_completed_load(self) -> list[str]:
+    def pop_completed_load(self) -> list[tuple[str, bool]]:
         return self.completed_loads.get_nowait()
+
+    def finish_loads(self, consumer_index):
+        success = self.layer_done_counter.finish(consumer_index)
+        # Broadcast receives are GPU writes too; wait before transferring ownership.
+        for event, _ in self.broadcast_events:
+            event.synchronize()
+        self.broadcast_events.clear()
+        rids = self.batch_rids.pop(consumer_index)
+        self.completed_loads.put([(rid, success) for rid in rids])
 
     def freeze_gc_once(self) -> None:
         if self.gc_frozen:
@@ -285,17 +290,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def start_layer_wise_loading(self) -> int:
         broadcaster = self.mla_broadcaster
         if broadcaster is not None:
-            # Insert can adopt different pages on different ranks. Compare the
-            # logical load order (not local slots), including empty batches,
+            # Compare logical load keys (not rank-local private slots),
+            # including empty batches,
             # before deciding collectively whether this batch can broadcast.
             plan = [
                 (rid, [(t.name, list(t.keys)) for t in transfers])
                 for rid, transfers in self.pending_loads.items()
             ]
-            digest = hashlib.sha256(repr(plan).encode()).digest()
-            digests = [None] * torch.distributed.get_world_size(self.tp_group)
-            torch.distributed.all_gather_object(digests, digest, group=self.tp_group)
-            if any(other != digest for other in digests):
+            digest = identity_words(plan)
+            payload = torch.tensor(digest + [-v for v in digest], dtype=torch.int64)
+            all_reduce_with_timeout(
+                payload, torch.distributed.ReduceOp.MIN, self.tp_group
+            )
+            if payload[:4].tolist() != (-payload[4:]).tolist():
                 logger.warning("MLA linker load plans differ; using all-rank reads.")
                 broadcaster = None
         if not self.pending_loads:
@@ -305,6 +312,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads = {}
 
         counter_index = self.layer_done_counter.update_producer()
+        self.batch_rids[counter_index] = list(pending)
         if broadcaster is not None:
             indices = {}
             for transfers in pending.values():
@@ -346,6 +354,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             event = device_module.Event()
             event.record()
             self.broadcast_events.append((event, rids))
+            if not self.mla_broadcaster.is_src:
+                # Event remains separately fenced in finish_loads.
+                self.layer_done_counter.publish_terminal(index)
             del self.broadcast_loads[index]
         else:
             self.broadcast_loads[index] = (
@@ -356,22 +367,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
 
     def load_thread_func(self) -> None:
+        device_module.set_device(self.device)
         while True:
             task = self.load_queue.get()
             try:
                 if task is None:
                     return
                 counter_index, pending, ready_event = task
-                replicated = counter_index in self.broadcast_loads
                 try:
                     ready_event.synchronize()
                     self.load_layer_wise(counter_index, list(pending.values()))
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
+                    self._availability.failed(error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
-                    if not replicated:
-                        self.completed_loads.put(list(pending))
+                    self.layer_done_counter.publish_terminal(counter_index)
             finally:
                 self.load_queue.task_done()
 
@@ -395,12 +406,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
             for keys, _ in batches.values():
                 result = self.storage.store.batch_get_session_start(keys)
-                if list(result) != [0] * len(keys):
+                # Retain successful starts even if a later key failed.
+                if result is not None and not isinstance(result, int):
+                    started.append(
+                        [key for key, code in zip(keys, result) if code == 0]
+                    )
+                if (
+                    result is None
+                    or isinstance(result, int)
+                    or list(result) != [0] * len(keys)
+                ):
                     raise RuntimeError(
                         f"Mooncake get session start failed: keys={len(keys)}, "
                         f"results={result}"
                     )
-                started.append(keys)
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
@@ -430,6 +449,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
+            self._availability.failed(error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
             for keys in started:
@@ -437,9 +457,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.storage.store.batch_get_session_end(keys)
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
+                    self._availability.failed(error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
+        if not self._storage_ready():
+            return False
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
@@ -455,6 +478,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def offload_thread_func(self) -> None:
+        device_module.set_device(self.device)
         while True:
             task = self.offload_queue.get()
             try:
@@ -468,8 +492,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
                         logger.info("Mooncake direct linker offload: tokens=%d", tokens)
+                if not success:
+                    self._availability.failed("Mooncake write-back failed")
                 self.offload_results.put(success)
-            except BaseException:
+            except BaseException as error:
+                self._availability.failed(error)
                 logger.exception("Mooncake offload failed")
                 self.offload_results.put(False)
             finally:
@@ -483,8 +510,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def reset(self) -> None:
         self.pending_loads.clear()
-        self.load_queue.join()
-        self.offload_queue.join()
+        wait_queue_drained(self.load_queue)
+        wait_queue_drained(self.offload_queue)
         for event, _ in self.broadcast_events:
             event.synchronize()
         self.broadcast_events.clear()
@@ -500,14 +527,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             except Empty:
                 break
         self.layer_done_counter.reset()
+        self.batch_rids.clear()
 
     def close(self) -> None:
+        if getattr(self, "_shutdown_complete", False):
+            return
+        self._closed = True
+        if not self._availability.wait_closed(timeout_s=2):
+            raise RuntimeError(
+                "Mooncake metadata still active; retaining storage/buffers"
+            )
         self.reset()
         self.load_queue.put(None)
         self.offload_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
         logger.info("Mooncake direct linker stats: %s", self.stats)
-        self.storage.close()
+        # Initialization may have completed after the caller's timeout.
+        self.storage = self._availability.storage
+        if self.storage is not None:
+            self.storage.close()
         if self.mla_broadcaster is not None:
             self.mla_broadcaster.destroy()
+        self._shutdown_complete = True

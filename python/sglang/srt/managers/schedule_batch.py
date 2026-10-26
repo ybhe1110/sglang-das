@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -1202,6 +1201,9 @@ class Req(ReqDllmMixin):
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.storage_hit_start: Optional[int] = None
+        # External loads are request-private until all layers/ranks succeed.
+        self.external_kv_load_pending = False
+        self.external_kv_load_failed = False
         # FULL host-hit tokens actually spliced to device by init_load_back at
         # admission; less than host_hit_length when the load-back was declined
         # or the staged splice dropped (that shortfall is re-prefilled).

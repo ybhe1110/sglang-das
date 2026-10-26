@@ -147,6 +147,7 @@ def _transfer_start_layer(*, pool, hf_text_config) -> int:
         1 for lid in hf_text_config.full_attention_layer_ids if lid < pool.start_layer
     )
 
+
 def clear_pd_hidden_request_state(req: Req) -> None:
     pd_hidden_state(req).meta = None
     pd_hidden_state(req).src_indices = None
@@ -1896,6 +1897,8 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
+                if getattr(req, "external_kv_load_failed", False):
+                    still_chunking = False
                 if is_aborted(req):
                     if not still_chunking and self._retire_aborted_prefill_result(req):
                         req.time_stats.set_completion_time()
@@ -1971,11 +1974,18 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         transfer_status: For PP, the globally agreed successful and failed rids.
         """
+        if getattr(self.tree_cache, "linker", None) is not None:
+            from sglang.srt.mem_cache.unified_cache.linker_lifecycle import preflight
+
+            sequence = getattr(self, "_linker_inflight_sequence", 0) + 1
+            self._linker_inflight_sequence = sequence
+            rids = [req.rid for req in self.disagg_prefill_inflight_queue]
+            # Empty ranks must participate too, before the variable poll vector.
+            preflight(self.tree_cache, 7, (sequence, rids), (len(rids), 0, 0))
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
         done_reqs = []
-        success_rids = set(transfer_status[0]) if transfer_status is not None else set()
         failed_rids = set(transfer_status[1]) if transfer_status is not None else set()
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -2328,6 +2338,10 @@ class SchedulerDisaggregationPrefillMixin:
                 running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        if getattr(req, "external_kv_load_pending", False) or getattr(
+            req, "external_kv_load_failed", False
+        ):
+            return
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
@@ -2370,6 +2384,10 @@ class SchedulerDisaggregationPrefillMixin:
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
     ) -> None:
+        if getattr(req, "external_kv_load_pending", False) or getattr(
+            req, "external_kv_load_failed", False
+        ):
+            return
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
@@ -2392,6 +2410,10 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
+        if getattr(req, "external_kv_load_pending", False) or getattr(
+            req, "external_kv_load_failed", False
+        ):
+            return False
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
@@ -2425,16 +2447,13 @@ class SchedulerDisaggregationPrefillMixin:
         current_pd_hidden_start = pd_hidden_state(req).current_start
         current_pd_hidden_row_len = int(pd_hidden_state(req).current_row_len or 0)
         has_current_pd_hidden = (
-            current_pd_hidden_src_indices is not None
-            and current_pd_hidden_row_len > 0
+            current_pd_hidden_src_indices is not None and current_pd_hidden_row_len > 0
         )
         streaming_pd_hidden = bool(
             (pd_hidden_state(req).meta or {}).get("streaming_hidden", False)
         )
 
-        state_types = (
-            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
-        )
+        state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
         state_indices: Optional[List] = None
         if last_chunk or (streaming_pd_hidden and has_current_pd_hidden):
             if last_chunk:
@@ -2541,9 +2560,13 @@ class SchedulerDisaggregationPrefillMixin:
                     StateType.BLOCK_SCALE_SWA: _swa_payload,
                 }
                 payloads[StateType.PD_HIDDEN] = _pd_hidden_payload
-            if last_chunk and _is_npu and isinstance(
-                self.token_to_kv_pool_allocator.get_kvcache(),
-                DeepSeekV4TokenToKVPool,
+            if (
+                last_chunk
+                and _is_npu
+                and isinstance(
+                    self.token_to_kv_pool_allocator.get_kvcache(),
+                    DeepSeekV4TokenToKVPool,
+                )
             ):
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                     dsv4_state_payloads,

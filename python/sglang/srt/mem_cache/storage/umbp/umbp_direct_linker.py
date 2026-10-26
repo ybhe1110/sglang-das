@@ -4,14 +4,12 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
 
 import numpy as np
 import torch
-
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -21,6 +19,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
+)
+from sglang.srt.mem_cache.unified_cache.linker_lifecycle import (
+    LayerWiseLoadCounter,
+    wait_queue_drained,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import (
@@ -79,48 +81,6 @@ def _ordered_layers(entry) -> list[int]:
     return [by_buffer[index] for index in range(pool_layer_count)]
 
 
-class LayerWiseLoadCounter:
-    """CPU completion counter compatible with KV pools' layer wait hook."""
-
-    def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        self._producer_index = -1
-        self.consumer_index = -1
-        self._futures: dict[int, list[Future]] = {}
-
-    def update_producer(self) -> int:
-        self._producer_index += 1
-        self._futures[self._producer_index] = [Future() for _ in range(self.num_layers)]
-        return self._producer_index
-
-    def set_consumer(self, index: int) -> None:
-        self.consumer_index = index
-
-    def complete(self, index: int, layer: int) -> None:
-        self._futures[index][layer].set_result(None)
-
-    def fail(self, index: int, error: BaseException) -> None:
-        for future in self._futures.get(index, ()):
-            if not future.done():
-                future.set_exception(error)
-
-    def wait_until(self, threshold: int) -> None:
-        index = self.consumer_index
-        futures = self._futures.get(index)
-        if futures is None:
-            return
-        try:
-            futures[threshold].result()
-        except BaseException as error:
-            raise RuntimeError("UMBP layer-wise KV load failed.") from error
-        finally:
-            if threshold == self.num_layers - 1:
-                self._futures.pop(index, None)
-
-    def reset(self) -> None:
-        self._producer_index = -1
-        self.consumer_index = -1
-        self._futures.clear()
 
 
 @dataclass
@@ -401,7 +361,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._load_queue: Queue[
             tuple[int, list[str], list[_PoolRangePlan], object] | None
         ] = Queue()
-        self._completed_loads: Queue[list[str]] = Queue()
+        self.batch_rids = {}
+        self._completed_loads: Queue[list[tuple[str, bool]]] = Queue()
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._stats = {
@@ -505,6 +466,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        if self._closed:
+            return []
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -536,12 +499,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return valid_pages
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
-        # Lookup establishes a restorable boundary before insert de-duplicates
-        # resident pages. The remaining transfer can therefore contain only a
-        # side pool such as SWA, with no KV transfer at all.
-        expanded = self.pool_group.resolve_transfers(
-            transfers, allow_partial=True, allow_missing_kv=True
-        )
+        if self._closed:
+            return False
+        # The entire tail is private until the request checkpoints it. FULL is
+        # mandatory even if another request inserted the same prefix meanwhile.
+        expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return False
         if rid in self._pending:
@@ -550,15 +512,18 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        # The tree node is already visible in L1. Dropping its transfer would
-        # leave a device hit pointing at slots that were never populated.
-        return False
+        return self._pending.pop(rid, None) is not None
 
     def num_completed_loads(self) -> int:
         return self._completed_loads.qsize()
 
-    def pop_completed_load(self) -> list[str]:
+    def pop_completed_load(self) -> list[tuple[str, bool]]:
         return self._completed_loads.get_nowait()
+
+    def finish_loads(self, consumer_index):
+        success = self.layer_done_counter.finish(consumer_index)
+        rids = self.batch_rids.pop(consumer_index)
+        self._completed_loads.put([(rid, success) for rid in rids])
 
     def start_layer_wise_loading(self) -> int:
         if not self._pending:
@@ -570,6 +535,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         ready_event = device_module.Event()
         ready_event.record()
         counter_index = self.layer_done_counter.update_producer()
+        self.batch_rids[counter_index] = rids
         self._load_queue.put((counter_index, rids, plans, ready_event))
         self._pending = {}
         self._stats["load"] += len(pending)
@@ -715,8 +681,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 counter_index, rids, plans, ready_event = task
                 try:
                     self._run_layer_wise_batch(counter_index, plans, ready_event)
+                except Exception as error:
+                    self.layer_done_counter.fail(counter_index, error)
+                    logger.exception("UMBP load batch failed")
                 finally:
-                    self._completed_loads.put(rids)
+                    self.layer_done_counter.publish_terminal(counter_index)
             finally:
                 self._load_queue.task_done()
 
@@ -902,6 +871,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         ]
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
+        if self._closed:
+            return False
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
@@ -1043,8 +1014,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
     def reset(self) -> None:
         self._pending.clear()
-        self._load_queue.join()
-        self._offload_queue.join()
+        wait_queue_drained(self._load_queue)
+        wait_queue_drained(self._offload_queue)
         while True:
             try:
                 self._offload_results.get_nowait()
@@ -1056,6 +1027,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             except Empty:
                 break
         self.layer_done_counter.reset()
+        self.batch_rids.clear()
 
     def close(self) -> None:
         if self._closed:

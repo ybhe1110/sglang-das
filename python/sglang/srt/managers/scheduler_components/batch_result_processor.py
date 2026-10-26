@@ -431,6 +431,26 @@ class SchedulerBatchResultProcessor:
                         ),
                     )
 
+                if getattr(req, "external_kv_load_failed", False):
+                    # The scheduler drained load + GPU consumers before marking
+                    # this abort. The request is the only FULL/SWA free owner.
+                    req.inflight_middle_chunks = max(0, req.inflight_middle_chunks - 1)
+                    if req.kv.holds_kv:
+                        release_kv_cache(req, self.tree_cache, checkpoint=False)
+                        req.time_stats.set_completion_time()
+                    if batch.return_logprob:
+                        logprob_pt = self._apply_prefill_logprobs(
+                            req=req,
+                            i=i,
+                            logits_output=logits_output,
+                            extend_input_len_per_req=extend_input_len_per_req,
+                            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                            next_token_ids=next_token_ids,
+                            logprob_pt=logprob_pt,
+                            store=False,
+                        )
+                    continue
+
                 if (
                     req.finished() and req.inflight_middle_chunks <= 0
                 ) or req.is_retracted:
@@ -554,6 +574,12 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
                 if req.is_retracted:
+                    continue
+                if getattr(req, "external_kv_load_failed", False):
+                    req.inflight_middle_chunks = max(0, req.inflight_middle_chunks - 1)
+                    if req.kv.holds_kv:
+                        release_kv_cache(req, self.tree_cache, checkpoint=False)
+                        req.time_stats.set_completion_time()
                     continue
 
                 req.embedding = embeddings[i]

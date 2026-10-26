@@ -363,6 +363,10 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
 
 
 def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
+    linker = getattr(batch.tree_cache, "linker", None)
+    private = linker.private_loads.get(req.rid) if linker is not None else None
+    if private is not None and not private.adopted:
+        return linker.prefix_device_indices(req)
     # A request holding its row (a later chunk, a borrowed session record)
     # already has its prefix there; a new one reads its match off the tree.
     if req.kv.holds_kv:
@@ -459,6 +463,12 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+    # The row now contains the private FULL indices. From here, including
+    # abort/retraction, the request owns both FULL and mapped SWA releases.
+    linker = getattr(batch.tree_cache, "linker", None)
+    if linker is not None:
+        for req in batch.reqs:
+            linker.adopt_request(req)
     try:
         batch.req_to_token_pool.alloc_aux_to_lengths(
             req_pool_indices_cpu=req_pool_indices_cpu,

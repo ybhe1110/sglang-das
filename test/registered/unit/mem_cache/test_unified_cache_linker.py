@@ -9,15 +9,6 @@ from unittest.mock import MagicMock
 import pytest
 import test_unified_radix_cache_unittest as shared_cache_suite
 import torch
-from test_unified_radix_cache_unittest import (
-    CacheConfig,
-    _device_lock_ref,
-    _device_value,
-    _InsertWalkSuite,
-    _node_children,
-    build_fixture,
-)
-
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -40,15 +31,23 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
 )
-from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
+    _PrivateLoad,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from test_unified_radix_cache_unittest import (
+    CacheConfig,
+    _device_lock_ref,
+    _device_value,
+    _InsertWalkSuite,
+    _node_children,
+    build_fixture,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
@@ -80,6 +79,9 @@ class _FakeLinker(UnifiedCacheLinker):
             return False
         del self.queued_loads[rid]
         return True
+
+    def finish_loads(self, consumer_index):
+        pass
 
     def num_completed_loads(self):
         return len(self.completed_loads)
@@ -150,6 +152,7 @@ def _cache_for_wrapper(**kwargs):
         "tree_core": SimpleNamespace(enable_external_cache_linker=False),
         "tree_components": (ComponentType.FULL,),
         "write_through_threshold": 256,
+        "_all_reduce_attn_groups": lambda tensor, op: None,
         "pp_size": 1,
         "pp_group": None,
     }
@@ -273,6 +276,9 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
     def cancel_queued_load(self, rid):
         return self.queued_loads.pop(rid, None) is not None
 
+    def finish_loads(self, consumer_index):
+        pass
+
     def num_completed_loads(self):
         return len(self.completed_loads)
 
@@ -280,7 +286,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
         rids = self.completed_loads.pop(0)
         for rid in rids:
             self.queued_loads.pop(rid, None)
-        return rids
+        return [(rid, True) for rid in rids]
 
     def complete_started_loads(self):
         self.completed_loads.append(self.started_loads[-1])
@@ -401,22 +407,94 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             )
         )
         self.assertEqual(loaded_len, len(tokens))
-        self.assertNotEqual(loaded_node, consumer.root_node_handle())
+        self.assertEqual(loaded_node, consumer.root_node_handle())
         (kv_load,) = consumer_linker.queued_loads[req.rid]
         self.assertEqual(kv_load.name, PoolName.KV)
         self.assertEqual(kv_load.keys, kv_offload.keys)
-        self.assertEqual(_device_lock_ref(consumer, loaded_node, ComponentType.FULL), 1)
+        self.assertEqual(
+            consumer._match_tree(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).device_prefix_len,
+            0,
+        )
 
-        self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+        indices = consumer.linker.prefix_device_indices(req)
+        consumer_req_pool.req_to_token[req.kv.req_pool_idx, : len(tokens)] = indices
+        req.origin_input_ids = req.full_untruncated_fill_ids = array("q", tokens)
+        req.kv.kv_allocated_len = req.kv.kv_committed_len = len(tokens)
+        consumer.linker.adopt_request(req)
+        index = consumer.ready_to_load_host_cache()
         consumer_linker.complete_started_loads()
-        consumer.check_hicache_events()
-        self.assertEqual(_device_lock_ref(consumer, loaded_node, ComponentType.FULL), 0)
+        assert consumer.finish_external_linker_loads(index) == []
+        # Completion alone does not publish any node.
+        assert (
+            consumer._match_tree(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).device_prefix_len
+            == 0
+        )
+        consumer.checkpoint(req, up_to=len(tokens))
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
         self.assertEqual(final_match.device_prefix_len, len(tokens))
-        self.assertEqual(consumer_linker.offload_calls, [])
         consumer.sanity_check()
+
+    def test_failed_private_swa_load_frees_each_pool_once_without_checkpoint(self):
+        from sglang.srt.mem_cache.common import release_kv_cache
+
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=2,
+            kv_size=64,
+            max_context_len=64,
+        )
+        self.cfg = cfg
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                cache, allocator, pool = build_fixture(cfg)
+                backend = _FakeLinker()
+                cache.init_cache_linker(backend)
+                req = self._make_req(pool)
+                req.last_node = cache.root_node_handle()
+                req.origin_input_ids = req.full_untruncated_fill_ids = array(
+                    "q", range(6)
+                )
+                req.prefix_len = 0
+                before = (
+                    allocator.full_available_size(),
+                    allocator.swa_available_size(),
+                )
+                cache.linker.hit_markers[req.rid] = ExternalCacheHitMarker(
+                    RadixKey(req.origin_input_ids), [str(i) for i in range(6)], 0
+                )
+                loaded, _ = cache.linker.load_back(req)
+                self.assertEqual(loaded, 6)
+                pool.write(
+                    (req.kv.req_pool_idx, slice(0, 6)),
+                    cache.linker.prefix_device_indices(req),
+                )
+                req.kv.kv_allocated_len = req.kv.kv_committed_len = 6
+                cache.linker.adopt_request(req)
+                index = cache.ready_to_load_host_cache()
+                backend.completed_loads.append([(req.rid, False)])
+                self.assertEqual(cache.finish_external_linker_loads(index), [req])
+                # A chunk result arriving after failure must not republish freed KV.
+                if chunked:
+                    cache.checkpoint(req, up_to=6)
+                    cache.advance_unpublished_req(req)
+                release_kv_cache(req, cache, checkpoint=False)
+                cache.linker.release_request(req.rid)
+                self.assertEqual(
+                    (allocator.full_available_size(), allocator.swa_available_size()),
+                    before,
+                )
+                match = cache._match_tree(
+                    MatchPrefixParams(key=RadixKey(req.origin_input_ids))
+                )
+                self.assertEqual(match.device_prefix_len, 0)
+                cache.sanity_check()
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
         cfg = CacheConfig(
@@ -528,7 +606,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         cache.reset()
         cache.sanity_check()
 
-    def test_swa_partial_hit_loads_only_pages_not_adopted_locally(self):
+    def test_swa_private_tail_is_deduplicated_only_after_load_success(self):
         cfg = CacheConfig(
             page_size=1,
             components=(ComponentType.FULL, ComponentType.SWA),
@@ -578,7 +656,6 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         raced_full = consumer.path_device_indices(raced_match.last_device_node)[
             -1:
         ].clone()
-        raced_swa = consumer_allocator.translate_loc_from_full_to_swa(raced_full)
 
         loaded_len, loaded_node = consumer.init_load_back(
             InitLoadBackParams(
@@ -588,32 +665,26 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             )
         )
         self.assertEqual(loaded_len, 2)
-        loaded = consumer.path_device_indices(loaded_node)[-loaded_len:]
-        self.assertTrue(torch.equal(loaded[:1], raced_full))
-        load_by_pool = {
-            transfer.name: transfer
-            for transfer in consumer_linker.queued_loads[req.rid]
-        }
-        self.assertEqual(set(load_by_pool), {PoolName.KV, PoolName.SWA})
-        expected_key = all_keys[3]
+        loaded = consumer.linker.private_loads[req.rid].device_indices
+        self.assertFalse(torch.equal(loaded[:1], raced_full))
+        load_by_pool = {t.name: t for t in consumer_linker.queued_loads[req.rid]}
         for transfer in load_by_pool.values():
-            self.assertEqual(transfer.keys, [expected_key])
-            self.assertEqual(transfer.device_indices.numel(), 1)
-
-        translated = consumer_allocator.translate_loc_from_full_to_swa(loaded)
-        self.assertTrue(torch.equal(translated[:1], raced_swa))
-        self.assertTrue(
-            torch.equal(translated[-1:], load_by_pool[PoolName.SWA].device_indices)
-        )
-
-        self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+            self.assertEqual(transfer.keys, all_keys[2:4])
+            self.assertEqual(transfer.device_indices.numel(), 2)
+        indices = consumer.linker.prefix_device_indices(req)
+        consumer_req_pool.req_to_token[req.kv.req_pool_idx, :4] = indices
+        req.origin_input_ids = req.full_untruncated_fill_ids = array("q", tokens[:4])
+        req.kv.kv_allocated_len = req.kv.kv_committed_len = 4
+        req.kv.cache_protected_len = 2
+        consumer.linker.adopt_request(req)
+        index = consumer.ready_to_load_host_cache()
         consumer_linker.complete_started_loads()
-        consumer.check_hicache_events()
-        final_match = consumer.match_prefix(
+        self.assertEqual(consumer.finish_external_linker_loads(index), [])
+        consumer.checkpoint(req, up_to=4)
+        final_match = consumer._match_tree(
             MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
         )
         self.assertEqual(final_match.device_prefix_len, 4)
-        self.assertEqual(_device_lock_ref(consumer, loaded_node, ComponentType.FULL), 0)
         consumer.sanity_check()
 
 
@@ -839,52 +910,72 @@ def test_offload_skips_node_already_stored_by_tree_core():
     assert linker.queued_offloads == []
 
 
-def test_async_load_pins_node_until_completion():
-    linker = _FakeLinker()
-    lock_params = object()
-    locks = []
-    unlocks = []
-
-    def inc_lock_ref(node):
-        locks.append(node)
-        return SimpleNamespace(to_dec_params=lambda: lock_params)
-
-    node_id = 7
-    cache = _cache_for_wrapper(
-        inc_lock_ref=inc_lock_ref,
-        dec_lock_ref=lambda node, params: unlocks.append((node, params)),
+def _private_fixture(*, adopted=False):
+    freed = []
+    req = SimpleNamespace(
+        rid="rid",
+        kv=SimpleNamespace(holds_kv=True),
+        external_kv_load_pending=True,
+        external_kv_load_failed=False,
+        skip_radix_cache_insert=False,
     )
-    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-
-    wrapper._queue_load("rid", node_id, [object()])
-
-    assert locks == [node_id]
-    assert not unlocks
-
-    linker.completed_loads.append(["rid"])
-    wrapper.drain_loads(finish_count=1)
-
-    assert unlocks == [(node_id, lock_params)]
-
-
-def test_release_request_cancels_queued_load():
-    linker = _FakeLinker()
-    lock_params = object()
-    unlocks = []
-    cache = _cache_for_wrapper(
-        dec_lock_ref=lambda node, params: unlocks.append((node, params))
+    full = PoolTransfer(
+        name=PoolName.KV, device_indices=torch.arange(4), keys=["a", "b"]
     )
+    component = SimpleNamespace(
+        update_external_linker_load=lambda phase, *args: freed.append(phase)
+    )
+    cache = _cache_for_wrapper()
+    linker = _FakeLinker()
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper.hit_markers["rid"] = object()
-    wrapper.pending_loads["rid"] = (7, lock_params)
-    linker.queued_loads["rid"] = [object()]
+    wrapper.private_loads[req.rid] = _PrivateLoad(
+        req, [(component, full)], 2, 6, full.device_indices, adopted=adopted
+    )
+    linker.queued_loads[req.rid] = [full]
+    return wrapper, linker, req, freed
 
-    wrapper.release_request("rid")
 
-    assert wrapper.hit_markers == {}
-    assert wrapper.pending_loads == {}
-    assert "rid" not in linker.queued_loads
-    assert unlocks == [(7, lock_params)]
+def test_release_unadopted_private_slots_once_even_with_preallocated_row():
+    wrapper, linker, req, freed = _private_fixture()
+    wrapper.release_request(req.rid)
+    wrapper.release_request(req.rid)
+    assert freed == [ExternalLinkerLoadPhase.ABORT]
+    assert not wrapper.private_loads
+    assert not req.external_kv_load_pending
+
+
+def test_release_adopted_private_slots_leaves_request_as_only_free_owner():
+    wrapper, linker, req, freed = _private_fixture(adopted=True)
+    wrapper.release_request(req.rid)
+    wrapper.release_request(req.rid)
+    assert not freed
+    assert req.external_kv_load_failed and req.skip_radix_cache_insert
+
+
+def test_started_load_cannot_be_released_by_cancel_retry():
+    wrapper, linker, req, freed = _private_fixture()
+    linker.queued_loads.clear()  # worker already took the transfer
+    with pytest.raises(RuntimeError, match="before load drain"):
+        wrapper.release_request(req.rid)
+    assert not freed
+    assert req.rid in wrapper.private_loads
+
+
+def test_failed_rank_completion_never_frees_adopted_slots_or_publishes():
+    wrapper, linker, req, freed = _private_fixture(adopted=True)
+    wrapper.load_batches[0] = [req.rid]
+    linker.completed_loads.append([(req.rid, True)])
+
+    def reduce(tensor, op):
+        if tensor.numel() == 1:  # remote rank failed its load
+            tensor.zero_()
+
+    wrapper.cache._all_reduce_attn_groups = reduce
+    assert wrapper.finish_loads(0) == [req]
+    assert req.external_kv_load_failed and req.skip_radix_cache_insert
+    assert not freed
+    wrapper.release_request(req.rid)
+    assert not freed
 
 
 def test_failed_offload_rolls_back_split_fragments():
@@ -968,46 +1059,35 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id)),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper._queue_load("rid", node.id, [object()])
     wrapper.offload_nodes([node.id])
 
     wrapper.reset()
 
-    assert events == ["backend", ("unlock", node.id), ("unlock", node.id)]
-    assert wrapper.pending_loads == {}
+    assert events == ["backend", ("unlock", node.id)]
+    assert wrapper.private_loads == {}
     assert wrapper.pending_offloads == []
     assert not node.external_cache_stored
     assert node.write_through_pending_id is None
 
 
-def test_close_quiesces_backend_before_releasing_pending_loads():
-    events = []
+def test_close_quiesces_backend_before_releasing_private_slots():
+    wrapper, linker, req, freed = _private_fixture()
 
-    class _ClosingFakeLinker(_FakeLinker):
-        def close(self):
-            events.append("backend")
-            super().close()
+    def close():
+        assert not freed
+        linker.closed = True
 
-    linker = _ClosingFakeLinker()
-    cache = _cache_for_wrapper(
-        dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id))
-    )
-    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper.pending_loads["rid"] = (7, object())
-
+    linker.close = close
     wrapper.close()
-
-    assert events == ["backend", ("unlock", 7)]
     assert linker.closed
-    assert wrapper.pending_loads == {}
+    assert freed == [ExternalLinkerLoadPhase.ABORT]
+    assert not wrapper.private_loads
 
 
 def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.linker = SimpleNamespace(
-        num_completed_loads=lambda: 1,
-        drain_loads=lambda count: committed.append(("load", count)),
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
@@ -1020,7 +1100,7 @@ def test_check_hicache_events_commits_common_rank_results():
         assert op == torch.distributed.ReduceOp.MIN
         reduce_calls += 1
         if reduce_calls == 1:
-            value.copy_(torch.tensor([1, 1]))
+            value.copy_(torch.tensor([1]))
         else:
             value.fill_(0)
 
@@ -1028,60 +1108,17 @@ def test_check_hicache_events_commits_common_rank_results():
 
     cache.check_hicache_events()
 
-    assert committed == [("load", 1), [False]]
+    assert committed == [[False]]
 
 
-def test_component_commit_keeps_only_adopted_pages():
-    mapping = _MappingRecorder()
-    cache = _cache_for_wrapper(
-        page_size=2,
-        token_to_kv_pool_allocator=SimpleNamespace(
-            set_full_to_swa_mapping=mapping.set_full_to_swa_mapping
-        ),
-    )
-    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
-    full_component = FullComponent.__new__(FullComponent)
-    full_component.cache = cache
-    full_component.component_type = ComponentType.FULL
-    swa_component = SWAComponent.__new__(SWAComponent)
-    swa_component.cache = cache
-    swa_component.component_type = ComponentType.SWA
-    full = PoolTransfer(
-        name=PoolName.KV,
-        keys=["a", "b", "c", "d"],
-        device_indices=torch.tensor([100, 101, 102, 103, 104, 105, 106, 107]),
-    )
-    canonical_tail = torch.tensor([10, 11, 102, 103, 14, 15, 106, 107])
-    swa = PoolTransfer(
-        name=PoolName.SWA,
-        keys=["a", "b", "c", "d"],
-        device_indices=torch.tensor([200, 201, 202, 203, 204, 205, 206, 207]),
-    )
-    insert_result = InsertResult(
-        prefix_len=0,
-        adopted_ranges={
-            ComponentType.FULL: [(2, 4), (6, 8)],
-            ComponentType.SWA: [(2, 4), (6, 8)],
-        },
-    )
-
-    filtered = wrapper._update_load(
-        ExternalLinkerLoadPhase.COMMIT,
-        SimpleNamespace(),
-        [(full_component, full), (swa_component, swa)],
-        prefix_len=8,
-        insert_result=insert_result,
-        canonical_full=canonical_tail,
-    )
-
-    assert filtered == [full, swa]
-    assert full.keys == ["b", "d"]
-    assert full.device_indices.tolist() == [102, 103, 106, 107]
-    assert swa.keys == ["b", "d"]
-    assert swa.device_indices.tolist() == [202, 203, 206, 207]
-    mapped_full, mapped_swa = mapping.mapping[0]
-    assert mapped_full.tolist() == [102, 103, 106, 107]
-    assert mapped_swa.tolist() == [202, 203, 206, 207]
+def test_completion_identity_mismatch_retains_private_ownership():
+    wrapper, linker, req, freed = _private_fixture()
+    wrapper.load_batches[0] = [req.rid]
+    linker.completed_loads.append([("different-rid", True)])
+    with pytest.raises(RuntimeError, match="Out-of-order"):
+        wrapper.finish_loads(0)
+    assert req.rid in wrapper.private_loads
+    assert not freed
 
 
 @pytest.mark.parametrize(
@@ -1304,9 +1341,8 @@ def test_linker_load_preserves_swa_boundaries(
         tail_hashes=["a", "b"],
         device_hit_len=0,
     )
-    wrapper._queue_load = MagicMock()
     kv = (
-        None
+        ReqKvInfo()
         if previous_boundary is None
         else ReqKvInfo(
             kv_allocated_len=previous_boundary,
@@ -1325,12 +1361,9 @@ def test_linker_load_preserves_swa_boundaries(
     assert restored_len == len(full_indices)
     assert last_node == 0
     assert req.kv.get_evicted_seqlen(ComponentType.SWA) == expected_boundary
-    assert req.kv.kv_allocated_len == (previous_boundary or 4)
-    assert (
-        cache.insert.call_args.args[0].get_evicted_seqlen(ComponentType.SWA)
-        == expected_boundary
-    )
-    cache.tree_core.mark_external_cache_stored_path.assert_called_once_with(0, 0)
+    cache.insert.assert_not_called()
+    cache.tree_core.mark_external_cache_stored_path.assert_not_called()
+    assert "rid" in wrapper.private_loads
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD
     ]
@@ -1341,3 +1374,105 @@ def test_linker_load_preserves_swa_boundaries(
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("remote_geometry", [(16, 2, 14), (17, 14, 3)])
+def test_match_geometry_divergence_is_fatal_before_variable_mask(remote_geometry):
+    from sglang.srt.mem_cache.unified_cache.linker_lifecycle import (
+        identity_words,
+        preflight,
+    )
+
+    calls = []
+    identity = ("request", 1)
+
+    def reduce(payload, op):
+        calls.append(payload.numel())
+        fields = [1, *identity_words(identity), *remote_geometry, 1]
+        remote = torch.tensor(fields + [-v for v in fields], dtype=torch.int64)
+        payload.copy_(torch.minimum(payload, remote))
+
+    cache = _cache_for_wrapper(_all_reduce_attn_groups=reduce)
+    with pytest.raises(RuntimeError, match="rank divergence"):
+        preflight(cache, 1, identity, (16, 14, 2), True)
+    assert calls == [18]
+
+
+@pytest.mark.parametrize("remote_rids", [["a"], ["b", "a"]])
+def test_inflight_count_or_same_size_rid_reordering_is_fatal(remote_rids):
+    from sglang.srt.mem_cache.unified_cache.linker_lifecycle import (
+        identity_words,
+        preflight,
+    )
+
+    def reduce(payload, op):
+        fields = [7, *identity_words((1, remote_rids)), len(remote_rids), 0, 0, 1]
+        payload.copy_(
+            torch.minimum(payload, torch.tensor(fields + [-v for v in fields]))
+        )
+
+    cache = _cache_for_wrapper(_all_reduce_attn_groups=reduce)
+    with pytest.raises(RuntimeError, match="rank divergence"):
+        preflight(cache, 7, (1, ["a", "b"]), (2, 0, 0))
+
+
+def test_valid_only_divergence_is_safe_miss():
+    from sglang.srt.mem_cache.unified_cache.linker_lifecycle import preflight
+
+    def reduce(payload, op):
+        payload[8] = 0  # geometry and identity unchanged, remote lookup unavailable
+
+    cache = _cache_for_wrapper(_all_reduce_attn_groups=reduce)
+    assert not preflight(cache, 1, ("a", 1), (16, 14, 2), True)
+
+
+@pytest.mark.parametrize("completed", [False, None])
+def test_collective_unconfirmed_completion_aborts_group(completed):
+    from unittest.mock import patch
+
+    from sglang.srt.mem_cache.unified_cache.linker_lifecycle import (
+        all_reduce_with_timeout,
+    )
+
+    group = MagicMock()
+    work = SimpleNamespace(wait=lambda **kwargs: completed)
+    with patch.object(torch.distributed, "all_reduce", return_value=work):
+        with pytest.raises(RuntimeError, match="collective failed"):
+            all_reduce_with_timeout(
+                torch.zeros(1), torch.distributed.ReduceOp.MIN, group
+            )
+    group.abort.assert_called_once()
+
+
+@pytest.mark.parametrize("adopted", [False, True])
+def test_full_and_swa_share_one_abort_owner(adopted):
+    wrapper, linker, req, freed = _private_fixture(adopted=adopted)
+    swa_freed = []
+    swa = PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2), keys=["b"])
+    component = SimpleNamespace(
+        update_external_linker_load=lambda phase, *args: swa_freed.append(phase)
+    )
+    wrapper.private_loads[req.rid].transfers.append((component, swa))
+    wrapper.release_request(req.rid)
+    wrapper.release_request(req.rid)
+    assert len(freed) == len(swa_freed) == (0 if adopted else 1)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "checkpoint",
+        "checkpoint_into_tree",
+        "advance_unpublished_req",
+        "maybe_hand_to_session",
+    ],
+)
+@pytest.mark.parametrize(
+    "state", ["external_kv_load_pending", "external_kv_load_failed"]
+)
+def test_unfinished_or_session_path_cannot_publish_private_load(method, state):
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    req = SimpleNamespace(rid="chunked", **{state: True})
+    # Bare cache has no session, tree, or allocator: touching any is an error.
+    kwargs = {"up_to": 4} if method.startswith("checkpoint") else {}
+    getattr(cache, method)(req, **kwargs)

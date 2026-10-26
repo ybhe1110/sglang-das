@@ -9,7 +9,6 @@ from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
-
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -322,13 +321,17 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
+        from sglang.srt.mem_cache.unified_cache.linker_lifecycle import (
+            all_reduce_with_timeout,
+        )
+
         reduced = False
         for group in (self.attn_cp_group, self.attn_tp_group):
             if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.all_reduce(tensor, op=op, group=group)
+                all_reduce_with_timeout(tensor, op=op, group=group)
                 reduced = True
         if not reduced and self.tp_world_size > 1:
-            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+            all_reduce_with_timeout(tensor, op=op, group=self.tp_group)
 
     def _drain_async_work(self):
         """
@@ -1073,9 +1076,17 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
     def maybe_hand_to_session(self, req: Req) -> None:
+        if getattr(req, "external_kv_load_pending", False) or getattr(
+            req, "external_kv_load_failed", False
+        ):
+            return
         self.session.take(req)
 
     def claim_kv_row(self, req: Req) -> bool:
+        if self.linker is not None:
+            self.linker.release_request(req.rid)
+        if getattr(req, "external_kv_load_failed", False):
+            return False
         # Retraction also enters here: retain its ticket until actual finish.
         if (
             self.cache_controller is not None
@@ -1094,6 +1105,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        if getattr(req, "external_kv_load_pending", False) or getattr(
+            req, "external_kv_load_failed", False
+        ):
+            return
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
@@ -1103,6 +1118,10 @@ class UnifiedRadixCache(BasePrefixCache):
         move its tree lock onto the node the insert ended on."""
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
+        if getattr(req, "external_kv_load_pending", False) or getattr(
+            req, "external_kv_load_failed", False
+        ):
+            return
         is_finished = req.finished()
         token_ids = req.full_untruncated_fill_ids[:up_to]
 
@@ -1280,6 +1299,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
+        if getattr(req, "external_kv_load_pending", False) or getattr(
+            req, "external_kv_load_failed", False
+        ):
+            return
         assert not self.supports_mamba()
         token_ids = req.get_fill_ids()
         insert_params = InsertParams(
@@ -3466,6 +3489,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Scheduler Entry Points ----
 
+    def prefix_device_indices(self, req):
+        if self.linker is not None and req.rid in self.linker.private_loads:
+            return self.linker.prefix_device_indices(req)
+        return super().prefix_device_indices(req)
+
+    def finish_external_linker_loads(self, consumer_index):
+        if self.linker is None:
+            return []
+        return self.linker.finish_loads(consumer_index)
+
     @rank_consensus(same_params=["params.host_hit_length"])
     def init_load_back(
         self,
@@ -3512,15 +3545,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
-                    self.linker.num_completed_loads(),
                     self.linker.num_completed_offloads(),
                 ],
                 dtype=torch.int,
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
-            self.linker.drain_loads(load_count)
+            offload_count = int(finish_counts[0])
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
