@@ -19,6 +19,7 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -53,6 +54,10 @@ if TYPE_CHECKING:
 
 class ExternalLinkerLoadError(RuntimeError):
     """A recoverable external-cache load failure for the current batch."""
+
+
+class ExternalLinkerCleanupError(RuntimeError):
+    """Allocator ownership is uncertain; only process teardown is safe."""
 
 
 class UnifiedCacheLinker(ABC):
@@ -183,6 +188,9 @@ class UnifiedCacheLinkerWrapper:
         # kept separate from pending_loads, which is retained only for legacy
         # callers that still use the publish-then-rollback helper.
         self.private_loads: dict[str, _PrivateLoad] = {}
+        # Never retry an allocator call that may have freed only part of a pool.
+        self.cleanup_quarantine: dict[str, dict] = {}
+        self._match_sequence = 0
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
 
@@ -203,24 +211,34 @@ class UnifiedCacheLinkerWrapper:
             or self.private_loads
             or self.pending_offloads
             or self.taken_loads
+            or getattr(self, "cleanup_quarantine", {})
         )
+
+    def _raise_if_cleanup_quarantined(self) -> None:
+        if getattr(self, "cleanup_quarantine", {}):
+            raise ExternalLinkerCleanupError(
+                "external KV cleanup quarantined; process teardown required: "
+                f"rids={list(self.cleanup_quarantine)}"
+            )
 
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        self._raise_if_cleanup_quarantined()
         cache = self.cache
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
         self.hit_markers.pop(req.rid, None)
 
         known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
+        skip_lookup = False
         if known_hit_len is not None:
             # PP0's absolute boundary also survives later local L1 rematches.
             key = key[:known_hit_len]
         elif cache.pp_size > 1:
             req.external_cache_hit_length = 0
             if cache.pp_rank != 0:
-                return result
+                skip_lookup = True
 
         # Every rank in an attention group must reach the same collective in
         # the same order.  In particular, do not return early when this rank
@@ -230,7 +248,7 @@ class UnifiedCacheLinkerWrapper:
         # be skipped for the whole group.
         tail_hashes = (
             self._tail_hashes(key, result, device_hit_len)
-            if device_hit_len < len(key)
+            if not skip_lookup and device_hit_len < len(key)
             else []
         )
         lookup_transfers = []
@@ -245,20 +263,21 @@ class UnifiedCacheLinkerWrapper:
                     break
                 lookup_transfers.append(transfer)
 
-        if known_hit_len is None:
-            local_valid, common_tail_pages = self._match_preflight(
-                req.rid,
-                key_len=len(key),
-                device_hit_len=device_hit_len,
-                tail_pages=len(tail_hashes),
-                local_valid=local_valid,
-            )
-            if not local_valid:
-                return result
-            # The preflight guarantees that every rank has the same geometry,
-            # but retain the negotiated bound so a future backend cannot
-            # accidentally create different mask lengths.
-            tail_hashes = tail_hashes[:common_tail_pages]
+        local_valid, common_tail_pages = self._match_preflight(
+            req.rid,
+            key_len=len(key),
+            device_hit_len=device_hit_len,
+            tail_pages=len(tail_hashes),
+            local_valid=local_valid,
+            boundary_mode=2 if skip_lookup else int(known_hit_len is not None),
+        )
+        if not local_valid:
+            if known_hit_len is not None and device_hit_len < len(key):
+                raise DisaggregationCollectiveError(
+                    "cannot restore the prefix boundary already agreed by PP0"
+                )
+            return result
+        tail_hashes = tail_hashes[:common_tail_pages]
 
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
@@ -308,18 +327,29 @@ class UnifiedCacheLinkerWrapper:
         device_hit_len: int,
         tail_pages: int,
         local_valid: bool,
+        boundary_mode: int = 0,
     ) -> tuple[bool, int]:
         """Negotiate match geometry before any variable-size collective.
 
-        The payload is always eight int64 values.  The first half carries
-        local values and the second half carries their negation, allowing one
-        MIN reduction to recover both the group minimum and maximum.  A
+        The payload is always eighteen int64 values, in value/negation pairs.
+        RID fingerprint, sequence and phase must agree even for a full L1 hit.
         A geometry mismatch means that ranks are looking at different
         radix-tree prefixes.  Continuing with local results would make the
         subsequent forward collectives consume different KV layouts, so that
         condition is fatal.  A validity-only mismatch is safe to handle by
         abandoning the external lookup on every rank.
         """
+        sequence = getattr(self, "_match_sequence", 0)
+        self._match_sequence = sequence + 1
+        digest = hashlib.blake2b(str(rid).encode("utf-8"), digest_size=16).digest()
+        identity = [
+            int.from_bytes(digest[:8], "little") & ((1 << 63) - 1),
+            int.from_bytes(digest[8:], "little") & ((1 << 63) - 1),
+            sequence,
+            0x4D41544348,  # MATCH
+            boundary_mode,
+        ]
+        identity_payload = [item for value in identity for item in (value, -value)]
         preflight = torch.tensor(
             [
                 key_len,
@@ -330,12 +360,23 @@ class UnifiedCacheLinkerWrapper:
                 -tail_pages,
                 int(local_valid),
                 -int(local_valid),
+                *identity_payload,
             ],
             dtype=torch.int64,
         )
-        self.cache._all_reduce_attn_groups(
-            preflight, torch.distributed.ReduceOp.MIN
-        )
+        self.cache._all_reduce_attn_groups(preflight, torch.distributed.ReduceOp.MIN)
+
+        if any(int(preflight[i]) != -int(preflight[i + 1]) for i in range(8, 18, 2)):
+            logger.error(
+                "External KV match identity mismatch: rid=%s sequence=%d "
+                "identity_min_max=%s",
+                rid,
+                sequence,
+                preflight[8:].tolist(),
+            )
+            raise DisaggregationCollectiveError(
+                "external KV match RID/sequence/phase differs across ranks"
+            )
 
         same_geometry = (
             int(preflight[0]) == -int(preflight[1])
@@ -367,7 +408,7 @@ class UnifiedCacheLinkerWrapper:
         if (
             not mixed_valid
             and not all_valid
-            and int(preflight[0]) == int(preflight[2])
+            and (int(preflight[0]) <= int(preflight[2]) or boundary_mode == 2)
             and int(preflight[4]) == 0
         ):
             # Every rank has a complete local hit. This is a normal no-op, but
@@ -432,6 +473,7 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> request-private device slots ----
 
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
+        self._raise_if_cleanup_quarantined()
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
         hit = self.hit_markers.pop(req.rid, None)
@@ -579,17 +621,19 @@ class UnifiedCacheLinkerWrapper:
     ) -> list[PoolTransfer]:
         if not component_transfers:
             return []
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            return self._abort_transfers_with_quarantine(
+                req, component_transfers, prefix_len
+            )
         full = component_transfers[0][1]
         result = []
-        transfers = (
-            reversed(component_transfers)
-            if phase == ExternalLinkerLoadPhase.ABORT
-            else component_transfers
-        )
-        for component, transfer in transfers:
+        for component, transfer in component_transfers:
             component_canonical = canonical_full
             if phase == ExternalLinkerLoadPhase.COMMIT:
-                assert insert_result is not None and insert_result.adopted_ranges is not None
+                assert (
+                    insert_result is not None
+                    and insert_result.adopted_ranges is not None
+                )
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [
                     (max(start, coverage_start), min(end, prefix_len))
@@ -623,6 +667,65 @@ class UnifiedCacheLinkerWrapper:
             if transfer is not None:
                 result.append(transfer)
         return result
+
+    def _abort_transfers_with_quarantine(
+        self,
+        req: Req,
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]],
+        prefix_len: int,
+    ) -> list[PoolTransfer]:
+        """Keep descriptors and component outcomes if a free has ambiguous effects."""
+        self._raise_if_cleanup_quarantined()
+        full = component_transfers[0][1]
+        states = ["not_attempted"] * len(component_transfers)
+        for index in reversed(range(len(component_transfers))):
+            component, transfer = component_transfers[index]
+            states[index] = "uncertain"
+            try:
+                component.update_external_linker_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    req,
+                    full,
+                    transfer,
+                    prefix_len,
+                    insert_result=None,
+                    canonical_full=None,
+                )
+            except BaseException as error:
+                if not hasattr(self, "cleanup_quarantine"):
+                    self.cleanup_quarantine = {}
+                # Keep tensor references alive. Do not retry even during close/reset.
+                self.cleanup_quarantine[req.rid] = {
+                    "req": req,
+                    "transfers": component_transfers,
+                    "prefix_len": prefix_len,
+                    "states": tuple(states),
+                }
+                component_slots = [
+                    (
+                        str(t.name),
+                        (
+                            int(t.device_indices.numel())
+                            if t.device_indices is not None
+                            else 0
+                        ),
+                        states[i],
+                    )
+                    for i, (_, t) in enumerate(component_transfers)
+                ]
+                logger.exception(
+                    "External KV release quarantined: rid=%s range=[%s,%s) "
+                    "components=(pool,slots,state)=%s; process teardown required",
+                    req.rid,
+                    getattr(req, "external_kv_private_slots_start", None),
+                    prefix_len,
+                    component_slots,
+                )
+                raise ExternalLinkerCleanupError(
+                    f"external KV release uncertain for rid={req.rid}"
+                ) from error
+            states[index] = "released"
+        return []
 
     def _select_adopted_pages(
         self,
@@ -744,7 +847,9 @@ class UnifiedCacheLinkerWrapper:
         This mirrors take_completed_offloads / commit_completed_offloads, which
         already reduce their verdict for the same reason.
         """
-        return [success for _rids, success in self.take_completed_load_batches(finish_count)]
+        return [
+            success for _rids, success in self.take_completed_load_batches(finish_count)
+        ]
 
     def take_completed_load_batches(
         self, finish_count: int
@@ -782,6 +887,7 @@ class UnifiedCacheLinkerWrapper:
         failed radix chain to detach.  The old pending_loads branch is kept for
         legacy callers only; external load_back never populates it.
         """
+        self._raise_if_cleanup_quarantined()
         assert len(successes) <= len(self.taken_loads)
         failed: list[str] = []
         for success in successes:
@@ -864,9 +970,7 @@ class UnifiedCacheLinkerWrapper:
         # cache_finished_req/release_kv_cache skip it on the next pass.
         for _component, transfer in component_transfers:
             if transfer.name == PoolName.KV and transfer.device_indices is not None:
-                self._remember_private_slot_range(
-                    req, prev_prefix_len, prefix_len
-                )
+                self._remember_private_slot_range(req, prev_prefix_len, prefix_len)
                 self._mark_private_slots_released(req)
                 break
         self._update_load(
@@ -907,23 +1011,12 @@ class UnifiedCacheLinkerWrapper:
                 private.req, private.prev_prefix_len, private.prefix_len
             )
         self._mark_private_slots_released(private.req)
-        try:
-            self._update_load(
-                ExternalLinkerLoadPhase.ABORT,
-                private.req,
-                private.transfers,
-                private.prefix_len,
-            )
-        except BaseException:
-            # The ownership is intentionally not reinserted: retrying an
-            # allocator free can double-release a partially freed component.
-            # Keep the failure visible for invariant checks and process-level
-            # shutdown diagnostics instead.
-            logger.exception(
-                "Failed to release private external load rid=%r after "
-                "backend completion; slots may require process teardown",
-                rid,
-            )
+        self._update_load(
+            ExternalLinkerLoadPhase.ABORT,
+            private.req,
+            private.transfers,
+            private.prefix_len,
+        )
         return True
 
     def _detach_failed_chain(self, rid: str, node_id: NodeId, anchor: NodeId) -> None:
@@ -979,11 +1072,13 @@ class UnifiedCacheLinkerWrapper:
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        self._raise_if_cleanup_quarantined()
         self.cache_linker.reset()
         self.hit_markers.clear()
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
+        self._raise_if_cleanup_quarantined()
         for rid in list(self.private_loads):
             private = self.private_loads.pop(rid, None)
             self._abort_private_load(rid, private)
@@ -1002,6 +1097,7 @@ class UnifiedCacheLinkerWrapper:
         self.taken_loads.clear()
 
     def release_request(self, rid: str) -> None:
+        self._raise_if_cleanup_quarantined()
         # failed_chains is deliberately untouched: the chain outlives the
         # request's linker state, and cache_finished_req is what frees it.
         self.hit_markers.pop(rid, None)
@@ -1018,5 +1114,6 @@ class UnifiedCacheLinkerWrapper:
                 self.cache.dec_lock_ref(node_id, lock_params)
 
     def close(self) -> None:
+        self._raise_if_cleanup_quarantined()
         self.cache_linker.close()
         self._release_pending_locks()

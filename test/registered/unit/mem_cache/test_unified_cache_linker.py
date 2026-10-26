@@ -165,7 +165,7 @@ def test_match_preflight_rejects_rank_shape_mismatch_without_variable_collective
         assert op == torch.distributed.ReduceOp.MIN
         reduce_shapes.append((tensor.numel(), tensor.dtype))
         # Simulate two ranks whose page tails are 2 and 14/20 pages long.
-        tensor.copy_(
+        tensor[:8].copy_(
             torch.tensor(
                 [8, -8, 0, 0, 2, -remote_tail_pages, 0, -1],
                 dtype=torch.int64,
@@ -193,9 +193,9 @@ def test_match_preflight_rejects_rank_shape_mismatch_without_variable_collective
     with pytest.raises(DisaggregationCollectiveError, match="geometry"):
         wrapper.match(key, req, result)
     assert backend.lookup_calls == []
-    # The preflight is fixed at eight int64 values; no rank-dependent mask
+    # The preflight is fixed at eighteen int64 values; no rank-dependent mask
     # tensor (3, 15, or 21 int32 values) is ever submitted.
-    assert reduce_shapes == [(8, torch.int64)]
+    assert reduce_shapes == [(18, torch.int64)]
 
 
 def test_match_preflight_validity_mismatch_falls_back_safely(caplog):
@@ -212,7 +212,7 @@ def test_match_preflight_validity_mismatch_falls_back_safely(caplog):
         reduce_shapes.append(tensor.numel())
         # Geometry is identical (two pages), but one rank cannot build a
         # transfer.  The group must take the safe local-cache fallback.
-        tensor.copy_(
+        tensor[:8].copy_(
             torch.tensor(
                 [8, -8, 0, 0, 2, -2, 0, -1], dtype=torch.int64
             )
@@ -238,7 +238,7 @@ def test_match_preflight_validity_mismatch_falls_back_safely(caplog):
 
     assert wrapper.match(key, req, result) is result
     assert backend.lookup_calls == []
-    assert reduce_shapes == [8]
+    assert reduce_shapes == [18]
     assert "External KV match preflight rejected" in caplog.text
 
 
@@ -270,7 +270,7 @@ def test_match_preflight_is_called_for_local_early_return(caplog, key_len):
 
     assert wrapper.match(key, req, result) is result
     assert len(calls) == 1
-    assert calls[0][0:2] == (8, torch.int64)
+    assert calls[0][0:2] == (18, torch.int64)
     assert backend.lookup_calls == []
     assert "External KV match preflight rejected" not in caplog.text
 
