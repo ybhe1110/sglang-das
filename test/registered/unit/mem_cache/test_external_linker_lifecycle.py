@@ -1,6 +1,7 @@
 """CPU regressions for private-load completion and metadata fallback."""
 
 import threading
+import unittest
 from concurrent.futures import Future
 from queue import Queue
 from unittest.mock import patch
@@ -67,7 +68,9 @@ class TestExternalLinkerLifecycle(CustomTestCase):
 
     def test_model_hook_does_not_consume_completion_or_skip_collective(self):
         callbacks = []
-        counter = LayerWiseLoadCounter(2, lambda i, l: callbacks.append((i, l)))
+        counter = LayerWiseLoadCounter(
+            2, lambda index, layer: callbacks.append((index, layer))
+        )
         index = counter.update_producer()
         counter.set_consumer(index)
         counter.fail(index, RuntimeError("first layer failed"))
@@ -168,3 +171,7 @@ class TestExternalLinkerLifecycle(CustomTestCase):
                 counter.wait_until(0)
         self.assertFalse(counter.terminals[index].done())
         self.assertIn(index, counter.futures)
+
+
+if __name__ == "__main__":
+    unittest.main()

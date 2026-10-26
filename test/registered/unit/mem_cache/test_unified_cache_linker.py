@@ -57,6 +57,7 @@ class _FakeLinker(UnifiedCacheLinker):
     def __init__(self):
         self.layer_done_counter = object()
         self.restorable = []
+        self.lookup_calls = []
         self.queued_loads = {}
         self.queued_offloads = []
         self.completed_loads = []
@@ -65,6 +66,7 @@ class _FakeLinker(UnifiedCacheLinker):
         self.closed = False
 
     def lookup(self, rid, transfers):
+        self.lookup_calls.append((rid, list(transfers)))
         return list(self.restorable)
 
     def load(self, rid, transfers):
@@ -1372,10 +1374,6 @@ def test_linker_load_preserves_swa_boundaries(
         swa.update_external_linker_load.assert_not_called()
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
-
-
 @pytest.mark.parametrize("remote_geometry", [(16, 2, 14), (17, 14, 3)])
 def test_match_geometry_divergence_is_fatal_before_variable_mask(remote_geometry):
     from sglang.srt.mem_cache.unified_cache.linker_lifecycle import (
@@ -1495,3 +1493,7 @@ def test_unfinished_or_session_path_cannot_publish_private_load(method, state):
     # Bare cache has no session, tree, or allocator: touching any is an error.
     kwargs = {"up_to": 4} if method.startswith("checkpoint") else {}
     getattr(cache, method)(req, **kwargs)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
