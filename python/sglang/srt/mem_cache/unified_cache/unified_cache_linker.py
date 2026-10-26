@@ -370,8 +370,18 @@ class UnifiedCacheLinkerWrapper:
             and int(preflight[0]) == int(preflight[2])
             and int(preflight[4]) == 0
         ):
-            # Every rank has a complete local hit. This is a normal no-op, but
-            # only after preflight: an early return would desynchronize peers.
+            # Every rank has a complete local hit with no tail pages to load.
+            # This is a normal no-op after preflight: all ranks agree and the
+            # device cache already holds the full prefix, so no L3 transfer is
+            # needed.  Log at DEBUG to avoid flooding the log at high concurrency
+            # where every cached request would produce a WARNING.
+            logger.debug(
+                "External KV match preflight: complete local hit, no L3 load "
+                "needed rid=%s key_len=%d device_hit=%d",
+                rid,
+                key_len,
+                int(preflight[2]),
+            )
             return False, 0
         if mixed_valid or not all_valid:
             logger.warning(

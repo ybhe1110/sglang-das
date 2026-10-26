@@ -4639,8 +4639,23 @@ class Scheduler(
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
         if not self.enable_hisparse and not deferred_pending:
+            # Pages held by the external linker's private_loads are allocated
+            # but not yet inserted into the tree.  Pass their token count as
+            # `uncached` so the invariant equation stays balanced while loads
+            # are in flight instead of reporting a spurious leak.
+            linker_uncached = 0
+            if self.enable_unified_cache_external_linker:
+                linker = getattr(self.tree_cache, "linker", None)
+                if linker is not None:
+                    for pl in getattr(linker, "private_loads", {}).values():
+                        # _PrivateLoad.end is the exclusive token end; .device_hit_len
+                        # is the start.  Their difference is the pending token span.
+                        end = getattr(pl, "end", 0)
+                        hit = getattr(pl, "device_hit_len", 0)
+                        linker_uncached += max(0, end - hit)
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
+                uncached=linker_uncached,
             )
             if has_leak:
                 self.invariant_checker._report_leak("pool", "\n".join(messages))
@@ -4702,6 +4717,14 @@ class Scheduler(
                 # Retry reclaiming stranded failed linker chains periodically
                 if self.enable_unified_cache_external_linker:
                     self.tree_cache.retry_stranded_failed_linker_chains()
+                    # Pool invariant checks must not fire while the linker still
+                    # holds private pages: those pages are allocated but not yet
+                    # inserted into the tree, so the SWA/full account will appear
+                    # unbalanced even though no leak has occurred.  This mirrors
+                    # the existing DECODE path that waits for linker operations.
+                    linker = self.tree_cache.linker
+                    if linker is not None:
+                        idle &= not linker.has_pending_operations()
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
