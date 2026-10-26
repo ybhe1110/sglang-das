@@ -13,7 +13,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-
 ROOT = pathlib.Path(__file__).resolve().parents[4]
 TRACKER_PATH = ROOT / "python/sglang/srt/disaggregation/mooncake/source_drain.py"
 ENGINE_PATH = (
@@ -131,6 +130,7 @@ class TestLongContextMooncakeSessions(unittest.TestCase):
         )
         engine = cls()
         engine.engine = SimpleNamespace()
+        engine._shutdown = False
         engine._session_lock = threading.RLock()
         engine._peer_sessions = set()
         engine.logger = Mock()
@@ -152,6 +152,10 @@ class TestLongContextMooncakeSessions(unittest.TestCase):
         self.assertTrue(engine.force_destroy_sessions())
         self.assertEqual(len(destroyed), 8)
         self.assertEqual(engine._peer_sessions, set())
+        self.assertEqual(engine.peer_session_count(), 0)
+
+        engine._shutdown = True
+        self.assertFalse(engine._track_peer_session("late-decode-endpoint"))
         self.assertEqual(engine.peer_session_count(), 0)
 
 

@@ -66,8 +66,8 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         s._pending_chunked_abort_req = None
         s._external_kv_chunked_abort_reqs = {}
         s.chunked_req = None
-        s.process_pending_chunked_abort = Scheduler.process_pending_chunked_abort.__get__(
-            s, type(s)
+        s.process_pending_chunked_abort = (
+            Scheduler.process_pending_chunked_abort.__get__(s, type(s))
         )
         s._process_external_kv_chunked_abort = (
             Scheduler._process_external_kv_chunked_abort.__get__(s, type(s))
@@ -98,11 +98,32 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             patch.object(prefill, "maybe_release_pd_hidden_rows_on_hidden_done")
         )
         self.stack.enter_context(patch.object(prefill, "logger"))
+        # Exercise cleanup preflight and flags reduction without a live group.
+        # These lifecycle tests model identical ranks; mismatch/timeout behavior
+        # is covered by test_collective_timeout.py and real Gloo validation.
+        self.stack.enter_context(
+            patch("sglang.srt.disaggregation.utils.all_reduce_with_timeout")
+        )
 
     def finalize(self, **kwargs):
         facts = dict(forward_drained=True, sender_terminal=True, emit_response=True)
         facts.update(kwargs)
         return self.scheduler.abort_external_kv_request(self.req, **facts)
+
+    def assert_cleanup_waits_for_next_consensus(self, transfer_status=None):
+        # This iteration's MIN was taken before local cleanup completed. Keep
+        # the RID queued until the next iteration confirms every rank is ready.
+        self.assertEqual(
+            self.scheduler.process_disagg_prefill_inflight_queue(transfer_status), []
+        )
+        self.assertTrue(self.req.external_kv_cleanup_done)
+        self.assertTrue(self.req.external_kv_cleanup_ready)
+        self.assertEqual(self.scheduler.disagg_prefill_inflight_queue, [self.req])
+        self.assertEqual(
+            self.scheduler.process_disagg_prefill_inflight_queue(transfer_status),
+            [self.req],
+        )
+        self.assertEqual(self.scheduler.disagg_prefill_inflight_queue, [])
 
     def test_both_drain_conditions_are_required(self):
         for forward_drained, sender_terminal in (
@@ -230,9 +251,7 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             "poll_and_all_reduce_attn_cp_tp_group",
             return_value=[KVPoll.Failed],
         ):
-            self.assertEqual(
-                self.scheduler.process_disagg_prefill_inflight_queue(), [self.req]
-            )
+            self.assert_cleanup_waits_for_next_consensus()
         self.cache.assert_called_once()
 
     def test_existing_abort_reason_is_preserved(self):
@@ -270,9 +289,7 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             "poll_and_all_reduce_attn_cp_tp_group",
             return_value=[KVPoll.Failed],
         ):
-            self.assertEqual(
-                self.scheduler.process_disagg_prefill_inflight_queue(), [self.req]
-            )
+            self.assert_cleanup_waits_for_next_consensus()
         self.cache.assert_called_once()
         self.assertEqual(self.scheduler.disagg_prefill_inflight_queue, [])
 
@@ -317,9 +334,7 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             self.assertFalse(done)
             self.assertIs(s.chunked_req, self.req)
             self.assertIs(s._pending_chunked_abort_req, self.req)
-            self.assertIs(
-                s._external_kv_chunked_abort_reqs[self.req.rid], self.req
-            )
+            self.assertIs(s._external_kv_chunked_abort_reqs[self.req.rid], self.req)
             self.assertTrue(self.req.external_kv_abort_response_via_chunked)
             self.cache.assert_not_called()
             s.output_streamer.stream_output.assert_not_called()
@@ -357,9 +372,7 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         ):
             self.assertEqual(self.scheduler.process_disagg_prefill_inflight_queue(), [])
             self.assertEqual(self.scheduler.disagg_prefill_inflight_queue, [self.req])
-            self.assertEqual(
-                self.scheduler.process_disagg_prefill_inflight_queue(), [self.req]
-            )
+            self.assert_cleanup_waits_for_next_consensus()
             self.assertEqual(self.scheduler.process_disagg_prefill_inflight_queue(), [])
         self.metadata.assert_called_once()
         self.assertEqual(self.cache.call_count, 2)
@@ -386,10 +399,7 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             self.metadata.assert_not_called()
             self.req.disagg_kv_sender.abort.assert_called_once()
             self.req.disagg_kv_sender.poll.return_value = KVPoll.Failed
-            self.assertEqual(
-                self.scheduler.process_disagg_prefill_inflight_queue(([], [])),
-                [self.req],
-            )
+            self.assert_cleanup_waits_for_next_consensus(([], []))
         self.assertIsNone(self.req.finished_reason.err_type)
 
     def test_poll_exception_keeps_cleanup_pending(self):
