@@ -3668,6 +3668,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             req_has_disagg_prefill_dp_rank,
         )
         self._source_generation = mgr._source_drain.open(bootstrap_room)
+        self._source_transfers_forgotten = False
         self.conclude_state = None
         self.init_time = time.time()
         self._source_event = None
@@ -3800,40 +3801,76 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self.trace_ctx.trace_req_start()
 
     def is_transfer_drained(self):
-        return self.kv_mgr.source_transfers_drained(
-            self.bootstrap_room, self._source_generation
-        )
+        tracker = self.kv_mgr._source_drain
+        with tracker.lock:
+            if self._source_transfers_forgotten:
+                return True
+            if not tracker.owns_generation(self.bootstrap_room, self._source_generation):
+                return False
+            return self.kv_mgr.source_transfers_drained(
+                self.bootstrap_room, self._source_generation
+            )
 
     def is_transfer_terminal(self):
-        return self.kv_mgr.source_transfers_terminal(
-            self.bootstrap_room, self._source_generation
-        )
+        tracker = self.kv_mgr._source_drain
+        with tracker.lock:
+            if self._source_transfers_forgotten:
+                return True
+            if not tracker.owns_generation(self.bootstrap_room, self._source_generation):
+                return False
+            return self.kv_mgr.source_transfers_terminal(
+                self.bootstrap_room, self._source_generation
+            )
 
     def forget_source_transfers(self):
-        # ``clear()`` may retire an already-terminal generation before the
-        # scheduler's resource cleanup retry.  Treat the second probe as
-        # success so that cleanup does not quarantine a request forever.
-        if self._source_generation is None:
-            return True
-        if self.kv_mgr._source_drain.forget(
-            self.bootstrap_room, self._source_generation
-        ):
+        # Remember only a retirement acknowledged by this sender. An unknown
+        # or stale generation must never resolve to the room's current owner.
+        tracker = self.kv_mgr._source_drain
+        with tracker.lock:
+            if self._source_transfers_forgotten:
+                return True
+            generation = self._source_generation
+            if generation is None or not tracker.terminal(
+                self.bootstrap_room, generation
+            ):
+                return False
+            # Clear room-keyed state before another sender can reuse the room,
+            # including when the scheduler calls forget without calling clear.
+            super().clear()
+            if not tracker.forget(self.bootstrap_room, generation):
+                return False
+            self._source_transfers_forgotten = True
             self._source_generation = None
             return True
-        return False
 
     def clear(self):
         # Failed ``failure_exception`` can clear the sender before the
         # scheduler's retry loop reaches abort_external_kv_request().  Retire a
         # generation whenever it is already terminal; a non-terminal one is
         # left intact and the retry loop will call this again.
-        if self.conclude_state in (KVPoll.Success, KVPoll.Failed):
-            self.forget_source_transfers()
-        super().clear()
+        with self.kv_mgr._source_drain.lock:
+            if (
+                self._source_transfers_forgotten
+                or not self.kv_mgr._source_drain.owns_generation(
+                    self.bootstrap_room, self._source_generation
+                )
+            ):
+                return
+            # Remove room-keyed metadata before making the room reusable.
+            super().clear()
+            if self.conclude_state in (KVPoll.Success, KVPoll.Failed):
+                self.forget_source_transfers()
 
     def abort(self):
         # Serialize Failed publication against the final enqueue.
         with self.kv_mgr._source_drain.lock:
+            if (
+                self._source_transfers_forgotten
+                or not self.kv_mgr._source_drain.owns_generation(
+                    self.bootstrap_room, self._source_generation
+                )
+            ):
+                return
             super().abort()
         self.kv_mgr._wake_pd_hidden_ack_waiters(self.bootstrap_room)
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})

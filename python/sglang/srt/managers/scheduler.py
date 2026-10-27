@@ -4620,6 +4620,9 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
+        # No forward does not mean fully idle: failed transfers can retain KV
+        # and queues for many iterations. Keep their load visible to routing.
+        self.publish_load_snapshot()
         if not self.is_fully_idle():
             return
 
@@ -4658,7 +4661,7 @@ class Scheduler(
         # reset token ratio
         self.new_token_ratio_tracker.reset()
 
-        # Publish the idle state so /get_loads and DP balancing do not see stale load.
+        # Publish the idle transition before sleeping regardless of interval.
         self.publish_load_snapshot(force=True)
 
         # sleep until next event

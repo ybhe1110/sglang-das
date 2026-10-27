@@ -673,7 +673,8 @@ class TestTransferWorkerFailure(unittest.TestCase):
         )
         sender = cls()
         sender._source_generation = None
-        sender.kv_mgr = SimpleNamespace(_source_drain=Mock())
+        sender._source_transfers_forgotten = True
+        sender.kv_mgr = SimpleNamespace(_source_drain=Mock(lock=threading.RLock()))
         self.assertTrue(cls.forget_source_transfers(sender))
         sender.kv_mgr._source_drain.forget.assert_not_called()
 
