@@ -8,11 +8,13 @@ from unittest.mock import Mock, call, patch
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationCollectiveError
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.mooncake_store import (
     mooncake_direct_linker as linker_module,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    LayerWiseLoadCounter,
     MooncakeDirectLinker,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
@@ -179,6 +181,106 @@ class TestSessionOwnership(CustomTestCase):
         self.assertFalse(result)
         self.store.batch_get_session_end.assert_called_once_with(["a"])
         linker.layer_done_counter.fail.assert_called_once()
+
+    def _range_failure_then_recovery(self, *, fail_at=0, raises=False, page_wise=False):
+        """Run the real worker, loader, counter and session cleanup for two batches.
+
+        Native reads and device events are simulated; this does not establish a
+        native DMA fence. The second batch succeeds without restarting the worker.
+        """
+        linker = self.linker
+        linker.tp_rank = 0
+        linker.num_layers = 3
+        linker.enable_page_wise_load = page_wise
+        linker.page_wise_load_threshold = 1
+        linker._storage_ready = Mock(return_value=True)
+        linker.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
+            keys,
+            1,
+        )
+        linker.storage._tag_keys = lambda keys: keys
+        linker.pools = {
+            PoolName.KV: NS(
+                prepare_locations=lambda indices: [1],
+                get_prepared_layer_range_meta=lambda locations, layer: (
+                    [[1024 + layer * 4]],
+                    [[4]],
+                    [[layer * 4]],
+                ),
+            )
+        }
+        linker.layer_done_counter = LayerWiseLoadCounter(3)
+        linker._finish_prefetch_metrics = Mock()
+        linker.load_queue = Queue()
+        events = []
+        self.store.batch_get_session_start.side_effect = lambda keys: (
+            events.append(("start", tuple(keys))) or [0] * len(keys)
+        )
+        self.store.batch_get_session_end.side_effect = lambda keys: (
+            events.append(("end", tuple(keys))) or 0
+        )
+        attempts = 0
+
+        def read(keys, ptrs, sizes, offsets):
+            nonlocal attempts
+            current = attempts
+            attempts += 1
+            events.append(("read", tuple(keys)))
+            if current == fail_at:
+                if raises:
+                    raise RuntimeError("injected synchronous read failure")
+                return [0]  # Short read, not a successful zero-byte transfer.
+            return [sum(parts) for parts in sizes]
+
+        self.store.batch_get_into_multi_buffer_ranges.side_effect = read
+        completions = linker.completed_loads
+        publish = completions.put
+
+        def record_completion(item):
+            events.append(("completion", item))
+            publish(item)
+
+        completions.put = record_completion
+        for rid in ("failed", "recovered"):
+            index = linker.layer_done_counter.update_producer()
+            transfers = [NS(name=PoolName.KV, keys=[rid], host_indices=[1])]
+            linker.load_queue.put((index, {rid: transfers}, NS(synchronize=Mock())))
+        linker.load_queue.put(None)
+        with envs.SGLANG_TEST_LINKER_LOAD_FAILURE_PROB.override(0):
+            linker.load_thread_func()
+
+        self.assertEqual(completions.get_nowait(), (["failed"], False))
+        self.assertEqual(completions.get_nowait(), (["recovered"], True))
+        self.assertTrue(completions.empty())
+        self.assertEqual(linker.load_queue.unfinished_tasks, 0)
+        self.assertEqual(linker.layer_done_counter.futures, {})
+        self.assertIsNone(getattr(linker, "_session_cleanup_error", None))
+        self.assertEqual(
+            self.store.batch_get_session_end.call_args_list,
+            [call(["failed"]), call(["recovered"])],
+        )
+        for rid, success in (("failed", False), ("recovered", True)):
+            self.assertLess(
+                events.index(("end", (rid,))),
+                events.index(("completion", ([rid], success))),
+            )
+        self.assertEqual(attempts, (2 if page_wise else fail_at + 1 + 3))
+        self.assertEqual(
+            linker._finish_prefetch_metrics.call_args_list,
+            [call(["failed"], False), call(["recovered"], True)],
+        )
+
+    def test_first_layer_short_read_aborts_batch_then_worker_recovers(self):
+        self._range_failure_then_recovery()
+
+    def test_first_layer_exception_aborts_batch_then_worker_recovers(self):
+        self._range_failure_then_recovery(raises=True)
+
+    def test_later_layer_failure_preserves_failed_terminal_then_recovers(self):
+        self._range_failure_then_recovery(fail_at=1)
+
+    def test_page_wise_short_read_cleans_sessions_then_recovers(self):
+        self._range_failure_then_recovery(page_wise=True)
 
     def test_reset_does_not_clear_ownership_if_worker_fails_during_join(self):
         linker = self.linker
