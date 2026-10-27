@@ -57,6 +57,11 @@ class SourceDrainTracker:
     def _current(self, key):
         return key[1] is not None and self._generations.get(key[0]) == key[1]
 
+    def owns_generation(self, room, generation):
+        """Check an explicit owner; None must never resolve a reused room."""
+        with self.lock:
+            return self._current((room, generation))
+
     def _op(self, chunk):
         op = self._ops.get(getattr(chunk, "_source_token", None))
         return op if op is not None and op.chunk is chunk else None
