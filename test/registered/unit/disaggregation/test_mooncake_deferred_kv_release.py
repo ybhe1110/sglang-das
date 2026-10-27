@@ -8,13 +8,13 @@ import threading
 import unittest
 from collections import defaultdict
 from unittest.mock import MagicMock, patch
+from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 
 import numpy as np
 from test_deferred_decode_kv_release import (
     ABORT_GENERATION,
     DeferredAbortNotificationScenarios,
     TaggedAbortNotificationScenarios,
-    WorkerFailureAbortScenarios,
 )
 
 from sglang.srt.disaggregation.base.conn import KVPoll
@@ -41,15 +41,25 @@ def _manager(
     *, enabled: bool = True, status: KVPoll | None = KVPoll.WaitingForInput
 ) -> MooncakeKVManager:
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
+    manager._source_drain = SourceDrainTracker()
+    manager.record_failure = MagicMock()
+    manager._wake_pd_hidden_ack_waiters = MagicMock()
+    manager._has_pd_hidden_state = MagicMock(return_value=False)
     manager.enable_deferred_decode_kv_release = enabled
     manager.request_status = {} if status is None else {ROOM: status}
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
     manager._staging_outstanding = {}
     manager.check_status = lambda room: manager.request_status[room]
-    manager.update_status = lambda room, value: manager.request_status.__setitem__(
-        room, value
-    )
+
+    def update_status(room, value):
+        manager.request_status[room] = value
+        if value == KVPoll.Failed:
+            manager._source_drain.poison(room)
+        elif value == KVPoll.Success:
+            manager._source_drain.close(room)
+
+    manager.update_status = update_status
     manager._sent = []
     manager._send_abort_ack = lambda *args: manager._sent.append(args)
     manager._send_multipart_locked = MagicMock()
@@ -83,7 +93,6 @@ def _last_chunk() -> TransferKVChunk:
 class TestMooncakeAbortNotification(
     DeferredAbortNotificationScenarios,
     TaggedAbortNotificationScenarios,
-    WorkerFailureAbortScenarios,
     CustomTestCase,
 ):
     room = ROOM
@@ -93,17 +102,23 @@ class TestMooncakeAbortNotification(
     def _make_abort_manager(self, status: KVPoll | None):
         return _manager(status=status)
 
-    def _provoke_worker_failure(self, manager) -> None:
+    def test_worker_exception_withholds_ack_but_worker_survives(self):
+        manager = _manager()
         manager.enable_trace = False
         manager.bootstrap_port = 8998
         manager._staging_outstanding = defaultdict(int)
         manager.check_status = MagicMock(side_effect=RuntimeError("worker error"))
+        manager.conclude_failure = MagicMock(
+            side_effect=lambda **kw: manager.update_status(ROOM, KVPoll.Failed)
+        )
+        chunk = _chunk()
         queue = MagicMock()
-        queue.get.return_value = _chunk()
-
-        with self.assertRaisesRegex(RuntimeError, "Transfer thread failed"):
-            manager.transfer_worker(queue, MagicMock())
-        manager.check_status = lambda room: manager.request_status[room]
+        manager._source_drain.publish(chunk, queue, lambda: True)
+        queue.get.side_effect = [chunk, None]
+        manager.transfer_worker(queue, MagicMock())
+        self.assertIn(ROOM, manager._deferred_ack_poisoned_rooms)
+        self.assertEqual(manager._sent, [])
+        manager.conclude_failure.assert_called_once()
 
     def test_generationless_abort_marks_failed_without_ack_or_warning(self):
         # A decode that did not arm (prealloc abort) sends no generation; that
@@ -198,6 +213,7 @@ class TestMooncakeAbortNotification(
 
     def _run_worker(self, manager, chunk: TransferKVChunk) -> None:
         queue = MagicMock()
+        manager._source_drain.publish(chunk, queue, lambda: True)
         queue.get.side_effect = [chunk, None]
         manager.transfer_worker(queue, MagicMock())
         self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
@@ -242,6 +258,7 @@ class TestMooncakeAbortNotification(
                 self.assertNotIn(ROOM, manager._deferred_ack_targets)
 
                 # A new lifecycle of the same bootstrap_room acks again.
+                self.assertTrue(manager._source_drain.forget(ROOM))
                 manager.request_status.pop(ROOM, None)
                 CommonKVManager.update_status(manager, ROOM, KVPoll.Bootstrapping)
                 self._dispatch_abort(manager)

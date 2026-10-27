@@ -25,11 +25,6 @@ from unittest.mock import MagicMock, patch
 
 import prometheus_client
 
-from sglang.srt.disaggregation.decode import DecodeTransferQueue
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.scheduler_components.metrics_reporter import (
-    SchedulerMetricsReporter,
-)
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -38,7 +33,6 @@ from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
     RadixCacheMetricsCollector,
     SchedulerMetricsCollector,
-    SchedulerStats,
     StorageMetricsCollector,
     TokenizerMetricsCollector,
     radix_cache_metric_labels,

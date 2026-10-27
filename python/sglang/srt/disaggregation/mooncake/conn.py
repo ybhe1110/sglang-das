@@ -2537,6 +2537,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
     ):
         rc = 0
+        dynamic_dst = (
+            (getattr(req, "spec_metadata", None) or {})
+            .get("pp_slice", {})
+            .get("dynamic_dst")
+        )
         state_types = getattr(self.kv_args, "state_types", [])
         for i, st in enumerate(state_types):
             indices = (
@@ -3247,7 +3252,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         batch_transfer_sync returns -1 on its wall-clock timeout with the batch
         still running (freeBatchID refuses a busy batch and the handle is
         dropped), so a failed send may still be writing decode's pages; decode
-        falls back to its release timeout instead."""
+        must keep those pages quarantined instead."""
         if self.enable_deferred_decode_kv_release:
             self.poison_deferred_ack_room(room)
 
@@ -3270,6 +3275,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # so decode releases the receiver-side allocation instead of
                 # waiting for its bootstrap/heartbeat timeout.
                 for room, _generation in affected:
+                    self.poison_deferred_ack_room(room)
                     if self.request_status.get(room) == KVPoll.Failed:
                         continue
                     try:
@@ -3284,6 +3290,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         logger.exception(
                             "Failed to publish worker-exit status for room %s", room
                         )
+
+    def _complete_source_chunk(self, chunk) -> None:
+        self._source_drain.complete(chunk)
+        if self.enable_deferred_decode_kv_release:
+            self._maybe_ack_drained_abort(chunk.room)
+
+    def _maybe_ack_drained_abort(self, room: int) -> None:
+        # The community counter covers dequeued chunks; the local tracker also
+        # covers queued work, detached native calls and failed native hazards.
+        tracker = self._source_drain
+        with tracker.lock:
+            if room in tracker._generations and not tracker.terminal(room):
+                return
+            super()._maybe_ack_drained_abort(room)
 
     def transfer_worker(
         self,
@@ -3385,7 +3405,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
-                    self._source_drain.complete(kv_chunk)
+                    self._complete_source_chunk(kv_chunk)
                     continue
 
                 reqs_to_be_processed = list(
@@ -3445,7 +3465,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._notify_transfer_waiters()
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(kv_chunk.room)
-                    self._source_drain.complete(kv_chunk)
+                    self._complete_source_chunk(kv_chunk)
                     continue
                 if (
                     self.enable_staging
@@ -3596,13 +3616,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             pd_hidden_done_count += 1
 
                     if pd_hidden_failed:
-                        self._source_drain.complete(kv_chunk)
+                        self._complete_source_chunk(kv_chunk)
                         continue
                     if waiting_for_ack and not ack_ready:
                         # A parked chunk is only re-enqueued by ACK/abort/timeout.
                         # Reaching this branch without a terminal status means a
                         # duplicate wakeup; avoid busy requeueing it.
-                        self._source_drain.complete(kv_chunk)
+                        self._complete_source_chunk(kv_chunk)
                         continue
                     if (
                         kv_chunk.pd_hidden_start is not None
@@ -3985,7 +4005,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
-                self._source_drain.complete(kv_chunk)
+                self._complete_source_chunk(kv_chunk)
                 self._notify_transfer_waiters()
 
             except Exception as e:
@@ -4018,6 +4038,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """
         room = kv_chunk.room
         reason = str(failure)
+        self.poison_deferred_ack_room(room)
         try:
             self._source_drain.mark_unresolved(kv_chunk)
             self._source_drain.finish_quiesced(kv_chunk)
@@ -4697,7 +4718,9 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         with tracker.lock:
             if self._source_transfers_forgotten:
                 return True
-            if not tracker.owns_generation(self.bootstrap_room, self._source_generation):
+            if not tracker.owns_generation(
+                self.bootstrap_room, self._source_generation
+            ):
                 return False
             return self.kv_mgr.source_transfers_drained(
                 self.bootstrap_room, self._source_generation
@@ -4708,7 +4731,9 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         with tracker.lock:
             if self._source_transfers_forgotten:
                 return True
-            if not tracker.owns_generation(self.bootstrap_room, self._source_generation):
+            if not tracker.owns_generation(
+                self.bootstrap_room, self._source_generation
+            ):
                 return False
             return self.kv_mgr.source_transfers_terminal(
                 self.bootstrap_room, self._source_generation

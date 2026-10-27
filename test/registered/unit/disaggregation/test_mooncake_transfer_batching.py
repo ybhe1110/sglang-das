@@ -12,6 +12,10 @@ import numpy as np
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.mooncake.source_drain import (
+    SourceDrainTracker,
+    SourceTransferUnresolved,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
@@ -44,6 +48,16 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             get_mla_kv_ptrs_with_pp=MagicMock(
                 return_value=([1000, 2000], [5000, 6000], 2)
             ),
+        )
+        manager._source_drain = SourceDrainTracker()
+        chunk = SimpleNamespace(room=1)
+        manager._source_drain.publish(chunk, MagicMock(), lambda: True)
+        manager._source_drain.begin(chunk)
+        manager._run_source_with_watchdog = (
+            MooncakeKVManager._run_source_with_watchdog.__get__(manager)
+        )
+        manager._run_mooncake_batch_transfer = (
+            MooncakeKVManager._run_mooncake_batch_transfer.__get__(manager)
         )
         manager._transfer_data = lambda session, blocks: (
             MooncakeKVManager._transfer_data(manager, session, blocks)
@@ -103,9 +117,8 @@ class TestMooncakeTransferBatching(unittest.TestCase):
 
     def test_stops_after_first_failed_index_batch(self):
         manager = self._make_manager(side_effect=[0, -1], max_batch_indices=2)
-        ret = self._send(manager)
-
-        self.assertEqual(ret, -1)
+        with self.assertRaises(SourceTransferUnresolved):
+            self._send(manager)
         self.assertEqual(manager.engine.batch_transfer_sync.call_count, 2)
 
     def test_uses_device_page_indices_in_batched_path(self):
