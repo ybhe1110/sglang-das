@@ -161,6 +161,10 @@ class _PendingOffload(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+class ExternalLinkerCleanupError(RuntimeError):
+    """A component release has uncertain side effects; do not retry it."""
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -194,6 +198,7 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Unpublished slots; after row allocation the request is the sole free owner.
         self.private_loads: dict[str, _PrivateLoad] = {}
+        self.cleanup_quarantine: dict[str, dict] = {}
         self.load_batches: dict[int, list[str]] = {}
         self._match_sequence = 0
         self._finish_sequence = 0
@@ -210,9 +215,17 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def _raise_if_cleanup_quarantined(self) -> None:
+        if getattr(self, "cleanup_quarantine", {}):
+            raise ExternalLinkerCleanupError(
+                "External KV cleanup quarantined; process teardown required: "
+                f"rids={list(self.cleanup_quarantine)}"
+            )
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        self._raise_if_cleanup_quarantined()
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -234,7 +247,12 @@ class UnifiedCacheLinkerWrapper:
         if not preflight(
             cache,
             1,
-            (req.rid, self._match_sequence),
+            (
+                req.rid,
+                self._match_sequence,
+                getattr(cache, "pp_size", 1),
+                getattr(cache, "pp_rank", 0),
+            ),
             (len(key), device_hit_len, max(0, (len(key) - device_hit_len) // page)),
             valid,
         ):
@@ -326,6 +344,7 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> request-private slots; NEVER insert ----
 
     def load_back(self, req: Req) -> tuple[int, NodeId]:
+        self._raise_if_cleanup_quarantined()
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return 0, req.last_node
@@ -405,6 +424,7 @@ class UnifiedCacheLinkerWrapper:
         return len(full.device_indices), req.last_node
 
     def adopt_request(self, req):
+        self._raise_if_cleanup_quarantined()
         private = self.private_loads.get(req.rid)
         if private is not None:
             private.adopted = True
@@ -415,17 +435,57 @@ class UnifiedCacheLinkerWrapper:
         return torch.cat([path[: private.prev_prefix_len], private.device_indices])
 
     def _abort_transfers(self, req, transfers, prefix_len):
+        self._raise_if_cleanup_quarantined()
         if not transfers:
             return
         full = next((t for _, t in transfers if t.name == PoolName.KV), None)
         # Only unadopted allocations use component ABORT. Once indices are adopted,
         # request cleanup owns both FULL and SWA, including donated SWA.
-        for component, transfer in reversed(transfers):
-            component.update_external_linker_load(
-                ExternalLinkerLoadPhase.ABORT, req, full, transfer, prefix_len
-            )
+        ordered = list(reversed(transfers))
+        states = ["not_attempted"] * len(ordered)
+        for index, (component, transfer) in enumerate(ordered):
+            states[index] = "uncertain"
+            try:
+                component.update_external_linker_load(
+                    ExternalLinkerLoadPhase.ABORT, req, full, transfer, prefix_len
+                )
+            except BaseException as error:
+                if not hasattr(self, "cleanup_quarantine"):
+                    self.cleanup_quarantine = {}
+                # Keep indices/request alive even when the caller already popped
+                # private_loads. A failed free may have partially changed a pool.
+                self.cleanup_quarantine[req.rid] = {
+                    "req": req,
+                    "transfers": ordered,
+                    "prefix_len": prefix_len,
+                    "states": states,
+                }
+                detail = [
+                    (
+                        str(t.name),
+                        (
+                            int(t.device_indices.numel())
+                            if t.device_indices is not None
+                            else 0
+                        ),
+                        state,
+                    )
+                    for (_, t), state in zip(ordered, states)
+                ]
+                logger.error(
+                    "External KV release quarantined: rid=%s prefix_len=%d "
+                    "components=%s; process teardown required",
+                    req.rid,
+                    prefix_len,
+                    detail,
+                )
+                raise ExternalLinkerCleanupError(
+                    f"External KV release uncertain for rid={req.rid}"
+                ) from error
+            states[index] = "released"
 
     def finish_loads(self, consumer_index):
+        self._raise_if_cleanup_quarantined()
         rids = self.load_batches.get(consumer_index, [])
         self._finish_sequence += 1
         preflight(
@@ -540,6 +600,7 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def start_layer_wise_loading(self) -> int:
+        self._raise_if_cleanup_quarantined()
         scheduled = {rid for rids in self.load_batches.values() for rid in rids}
         rids = [rid for rid in self.private_loads if rid not in scheduled]
         preflight(self.cache, 6, rids, (len(rids), 0, 0))
@@ -551,11 +612,13 @@ class UnifiedCacheLinkerWrapper:
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        self._raise_if_cleanup_quarantined()
         self.cache_linker.reset()
         self.hit_markers.clear()
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
+        self._raise_if_cleanup_quarantined()
         for private in self.private_loads.values():
             if not private.adopted:
                 self._abort_transfers(
@@ -574,6 +637,7 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
+        self._raise_if_cleanup_quarantined()
         self.hit_markers.pop(rid, None)
         private = self.private_loads.get(rid)
         if private is None:
@@ -591,5 +655,6 @@ class UnifiedCacheLinkerWrapper:
             self._abort_transfers(private.req, private.transfers, private.prefix_len)
 
     def close(self) -> None:
+        self._raise_if_cleanup_quarantined()
         self.cache_linker.close()
         self._release_pending_locks()

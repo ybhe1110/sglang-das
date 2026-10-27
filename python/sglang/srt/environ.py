@@ -443,6 +443,8 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
+    SGLANG_TEST_LINKER_LOAD_FAILURE_PROB = EnvFloat(0.0)
+    SGLANG_TEST_LINKER_LOAD_FAILURE_RANKS = EnvStr(None)
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
@@ -1109,7 +1111,7 @@ class Envs:
     SGLANG_ROCM_USE_AITER_TILELANG_MHC = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
-       # LightOp FP4 indexer logits on gfx928/936/938,Set to 0 to fall back to Triton.
+    # LightOp FP4 indexer logits on gfx928/936/938,Set to 0 to fall back to Triton.
     SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4 = EnvBool(True)
     # DSV4.1 low-ratio decode/verify indexer on HCU via the paged path on LightOp;
     # falls back to the slot-based path when LightOp lacks the paged operators.

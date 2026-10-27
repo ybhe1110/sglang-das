@@ -1186,7 +1186,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.sliding_window_size = WINDOW
         self.mock_tree_cache.supports_prefix_sharing.return_value = False
 
-        def run(delivered: int, remaining_after_load: int = 100_000):
+        def run(delivered: int, remaining_after_load: int = 100_000, private=False):
             self.mock_token_allocator.full_available_size.return_value = 100_000
             self.mock_token_allocator.swa_available_size.return_value = 400
             adder = self.create_adder(self.create_running_batch(), page_size=PAGE)
@@ -1203,6 +1203,7 @@ class TestPrefillAdder(CustomTestCase):
             req.last_node = MagicMock()
             req.best_match_node = MagicMock()
             req.kv = SimpleNamespace(cache_protected_len=0)
+            req.external_kv_load_pending = private
 
             req.sampling_params = SimpleNamespace(max_new_tokens=8, ignore_eos=False)
 
@@ -1236,6 +1237,12 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(req.prefix_len, HOST_HIT + 4)
         self.assertEqual(req.kv.cache_protected_len, HOST_HIT + 4)
         self.assertEqual((req.prefix_len, req.extend_end), (HOST_HIT + 4, SPAN))
+        # A request-private L3 prefix is not yet tree-owned: expanding this
+        # boundary would skip its SWA out-of-window release (release 1ca38d9a3e).
+        _, admitted, req = run(HOST_HIT, private=True)
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(req.prefix_len, HOST_HIT)
+        self.assertEqual(req.kv.cache_protected_len, 0)
         # A partial FULL load stays fatal.
         with self.assertRaisesRegex(RuntimeError, "promised"):
             run(HOST_HIT // 2)

@@ -139,9 +139,9 @@ class _FakeExternalTreeCore:
 
     def finish_external_linker_offload(self, node_ids, ack_id, success):
         nodes = [self.nodes[node_id] for node_id in node_ids]
-        assert all(node.write_through_pending_id == ack_id for node in nodes), (
-            "invalid external offload state"
-        )
+        assert all(
+            node.write_through_pending_id == ack_id for node in nodes
+        ), "invalid external offload state"
         for node in nodes:
             node.write_through_pending_id = None
             node.external_cache_stored |= success
@@ -1173,9 +1173,11 @@ def full_linker_component():
         return PoolTransfer(
             name=PoolName.KV,
             keys=keys,
-            device_indices=None
-            if phase == LinkerTransferPhase.LOOKUP
-            else torch.arange(len(keys) * 2),
+            device_indices=(
+                None
+                if phase == LinkerTransferPhase.LOOKUP
+                else torch.arange(len(keys) * 2)
+            ),
         )
 
     return SimpleNamespace(
@@ -1441,6 +1443,47 @@ def test_valid_only_divergence_is_safe_miss():
 
     cache = _cache_for_wrapper(_all_reduce_attn_groups=reduce)
     assert not preflight(cache, 1, ("a", 1), (16, 14, 2), True)
+
+
+@pytest.mark.parametrize(
+    "remote_identity",
+    [
+        ("other-rid", 1, 1, 0),
+        ("same-rid", 2, 1, 0),
+        ("same-rid", 1, 2, 0),
+        ("same-rid", 1, 1, 1),
+    ],
+)
+def test_match_identity_includes_rid_sequence_and_pp_even_for_full_hit(remote_identity):
+    from sglang.srt.mem_cache.unified_cache.linker_lifecycle import identity_words
+
+    calls = []
+
+    def reduce(payload, op):
+        calls.append(payload.numel())
+        fields = [1, *identity_words(remote_identity), 4, 4, 0, 0]
+        payload.copy_(
+            torch.minimum(payload, torch.tensor(fields + [-v for v in fields]))
+        )
+
+    cache = _cache_for_wrapper(
+        page_size=1,
+        pp_size=1,
+        pp_rank=0,
+        tree_core=SimpleNamespace(is_eagle=False),
+        get_last_hash_value=lambda node: None,
+        _all_reduce_attn_groups=reduce,
+    )
+    backend = _FakeLinker()
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    with pytest.raises(RuntimeError, match="rank divergence"):
+        wrapper.match(
+            RadixKey(array("q", range(4))),
+            SimpleNamespace(rid="same-rid"),
+            SimpleNamespace(device_prefix_len=4, last_device_node=0),
+        )
+    assert calls == [18]
+    assert backend.lookup_calls == []
 
 
 @pytest.mark.parametrize("completed", [False, None])

@@ -5,6 +5,7 @@ from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker as mc
 from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker as umbp
@@ -16,6 +17,77 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestLinkerWorkerCompletion(CustomTestCase):
+    def test_failed_batch_then_success_reuses_worker_and_session_cleanup(self):
+        for fail_at, raises in ((0, False), (0, True), (1, False)):
+            with self.subTest(fail_at=fail_at, raises=raises):
+                backend = mc.MooncakeDirectLinker.__new__(mc.MooncakeDirectLinker)
+                backend.tp_rank = 0
+                backend.device = "cpu"
+                backend.num_layers = 3
+                backend._availability = SimpleNamespace(failed=Mock())
+                backend.layer_done_counter = LayerWiseLoadCounter(3)
+                backend.load_queue = Queue()
+                backend.completed_loads = Queue()
+                backend.broadcast_events = []
+                backend.batch_rids = {0: ["failed"], 1: ["recovered"]}
+                ended = []
+                attempts = 0
+
+                def read(keys, ptrs, sizes, offsets):
+                    nonlocal attempts
+                    current = attempts
+                    attempts += 1
+                    if current == fail_at:
+                        if raises:
+                            raise RuntimeError("synchronous read failed")
+                        return [0]
+                    return [4]
+
+                def end(keys):
+                    index = 0 if keys == ["failed"] else 1
+                    self.assertFalse(backend.layer_done_counter.terminals[index].done())
+                    ended.append(keys)
+                    return 0
+
+                backend.storage = SimpleNamespace(
+                    store=SimpleNamespace(
+                        batch_get_session_start=lambda keys: [0],
+                        batch_get_session_end=end,
+                        batch_get_into_multi_buffer_ranges=read,
+                    ),
+                    _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+                    _tag_keys=lambda keys: keys,
+                )
+                backend.pools = {
+                    PoolName.KV: SimpleNamespace(
+                        prepare_locations=lambda indices: [1],
+                        get_prepared_layer_range_meta=lambda locations, layer: (
+                            [[1024]],
+                            [[4]],
+                            [[layer * 4]],
+                        ),
+                    )
+                }
+                for rid in ("failed", "recovered"):
+                    index = backend.layer_done_counter.update_producer()
+                    transfer = PoolTransfer(name=PoolName.KV, keys=[rid])
+                    backend.load_queue.put((index, {rid: [transfer]}, Mock()))
+                backend.load_queue.put(None)
+                with patch.object(
+                    mc, "device_module", Mock()
+                ), envs.SGLANG_TEST_LINKER_LOAD_FAILURE_PROB.override(0):
+                    backend.load_thread_func()
+                self.assertTrue(backend.completed_loads.empty())
+                backend.finish_loads(0)
+                self.assertEqual(backend.pop_completed_load(), [("failed", False)])
+                backend.finish_loads(1)
+                self.assertEqual(backend.pop_completed_load(), [("recovered", True)])
+                self.assertEqual(ended, [["failed"], ["recovered"]])
+                self.assertEqual(attempts, fail_at + 1 + 3)
+                self.assertEqual(backend.layer_done_counter.futures, {})
+                self.assertEqual(backend.layer_done_counter.terminals, {})
+                self.assertEqual(backend.load_queue.unfinished_tasks, 0)
+
     def test_mooncake_terminal_follows_read_and_session_cleanup(self):
         for failure in (None, "start", "read", "cleanup"):
             with self.subTest(failure=failure):
@@ -34,10 +106,14 @@ class TestLinkerWorkerCompletion(CustomTestCase):
                     events.append(("end", list(keys)))
                     if failure == "cleanup":
                         raise RuntimeError("session cleanup failed")
+                    return 0
 
                 store = SimpleNamespace(
                     batch_get_session_start=lambda keys: (
-                        [0, -1] if failure == "start" else [0, 0]
+                        [
+                            (-1 if key == "b" and failure == "start" else 0)
+                            for key in keys
+                        ]
                     ),
                     batch_get_into_multi_buffer_ranges=read,
                     batch_get_session_end=end,
@@ -58,6 +134,7 @@ class TestLinkerWorkerCompletion(CustomTestCase):
                     )
                 }
                 backend.num_layers = 2
+                backend.tp_rank = 0
                 backend.device = "cpu"
                 backend.layer_done_counter = counter
                 backend._availability = SimpleNamespace(failed=lambda error: None)
@@ -75,6 +152,12 @@ class TestLinkerWorkerCompletion(CustomTestCase):
                     0 if failure == "start" else 1 if failure == "read" else 2,
                 )
                 self.assertTrue(counter.terminals[index].done())
+                if failure == "cleanup":
+                    with self.assertRaisesRegex(RuntimeError, "ownership uncertain"):
+                        counter.finish(index)
+                    self.assertIn(index, counter.futures)
+                    self.assertEqual(backend.load_queue.unfinished_tasks, 0)
+                    continue
                 self.assertEqual(counter.finish(index), failure is None)
                 self.assertEqual(backend.load_queue.unfinished_tasks, 0)
                 self.assertEqual(counter.futures, {})

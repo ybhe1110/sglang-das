@@ -22,6 +22,9 @@ from sglang.srt.mem_cache.storage.mooncake_store.master_availability import (
     StoreUnavailable,
     checked_exists,
 )
+from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
+    arm_load_failure_injection,
+)
 from sglang.srt.mem_cache.unified_cache.linker_lifecycle import (
     LayerWiseLoadCounter,
     all_reduce_with_timeout,
@@ -80,6 +83,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_rank = torch.distributed.get_rank(group=tp_group)
             tp_size = torch.distributed.get_world_size(group=tp_group)
         rank_replicated = self.pool_group.rank_replicated
+        self.tp_rank = tp_rank
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
@@ -250,6 +254,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return restorable
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        self._raise_if_session_cleanup_uncertain()
         if not self._storage_ready():
             return False
         # Every tail page is private; no dedup or partial publication before I/O.
@@ -261,17 +266,88 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads[rid] = expanded
         return True
 
+    def _raise_if_session_cleanup_uncertain(self) -> None:
+        error = getattr(self, "_session_cleanup_error", None)
+        if error is not None:
+            raise RuntimeError(error)
+
+    def _quarantine_sessions(self, keys: list[str], reason: str) -> None:
+        # An exception does not tell us whether native acquired/released some
+        # sessions. Do not guess by retrying or publish a reclaimable completion.
+        if not hasattr(self, "_uncertain_sessions"):
+            self._uncertain_sessions = []
+        self._uncertain_sessions.append(tuple(keys))
+        self._session_cleanup_error = (
+            "Mooncake session ownership uncertain; process teardown required: "
+            f"keys={len(keys)} reason={reason}"
+        )
+        logger.error(self._session_cleanup_error)
+
+    def _start_load_sessions(self, keys: list[str], started: list[list[str]]) -> None:
+        """Track successful keys immediately; retry only explicit failures once."""
+        remaining = list(keys)
+        for attempt in range(2):
+            try:
+                result = list(self.storage.store.batch_get_session_start(remaining))
+                if len(result) != len(remaining):
+                    raise ValueError("session start returned incomplete key statuses")
+            except BaseException as error:
+                self._quarantine_sessions(
+                    remaining, f"session start: {type(error).__name__}"
+                )
+                raise
+            acquired = [key for key, code in zip(remaining, result) if code == 0]
+            if acquired:
+                started.append(acquired)
+            remaining = [key for key, code in zip(remaining, result) if code != 0]
+            if not remaining:
+                return
+            if attempt == 0:
+                logger.warning(
+                    "Mooncake session start partial failure: failed=%d; "
+                    "retrying only failed keys",
+                    len(remaining),
+                )
+        failed_get_cache = getattr(self.storage, "failed_get_cache", None)
+        if failed_get_cache is not None:
+            failed_get_cache.update_batch([], remaining)
+        raise RuntimeError(
+            f"Mooncake get session start failed: failed={len(remaining)}"
+        )
+
+    def _end_load_sessions(self, started: list[list[str]]) -> bool:
+        """Consume cleanup attempts once; a partially successful end is not retried."""
+        success = True
+        while started:
+            keys = started.pop(0)
+            try:
+                # The deployed native ABI returns an integer status. A normal
+                # Python return alone does not establish that cleanup succeeded.
+                status = self.storage.store.batch_get_session_end(keys)
+                if type(status) is not int or status != 0:
+                    raise RuntimeError(f"Mooncake get session end failed: {status!r}")
+            except BaseException as error:
+                self._quarantine_sessions(keys, f"session end: {type(error).__name__}")
+                self._availability.failed(error)
+                logger.exception("Mooncake layer-wise load session cleanup failed")
+                success = False
+        return success
+
     def cancel_queued_load(self, rid: str) -> bool:
         return self.pending_loads.pop(rid, None) is not None
 
     def num_completed_loads(self) -> int:
+        self._raise_if_session_cleanup_uncertain()
         return self.completed_loads.qsize()
 
     def pop_completed_load(self) -> list[tuple[str, bool]]:
+        self._raise_if_session_cleanup_uncertain()
         return self.completed_loads.get_nowait()
 
     def finish_loads(self, consumer_index):
+        self._raise_if_session_cleanup_uncertain()
         success = self.layer_done_counter.finish(consumer_index)
+        self._raise_if_session_cleanup_uncertain()
         # Broadcast receives are GPU writes too; wait before transferring ownership.
         for event, _ in self.broadcast_events:
             event.synchronize()
@@ -288,6 +364,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.gc_frozen = True
 
     def start_layer_wise_loading(self) -> int:
+        self._raise_if_session_cleanup_uncertain()
         broadcaster = self.mla_broadcaster
         if broadcaster is not None:
             # Compare logical load keys (not rank-local private slots),
@@ -382,7 +459,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self._availability.failed(error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
-                    self.layer_done_counter.publish_terminal(counter_index)
+                    error = getattr(self, "_session_cleanup_error", None)
+                    if error is None:
+                        self.layer_done_counter.publish_terminal(counter_index)
+                    else:
+                        # Wake finish() with a fatal error, never with permission
+                        # to return/reuse the private slots. Keep all ownership.
+                        self.layer_done_counter.terminals[counter_index].set_exception(
+                            RuntimeError(error)
+                        )
+                        logger.error(
+                            "Withholding external load completion: batch=%d rids=%s; "
+                            "session ownership uncertain, private slots retained",
+                            counter_index,
+                            list(pending),
+                        )
             finally:
                 self.load_queue.task_done()
 
@@ -390,7 +481,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
         started = []
+        maybe_fail = arm_load_failure_injection(self.tp_rank)
         try:
+            self._raise_if_session_cleanup_uncertain()
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
                 for transfer in transfers:
@@ -405,21 +498,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         )
                     )
             for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
-                # Retain successful starts even if a later key failed.
-                if result is not None and not isinstance(result, int):
-                    started.append(
-                        [key for key, code in zip(keys, result) if code == 0]
-                    )
-                if (
-                    result is None
-                    or isinstance(result, int)
-                    or list(result) != [0] * len(keys)
-                ):
-                    raise RuntimeError(
-                        f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"results={result}"
-                    )
+                self._start_load_sessions(keys, started)
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
@@ -429,6 +508,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
+                    maybe_fail(name, f"layer={layer}")
                     result = self.storage.store.batch_get_into_multi_buffer_ranges(
                         keys,
                         ptrs,
@@ -452,13 +532,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self._availability.failed(error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
-            for keys in started:
-                try:
-                    self.storage.store.batch_get_session_end(keys)
-                except BaseException as error:
-                    self.layer_done_counter.fail(counter_index, error)
-                    self._availability.failed(error)
-                    logger.exception("Mooncake layer-wise load session cleanup failed")
+            if not self._end_load_sessions(started):
+                self.layer_done_counter.fail(
+                    counter_index, RuntimeError(self._session_cleanup_error)
+                )
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         if not self._storage_ready():
@@ -509,9 +586,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return self.offload_results.get_nowait()
 
     def reset(self) -> None:
-        self.pending_loads.clear()
+        self._raise_if_session_cleanup_uncertain()
         wait_queue_drained(self.load_queue)
         wait_queue_drained(self.offload_queue)
+        self._raise_if_session_cleanup_uncertain()
+        self.pending_loads.clear()
         for event, _ in self.broadcast_events:
             event.synchronize()
         self.broadcast_events.clear()
