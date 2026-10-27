@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import zlib
+from datetime import timedelta
 import logging
 import threading
 from collections import deque
@@ -202,7 +204,7 @@ def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
         return polls
 
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    all_reduce_with_timeout(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
     return tensor_to_reduce.tolist()
 
 
@@ -2315,3 +2317,160 @@ def is_aborted(req: Req) -> bool:
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT
     )
+
+
+class DisaggregationCollectiveError(RuntimeError):
+    """A P/D collective failed and the scheduler must leave the event loop."""
+
+
+def _collective_timeout_s() -> float:
+    """Return a positive timeout for every disaggregation collective."""
+    try:
+        value = float(envs.SGLANG_DISAGGREGATION_COLLECTIVE_TIMEOUT.get())
+    except (AttributeError, TypeError, ValueError):
+        value = 30.0
+    return max(value, 0.1)
+
+
+def _abort_collective_group(group: dist.ProcessGroup) -> None:
+    """Best-effort abort that wakes peers after a collective failure."""
+    abort = getattr(group, "abort", None)
+    if callable(abort):
+        try:
+            abort()
+            return
+        except Exception:
+            logger.exception("Failed to abort disaggregation process group")
+    destroy = getattr(dist, "destroy_process_group", None)
+    if callable(destroy):
+        try:
+            destroy(group)
+        except Exception:
+            logger.exception("Failed to destroy disaggregation process group")
+
+
+def all_reduce_with_timeout(
+    tensor: torch.Tensor,
+    *,
+    op,
+    group: dist.ProcessGroup,
+    timeout_s: Optional[float] = None,
+) -> None:
+    """Run an all-reduce with bounded wait and fail-fast group teardown."""
+    timeout = (
+        _collective_timeout_s() if timeout_s is None else max(float(timeout_s), 0.1)
+    )
+    try:
+        work = dist.all_reduce(tensor, op=op, group=group, async_op=True)
+        if work is not None:
+            completed = work.wait(timeout=timedelta(seconds=timeout))
+            # Some backends return False on timeout; others return None when
+            # the wait expires without completing.  Treat anything that is
+            # not explicitly True as a timeout so neither return value slips
+            # through silently.
+            if completed is not True:
+                raise TimeoutError(f"all_reduce did not complete within {timeout:.3f}s")
+    except Exception as exc:
+        _abort_collective_group(group)
+        raise DisaggregationCollectiveError(
+            f"disaggregation all_reduce failed or timed out after {timeout:.3f}s"
+        ) from exc
+
+
+def _all_reduce_flags_preflight(
+    flags: List[int],
+    group: dist.ProcessGroup,
+    phase: int,
+    request_ids: Optional[List[str]] = None,
+) -> None:
+    """Check cleanup collective geometry before reducing variable flags.
+
+    ``all_reduce_min_flags`` normally reduces one element per in-flight
+    request.  A rank-local queue difference therefore changes the tensor shape
+    and can make Gloo/RCCL abort in C++ before ``work.wait`` can report a
+    timeout.  The four-element payload is fixed for every rank and carries the
+    request count and the collective phase as min/max pairs.  Any mismatch is
+    fatal; no variable-length collective is attempted afterwards.
+    """
+    if request_ids is not None and len(request_ids) != len(flags):
+        raise ValueError("request_ids and cleanup flags must have the same length")
+
+    # Keep this preflight fixed-size even when the in-flight queue is large.
+    # The ordered digest binds the local queue position to its RID; the XOR
+    # digest catches a permutation with a low-probability rolling-hash
+    # collision. This prevents two ranks from polling or removing different
+    # requests while avoiding a variable-length collective.
+    rid_digest = 0
+    rid_xor = 0
+    if request_ids is not None:
+        for rid in request_ids:
+            value = zlib.crc32(str(rid).encode("utf-8")) & 0x7FFFFFFF
+            rid_digest = ((rid_digest * 16777619) ^ value) & 0x7FFFFFFF
+            rid_xor ^= value
+
+    values = [len(flags), -len(flags), phase, -phase]
+    if request_ids is not None:
+        values.extend([rid_digest, -rid_digest, rid_xor, -rid_xor])
+    payload = torch.tensor(
+        values,
+        dtype=torch.int64,
+        device="cpu",
+    )
+    all_reduce_with_timeout(payload, op=dist.ReduceOp.MIN, group=group)
+    same_count = int(payload[0]) == -int(payload[1])
+    same_phase = int(payload[2]) == -int(payload[3])
+    same_rids = True
+    if request_ids is not None:
+        same_rids = int(payload[4]) == -int(payload[5]) and int(payload[6]) == -int(
+            payload[7]
+        )
+    if not (same_count and same_phase and same_rids):
+        if request_ids is None:
+            logger.error(
+                "Disaggregation cleanup collective shape mismatch: "
+                "count=[%d,%d] phase=[%d,%d]",
+                int(payload[0]),
+                -int(payload[1]),
+                int(payload[2]),
+                -int(payload[3]),
+            )
+        else:
+            logger.error(
+                "Disaggregation cleanup collective shape mismatch: "
+                "count=[%d,%d] phase=[%d,%d] rid_digest=[%d,%d] rid_xor=[%d,%d]",
+                int(payload[0]),
+                -int(payload[1]),
+                int(payload[2]),
+                -int(payload[3]),
+                int(payload[4]),
+                -int(payload[5]),
+                int(payload[6]),
+                -int(payload[7]),
+            )
+        raise DisaggregationCollectiveError(
+            "inflight cleanup collective shape/order/RID differs across ranks"
+        )
+
+
+def all_reduce_min_flags(
+    flags: List[int],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+    request_ids: Optional[List[str]] = None,
+) -> List[int]:
+    """Converge per-request cleanup decisions across the same scheduler ranks."""
+    _all_reduce_flags_preflight(
+        flags, attn_tp_cpu_group, phase=1, request_ids=request_ids
+    )
+    # The fixed preflight already proved that every rank in this TP group has
+    # the same queue shape.  Empty TP groups skip the zero-length variable
+    # reduce, but still participate in the CP preflight below because the CP
+    # group can span multiple TP groups.
+    if flags:
+        flags = _all_reduce_polls(flags, attn_tp_cpu_group)
+    _all_reduce_flags_preflight(
+        flags, attn_cp_cpu_group, phase=2, request_ids=request_ids
+    )
+    if not flags:
+        return []
+    return _all_reduce_polls(flags, attn_cp_cpu_group)

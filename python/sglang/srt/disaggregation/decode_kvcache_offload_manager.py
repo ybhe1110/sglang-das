@@ -1,3 +1,5 @@
+from sglang.srt.disaggregation.utils import all_reduce_with_timeout
+
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 # Modified by Hygon Information Technology Co., Ltd., 2026.
@@ -273,7 +275,7 @@ class DecodeKVCacheOffloadManager:
             dtype=torch.int,
         )
         if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
+            all_reduce_with_timeout(
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 
@@ -292,7 +294,7 @@ class DecodeKVCacheOffloadManager:
             dtype=torch.int,
         )
         if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
+            all_reduce_with_timeout(
                 pending, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
             )
         if pending.item():

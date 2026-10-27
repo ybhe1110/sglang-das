@@ -412,9 +412,20 @@ class PDHiddenEventManager:
             pool.free([int(idx) for idx in indices])
 
     def free_chunk_rows(self, kv_chunk: TransferKVChunk) -> None:
+        state = getattr(kv_chunk, "_pd_hidden_rows_release_state", None)
+        if state == "released":
+            return
+        if state == "uncertain":
+            raise RuntimeError(
+                f"PD hidden row release already quarantined: room={kv_chunk.room}"
+            )
+        self._assert_chunk_source_quiesced(kv_chunk)
+        kv_chunk._pd_hidden_rows_release_state = "uncertain"
         self.free_state_indices(self.release_state_indices(kv_chunk))
+        kv_chunk._pd_hidden_rows_release_state = "released"
 
     def release_or_mark_done(self, kv_chunk: TransferKVChunk) -> None:
+        self._assert_chunk_source_quiesced(kv_chunk)
         if kv_chunk.pd_hidden_start is not None:
             self.free_chunk_rows(kv_chunk)
         else:
@@ -449,13 +460,12 @@ class PDHiddenEventManager:
             if self.owner.session_failures[session_id] >= 1:
                 self.owner.failed_sessions.add(session_id)
                 logger.error("Session %s failed.", session_id)
-        self.owner.record_failure(kv_chunk.room, failure_reason)
-        self.owner.update_status(kv_chunk.room, KVPoll.Failed)
+        self.owner.conclude_failure(bootstrap_room=kv_chunk.room, failure_reason=failure_reason)
         self.wake_ack_waiters(kv_chunk.room)
-        self.owner.sync_status_to_decode_endpoint(
-            req.endpoint,
-            req.dst_port,
-            req.room,
-            KVPoll.Failed,
-            prefill_unique_rank,
-        )
+
+    def _assert_chunk_source_quiesced(self, kv_chunk: TransferKVChunk) -> None:
+        tracker = getattr(self.owner, "_source_drain", None)
+        if tracker is not None and not tracker.chunk_accesses_quiesced(kv_chunk):
+            raise RuntimeError(
+                f"Retaining PD hidden source rows with unresolved DMA: room={kv_chunk.room}"
+            )

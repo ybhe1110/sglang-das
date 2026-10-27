@@ -6130,7 +6130,52 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
-                scheduler.release_host_resources()
+                managers = []
+                for attr in (
+                    "disagg_prefill_bootstrap_queue",
+                    "disagg_decode_prealloc_queue",
+                ):
+                    manager = getattr(
+                        getattr(scheduler, attr, None), "kv_manager", None
+                    )
+                    if manager is not None and manager not in managers:
+                        managers.append(manager)
+                decode_queue = getattr(scheduler, "disagg_decode_transfer_queue", None)
+                linker = getattr(scheduler.tree_cache, "linker", None)
+                prealloc = getattr(scheduler, "disagg_decode_prealloc_queue", None)
+                drained = not (
+                    bool(getattr(prealloc, "has_published_destinations", False))
+                    or (
+                        decode_queue is not None
+                        and (
+                            decode_queue.queue
+                            or decode_queue.has_pending_deferred_releases()
+                        )
+                    )
+                    or (linker is not None and linker.has_pending_operations())
+                )
+                for manager in managers if drained else ():
+                    shutdown = getattr(manager, "shutdown", None)
+                    if shutdown is not None:
+                        try:
+                            shutdown()
+                        except Exception:
+                            logger.exception(
+                                "PD transport shutdown unresolved; retaining endpoint"
+                            )
+                            drained = False
+                if drained:
+                    from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                        shutdown_mooncake_transfer_engine,
+                    )
+
+                    drained = shutdown_mooncake_transfer_engine()
+                if drained:
+                    scheduler.release_host_resources()
+                else:
+                    logger.error(
+                        "Retaining native/host resources until process exit: transport is not quiescent"
+                    )
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
 

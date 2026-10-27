@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from importlib import metadata as importlib_metadata
+import threading
 import logging
 import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
@@ -116,6 +118,7 @@ class MooncakeTransferEngine:
         gpu_id: Optional[int] = None,
         ib_device: Optional[str] = None,
     ):
+        configure_mooncake_transfer_timeout()
         try:
             from mooncake.engine import TransferEngine
         except ImportError as e:
@@ -126,6 +129,16 @@ class MooncakeTransferEngine:
             ) from e
 
         self.engine = TransferEngine()
+        self._shutdown = False
+        self._endpoint_destroyed = False
+        self._registered_regions = set()
+        # Peer endpoint ids are learned from transfer/probe calls.  Keeping a
+        # process-local set lets shutdown explicitly tear down every session
+        # before destroying the native endpoint and its QPs.
+        self._peer_sessions = set()
+        self._region_lock = threading.RLock()
+        self._session_lock = threading.RLock()
+        log_mooncake_runtime_configuration(self.engine)
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         # MC_FORCE_TCP=1 makes mooncake install TcpTransport instead of RDMA,
@@ -151,6 +164,8 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             raise RuntimeError(f"Mooncake memory registration failed (ret={ret_value})")
+        with self._region_lock:
+            self._registered_regions.add((ptr, length))
 
     def deregister(self, ptr) -> None:
         try:
@@ -162,6 +177,10 @@ class MooncakeTransferEngine:
             raise RuntimeError(
                 f"Mooncake memory deregistration failed (ret={ret_value})"
             )
+        with self._region_lock:
+            self._registered_regions = {
+                r for r in self._registered_regions if r[0] != ptr
+            }
 
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
         """Batch register multiple memory regions."""
@@ -179,6 +198,8 @@ class MooncakeTransferEngine:
             raise RuntimeError(
                 f"Mooncake batch memory registration failed (ret={ret_value})"
             )
+        with self._region_lock:
+            self._registered_regions.update(zip(ptrs, lengths))
         return ret_value
 
     def batch_deregister(self, ptrs: List[int]) -> int:
@@ -191,6 +212,14 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             logger.debug("Mooncake batch memory deregistration failed.")
+        else:
+            with self._region_lock:
+                ptr_set = set(ptrs)
+                self._registered_regions = {
+                    region
+                    for region in self._registered_regions
+                    if region[0] not in ptr_set
+                }
         return ret_value
 
     def initialize(
@@ -227,6 +256,8 @@ class MooncakeTransferEngine:
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
+        if not self._track_peer_session(session_id):
+            return -1
         try:
             ret = self.engine.transfer_sync_write(
                 session_id, buffer, peer_buffer_address, length
@@ -252,6 +283,8 @@ class MooncakeTransferEngine:
         lengths: List[int],
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
+        if not self._track_peer_session(session_id):
+            return -1
         try:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
@@ -279,6 +312,8 @@ class MooncakeTransferEngine:
         return self.session_id
 
     def send_probe(self, peer_session_id: str) -> int:
+        if not self._track_peer_session(peer_session_id):
+            return -1
         return self.engine.send_probe(peer_session_id)
 
     def get_engine(self):
@@ -286,6 +321,157 @@ class MooncakeTransferEngine:
 
     def get_ib_device(self):
         return self.ib_device
+
+    def _track_peer_session(self, session_id: str) -> bool:
+        if self._shutdown:
+            logger.warning(
+                "Ignoring Mooncake peer session %s after endpoint shutdown",
+                session_id,
+            )
+            return False
+        if session_id:
+            added = False
+            with self._session_lock:
+                added = session_id not in self._peer_sessions
+                self._peer_sessions.add(session_id)
+                count = len(self._peer_sessions)
+            if added:
+                logger.info("Mooncake peer sessions tracked: count=%d", count)
+        return True
+
+    def _native_targets(self):
+        """Yield wrapper and underlying native endpoint exactly once."""
+        targets = [self.engine]
+        get_engine = getattr(self.engine, "get_engine", None)
+        if callable(get_engine):
+            try:
+                native = get_engine()
+            except Exception:
+                native = None
+            if native is not None and native is not self.engine:
+                targets.append(native)
+        return targets
+
+    def destroy_session(self, session_id: str) -> bool:
+        """Destroy one native peer session when the installed API supports it.
+
+        Mooncake has used several names for this operation.  Endpoint
+        shutdown remains the final fallback because older wheels do not expose
+        a per-session method.
+        """
+        if not session_id:
+            return True
+        for target in self._native_targets():
+            for method_name in (
+                "destroy_session",
+                "close_session",
+                "remove_session",
+                "unregister_session",
+                "disconnect",
+            ):
+                method = getattr(target, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    result = method(session_id)
+                except TypeError:
+                    # A method with the same name but endpoint-level signature
+                    # is not a per-session API; try the next candidate.
+                    continue
+                except Exception:
+                    logger.exception(
+                        "Mooncake session %s destroy via %s failed",
+                        session_id,
+                        method_name,
+                    )
+                    return False
+                if (
+                    result is None
+                    or result is True
+                    or (type(result) is int and result == 0)
+                ):
+                    with self._session_lock:
+                        self._peer_sessions.discard(session_id)
+                    logger.debug(
+                        "Mooncake session %s destroyed via %s",
+                        session_id,
+                        method_name,
+                    )
+                    return True
+                logger.warning(
+                    "Mooncake session %s destroy via %s returned %r",
+                    session_id,
+                    method_name,
+                    result,
+                )
+                return False
+        return False
+
+    def force_destroy_sessions(self) -> bool:
+        """Destroy all tracked peer sessions before endpoint teardown."""
+        with self._session_lock:
+            sessions = list(self._peer_sessions)
+        if not sessions:
+            return True
+        all_destroyed = True
+        for session_id in sessions:
+            if not self.destroy_session(session_id):
+                all_destroyed = False
+        if not all_destroyed:
+            logger.warning(
+                "Mooncake native wheel has no usable per-session destroy API; "
+                "endpoint shutdown will be used for sessions=%s",
+                sessions,
+            )
+        return all_destroyed
+
+    def peer_session_count(self) -> int:
+        """Return the number of unique peer endpoints tracked by this process."""
+        with self._session_lock:
+            return len(self._peer_sessions)
+
+    def shutdown(self, force_sessions: bool = True) -> bool:
+        """Final process teardown only, after every owner has drained its DMA.
+
+        The shared engine must not be closed by a single role-switching manager.
+        Missing native APIs or failed/ambiguous destruction never count as success.
+        """
+        with self._region_lock:
+            if self._shutdown:
+                return self._endpoint_destroyed
+            self._shutdown = True
+        if force_sessions:
+            self.force_destroy_sessions()
+        # Destroy the endpoint before relinquishing registrations. Native owns
+        # its MR/QP ordering; Python cannot fabricate a DMA fence by deregistering.
+        for target in self._native_targets():
+            for name in ("shutdown", "close", "destroy"):
+                method = getattr(target, name, None)
+                if not callable(method):
+                    continue
+                try:
+                    result = method()
+                except Exception:
+                    logger.exception(
+                        "Mooncake endpoint destruction is uncertain via %s", name
+                    )
+                    return False
+                if (
+                    result is not None
+                    and result is not True
+                    and not (type(result) is int and result == 0)
+                ):
+                    logger.error("Mooncake endpoint destruction returned %r", result)
+                    return False
+                self._endpoint_destroyed = True
+                self._registered_regions.clear()
+                with self._session_lock:
+                    self._peer_sessions.clear()
+                return True
+        logger.warning(
+            "Mooncake has no endpoint shutdown API; retaining ownership until process exit"
+        )
+        return False
 
 
 def init_mooncake_transfer_engine(
@@ -365,3 +551,60 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
                     "installation to 0.3.11 or above."
                 ) from e
             set_transfer_engine(_mooncake_transfer_engine.engine)
+
+
+def configure_mooncake_transfer_timeout() -> None:
+    """Set Mooncake's native transfer deadline without overriding operators."""
+    # Mooncake reads MC_TRANSFER_TIMEOUT while constructing the native
+    # TransferEngine.  This must happen before that construction; a Python
+    # Future timeout would only abandon the caller while the native WR could
+    # still access the registered KV buffers.
+    transfer_timeout_s = envs.SGLANG_DISAGGREGATION_MOONCAKE_TRANSFER_TIMEOUT.get()
+    if transfer_timeout_s > 0 and "MC_TRANSFER_TIMEOUT" not in os.environ:
+        os.environ["MC_TRANSFER_TIMEOUT"] = str(transfer_timeout_s)
+        logger.info(
+            "Configured MC_TRANSFER_TIMEOUT=%.3fs for Mooncake transfers",
+            transfer_timeout_s,
+        )
+
+
+def get_mooncake_package_version() -> str:
+    """Return the installed Mooncake distribution and version for diagnostics."""
+    # CUDA 13 images use the suffixed distribution name; CUDA 12 images use
+    # the generic package.  The import name is ``mooncake`` for both.
+    for distribution in (
+        "mooncake-transfer-engine-cuda13",
+        "mooncake-transfer-engine",
+    ):
+        try:
+            return f"{distribution}=={importlib_metadata.version(distribution)}"
+        except importlib_metadata.PackageNotFoundError:
+            continue
+    return "unknown"
+
+
+def log_mooncake_runtime_configuration(engine) -> None:
+    """Log the effective native timeout and API surface once at startup."""
+    configured_timeout = envs.SGLANG_DISAGGREGATION_MOONCAKE_TRANSFER_TIMEOUT.get()
+    native_timeout = os.environ.get("MC_TRANSFER_TIMEOUT", "<unset>")
+    logger.info(
+        "Mooncake runtime configuration: package=%s, "
+        "sglang_timeout=%.3fs, MC_TRANSFER_TIMEOUT=%s, "
+        "batch_transfer_sync_write=%s, MC_FORCE_TCP=%s",
+        get_mooncake_package_version(),
+        configured_timeout,
+        native_timeout,
+        hasattr(engine, "batch_transfer_sync_write"),
+        os.environ.get("MC_FORCE_TCP", "0"),
+    )
+
+
+def shutdown_mooncake_transfer_engine(force: bool = True) -> bool:
+    global _mooncake_transfer_engine
+    engine = _mooncake_transfer_engine
+    if engine is None:
+        return True
+    if not engine.shutdown(force_sessions=force):
+        return False
+    _mooncake_transfer_engine = None
+    return True

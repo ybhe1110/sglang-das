@@ -160,7 +160,8 @@ class DecodeHiCachePreallocMixin:
             dr.prefix_match.restore_token_count
             for dr in self.transfer_queue.queue
             if dr.prefix_match is not None
-            and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
+            and dr.hicache_restore_status
+            in (HiCacheRestoreResult.PENDING, HiCacheRestoreResult.FAILED)
             and dr.hicache_restore_lock is None
         )
 
@@ -173,11 +174,12 @@ class HiCacheRestoreGatedKVReceiver:
 
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
-        if (
-            poll == KVPoll.Success
-            and self.decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
-        ):
-            return KVPoll.Transferring
+        if poll == KVPoll.Success:
+            restore_status = self.decode_req.hicache_restore_status
+            if restore_status == HiCacheRestoreResult.PENDING:
+                return KVPoll.Transferring
+            if restore_status == HiCacheRestoreResult.FAILED:
+                return KVPoll.Failed
         return poll
 
 

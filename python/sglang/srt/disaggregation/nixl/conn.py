@@ -1761,7 +1761,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            state = self.agent.transfer(xfer_handle)
+            state = self._post_xfer(xfer_handle, notif)
             if state == "ERR":
                 raise Exception("KVSender failed to post prepped transfer")
             return xfer_handle
@@ -1898,7 +1898,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle, notif)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
@@ -2076,7 +2076,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create mixed prepped transfer")
-            state = self.agent.transfer(xfer_handle)
+            state = self._post_xfer(xfer_handle, part_notif)
             if state == "ERR":
                 raise Exception("KVSender failed to post mixed prepped transfer")
             handles.append(xfer_handle)
@@ -2123,7 +2123,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle, notif)
         if state == "ERR":
             raise Exception("KVSender failed to post prepped slice transfer")
         return xfer_handle
@@ -2235,7 +2235,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle, notif)
         if state == "ERR":
             raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
@@ -2370,7 +2370,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle, notif)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
@@ -2424,7 +2424,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create dsa_tail transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle, notif)
         if state == "ERR":
             raise Exception("KVSender failed to post dsa_tail transfer")
         return xfer_handle
@@ -2480,7 +2480,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle, notif)
         if state == "ERR":
             raise Exception("Failed to post Mamba state transfer")
         return xfer_handle
@@ -2610,7 +2610,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state slice transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle, notif)
         if state == "ERR":
             raise Exception("Failed to post Mamba state slice transfer")
         return xfer_handle
@@ -3205,6 +3205,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 raise
 
         threading.Thread(target=bootstrap_thread_guarded).start()
+
+    def _post_xfer(self, handle, notification: str):
+        """#45973: a failed submission is not a proof that writes stopped."""
+        room = int(notification.split("_", 1)[0])
+        try:
+            state = self.agent.transfer(handle)
+        except Exception:
+            self.poison_deferred_ack_room(room)
+            raise
+        if state == "ERR":
+            self.poison_deferred_ack_room(room)
+        return state
 
 
 class NixlKVSender(CommonKVSender):

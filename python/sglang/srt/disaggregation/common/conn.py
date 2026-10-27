@@ -2877,7 +2877,7 @@ class CommonKVReceiver(BaseKVReceiver):
         Unlike abort(), does not overwrite the recorded root cause -- callable
         for an already-Failed room whose failure decode did not initiate."""
         if (
-            not self.abort_notified
+            (not self.abort_notified or (force_arm and self._abort_generation is None))
             and hasattr(self, "bootstrap_infos")
             and self.bootstrap_infos is not None
         ):

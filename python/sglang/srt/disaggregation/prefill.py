@@ -48,6 +48,9 @@ from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_req_state as pd_hidden_state,
 )
 from sglang.srt.disaggregation.utils import (
+    all_reduce_min_flags,
+    DisaggregationCollectiveError,
+    all_reduce_with_timeout,
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     KVClassType,
@@ -175,6 +178,12 @@ def maybe_release_metadata_buffer(
         req: The request object that may have a metadata_buffer_index allocated
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
+    sender = getattr(req, "disagg_kv_sender", None)
+    terminal = getattr(sender, "is_transfer_terminal", None)
+    if terminal is not None and not terminal():
+        raise DisaggregationCollectiveError(
+            "Source metadata is still owned by a transfer"
+        )
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
@@ -229,8 +238,7 @@ def fail_pd_hidden_transfer(req: Req, message: str) -> None:
         return
     kv_mgr = sender.kv_mgr
     room = sender.bootstrap_room
-    kv_mgr.record_failure(room, message)
-    kv_mgr.update_status(room, KVPoll.Failed)
+    kv_mgr.conclude_failure(bootstrap_room=room, failure_reason=message)
     kv_mgr._wake_pd_hidden_ack_waiters(room)
     sender.conclude_state = KVPoll.Failed
 
@@ -777,12 +785,12 @@ class PrefillBootstrapQueue:
             hidden_row_credits -= hidden_cost
 
         ready_tensor = torch.tensor(ready, dtype=torch.uint8, device="cpu")
-        torch.distributed.all_reduce(
+        all_reduce_with_timeout(
             ready_tensor,
             op=torch.distributed.ReduceOp.MIN,
             group=self.scheduler.attn_tp_cpu_group,
         )
-        torch.distributed.all_reduce(
+        all_reduce_with_timeout(
             ready_tensor,
             op=torch.distributed.ReduceOp.MIN,
             group=self.scheduler.attn_cp_cpu_group,
@@ -807,12 +815,12 @@ class PrefillBootstrapQueue:
             dtype=torch.int64,
             device="cpu",
         )
-        torch.distributed.all_reduce(
+        all_reduce_with_timeout(
             prefix_tensor,
             op=torch.distributed.ReduceOp.MAX,
             group=self.scheduler.attn_tp_cpu_group,
         )
-        torch.distributed.all_reduce(
+        all_reduce_with_timeout(
             prefix_tensor,
             op=torch.distributed.ReduceOp.MAX,
             group=self.scheduler.attn_cp_cpu_group,
@@ -1440,7 +1448,7 @@ class SchedulerDisaggregationPrefillMixin:
             state = 2 if batch_result.copy_done.query() else 1
         if self.tp_size > 1:
             batch_result_completion_status.fill_(state)
-            torch.distributed.all_reduce(
+            all_reduce_with_timeout(
                 batch_result_completion_status,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_cpu_group,
@@ -1982,6 +1990,16 @@ class SchedulerDisaggregationPrefillMixin:
             rids = [req.rid for req in self.disagg_prefill_inflight_queue]
             # Empty ranks must participate too, before the variable poll vector.
             preflight(self.tree_cache, 7, (sequence, rids), (len(rids), 0, 0))
+        identities = [
+            f"{req.rid}:{req.bootstrap_room}"
+            for req in self.disagg_prefill_inflight_queue
+        ]
+        all_reduce_min_flags(
+            [1] * len(identities),
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+            request_ids=identities,
+        )
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -1994,11 +2012,55 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
+        not_aborted = all_reduce_min_flags(
+            [
+                int(
+                    poll != KVPoll.Failed
+                    and req.rid not in failed_rids
+                    and not is_aborted(req)
+                )
+                for req, poll in zip(self.disagg_prefill_inflight_queue, polls)
+            ],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+            request_ids=identities,
+        )
+        polls = [
+            poll if alive else KVPoll.Failed for poll, alive in zip(polls, not_aborted)
+        ]
+        local_ready, local_live = self._prefill_cleanup_flags(
+            self.disagg_prefill_inflight_queue, polls
+        )
+        cleanup_ready = all_reduce_min_flags(
+            local_ready,
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+            request_ids=identities,
+        )
+        cleanup_live = all_reduce_min_flags(
+            local_live,
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+            request_ids=identities,
+        )
+        if any(
+            not ready and not live for ready, live in zip(cleanup_ready, cleanup_live)
+        ):
+            raise DisaggregationCollectiveError(
+                "Prefill source drain deadline expired; retaining KV until process exit"
+            )
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        for req, poll, ready in zip(
+            self.disagg_prefill_inflight_queue, polls, cleanup_ready
+        ):
+            if not ready:
+                undone_reqs.append(req)
+                continue
+            if is_aborted(req):
+                poll = KVPoll.Failed
             if transfer_status is not None:
-                consensus_failed = req.rid in failed_rids
+                consensus_failed = req.rid in failed_rids or poll == KVPoll.Failed
                 failure_pending = isinstance(req.finished_reason, FINISH_ABORT)
                 if consensus_failed or failure_pending:
                     if consensus_failed and not failure_pending:
@@ -2117,6 +2179,8 @@ class SchedulerDisaggregationPrefillMixin:
                 ),
             )
 
+        for req in done_reqs:
+            req._pd_cleanup_done = True
         self.disagg_prefill_inflight_queue = undone_reqs
 
         return done_reqs
@@ -2144,7 +2208,8 @@ class SchedulerDisaggregationPrefillMixin:
         if req.finished_reason is None:
             req.finished_reason = FINISH_LENGTH(length=0)
         # unlock the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
+        if req.kv.holds_kv or req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
@@ -2152,6 +2217,7 @@ class SchedulerDisaggregationPrefillMixin:
             )
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
+        req._pd_cleanup_done = True
         return exc
 
     def get_transferred_rids(
@@ -2190,33 +2256,22 @@ class SchedulerDisaggregationPrefillMixin:
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
-    def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
-        """Release an aborted request when its last prefill result is safe."""
+    def _retire_aborted_prefill_result(self, req):
+        """Park every rank's abort until forward and source reads have drained."""
         self.clear_pending_chunk_send(req)
-        owns_resources = (
-            req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
-        )
-        if not owns_resources:
-            # A bootstrap failure or earlier abort already retired it.
+        if getattr(req, "_pd_cleanup_done", False):
             return False
-
+        req.skip_radix_cache_insert = True
+        req.pending_bootstrap = False
+        if self.chunked_req is req:
+            self.chunked_req = None
         sender = req.disagg_kv_sender
         if sender is not None:
-            try:
-                sender.abort()
-            except Exception:
-                # Transport notification is best effort; local ownership must
-                # still be released or the next idle invariant check will fail.
-                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
-
-        if req.to_finish is not None and not req.finished():
-            req.update_finish_state()
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        req.pending_bootstrap = False
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
-        return True
+            sender.abort()
+        if req not in self.disagg_prefill_inflight_queue:
+            self.disagg_prefill_inflight_queue.append(req)
+        # The inflight loop owns the single response and release on every rank.
+        return False
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
@@ -2249,6 +2304,7 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        req._pd_cleanup_done = True
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
@@ -2729,3 +2785,27 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
             self.waiting_queue.insert(0, req)
+
+    def _prefill_cleanup_flags(self, requests, polls):
+        """Retain unknown source ownership, but never wait indefinitely."""
+        ready, live = [], []
+        now = time.monotonic()
+        timeout = max(float(envs.SGLANG_DISAGGREGATION_COLLECTIVE_TIMEOUT.get()), 0.1)
+        for req, poll in zip(requests, polls):
+            sender = req.disagg_kv_sender
+            if poll == KVPoll.Failed:
+                sender.abort()
+            terminal = getattr(sender, "is_transfer_terminal", None)
+            retiring = poll in (KVPoll.Success, KVPoll.Failed)
+            safe = not retiring or (terminal() if terminal is not None else True)
+            if retiring:
+                safe = safe and req.inflight_middle_chunks == 0
+            ready.append(int(safe))
+            if not safe and poll == KVPoll.Failed:
+                started = getattr(req, "_pd_cleanup_started", None)
+                if started is None:
+                    started = req._pd_cleanup_started = now
+                live.append(int(now - started < timeout))
+            else:
+                live.append(1)
+        return ready, live

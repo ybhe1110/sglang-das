@@ -396,6 +396,16 @@ def discard_kv_cache_backup(
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
+    sender = getattr(req, "disagg_kv_sender", None)
+    terminal = getattr(sender, "is_transfer_terminal", None)
+    if terminal is not None and not terminal():
+        from sglang.srt.disaggregation.mooncake.source_drain import (
+            SourceTransferUnresolved,
+        )
+
+        raise SourceTransferUnresolved(
+            "Request KV still has a live or uncertain source transfer"
+        )
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
