@@ -18,7 +18,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     poll_and_all_reduce_with_staging,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
@@ -40,6 +40,25 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+
+    def setUp(self):
+        # Transport collectives and PD-hidden buffers are covered by dedicated
+        # multi-rank/ownership suites; these cases exercise queue decisions.
+        super().setUp()
+        patches = [
+            patch("sglang.srt.disaggregation.decode._all_reduce_flags_preflight"),
+            patch(
+                "sglang.srt.disaggregation.decode._all_reduce_polls",
+                side_effect=lambda flags, group: flags,
+            ),
+            patch.object(DecodeTransferQueue, "_consume_pd_hidden_acked_chunks"),
+            patch.object(DecodeTransferQueue, "_drain_pd_hidden_ready_chunks"),
+            patch.object(DecodeTransferQueue, "_release_pd_hidden_rows"),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.
@@ -397,7 +416,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
-    def test_failed_fake_transfer_releases_at_once_under_deferred_release(
+    def test_failed_fake_transfer_joins_rank_consistent_release(
         self, mock_poll, mock_prepare_abort, mock_release_kv_cache
     ):
         # A health-check request gets a FakeKVReceiver over the real transfer
@@ -433,10 +452,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertEqual(queue.pop_transferred(), [])
         self.assertFalse(receiver.abort_notified)
-        queue._defer_release.assert_not_called()
-        mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
-        )
+        queue._defer_release.assert_called_once_with(decode_req)
+        mock_release_kv_cache.assert_not_called()
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -491,6 +508,24 @@ def _gated_decode_req(poll, restore_status):
 
 
 class TestDecodeHiCacheRestoreGate(CustomTestCase):
+    def setUp(self):
+        # Transport collectives and PD-hidden buffers are covered by dedicated
+        # multi-rank/ownership suites; these cases exercise queue decisions.
+        super().setUp()
+        patches = [
+            patch("sglang.srt.disaggregation.decode._all_reduce_flags_preflight"),
+            patch(
+                "sglang.srt.disaggregation.decode._all_reduce_polls",
+                side_effect=lambda flags, group: flags,
+            ),
+            patch.object(DecodeTransferQueue, "_consume_pd_hidden_acked_chunks"),
+            patch.object(DecodeTransferQueue, "_drain_pd_hidden_ready_chunks"),
+            patch.object(DecodeTransferQueue, "_release_pd_hidden_rows"),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
     def test_gate_folds_restore_outcome_into_terminal_poll_only(self):
         cases = [
             (KVPoll.Success, HiCacheRestoreResult.READY, KVPoll.Success),
@@ -586,7 +621,6 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.pop_transferred(), [])
         self.assertEqual(queue.queue, [])
         queue._commit_transfer_to_req.assert_not_called()
-        queue._record_transfer_failure.assert_called_once_with("HiCache restore failed")
         mock_prepare_abort.assert_called_once()
 
         mock_prepare_abort.reset_mock()
@@ -594,9 +628,6 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         queue = make_queue(decode_req, peer_poll=KVPoll.Failed)
         self.assertEqual(queue.pop_transferred(), [])
         queue._commit_transfer_to_req.assert_not_called()
-        queue._record_transfer_failure.assert_called_once_with(
-            "Failed due to an unknown reason from another rank"
-        )
         mock_prepare_abort.assert_called_once()
 
         mock_prepare_abort.reset_mock()

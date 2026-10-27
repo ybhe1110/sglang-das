@@ -14,10 +14,9 @@ class SourceTransferTimeout(TimeoutError):
     """The caller deadline expired while the native source operation was active.
 
     A timeout does not cancel the native call.  The operation's hazard is kept
-    until the detached call returns so callers can quarantine the source
+    until the detached call succeeds so callers can quarantine the source
     buffers instead of releasing memory while RDMA may still be writing it.
     """
-
 
 class _SourceOp:
     def __init__(self, token, room, generation, chunk, queue):
@@ -105,7 +104,21 @@ class SourceDrainTracker:
 
     @staticmethod
     def _safe(op):
-        return not op.hazards and all(f.done() for f in op.futures)
+        # A failed Future proves only that the Python task returned, not that
+        # the native transport stopped accessing its source/destination buffers.
+        return not op.hazards and all(
+            f.done() and (f.cancelled() or f.exception() is None) for f in op.futures
+        )
+
+    def chunk_accesses_quiesced(self, chunk):
+        """Whether this chunk's buffers can be returned by a component owner.
+
+        Unlike room terminal, this permits a completed component to be freed
+        while the worker still owns the chunk, but never after an unknown DMA.
+        """
+        with self.lock:
+            op = self._op(chunk)
+            return op is not None and self._safe(op)
 
     def park(self, chunk):
         with self.lock:
@@ -152,7 +165,7 @@ class SourceDrainTracker:
             return True
 
     def run(self, fn, *args, success=None):
-        """Track a synchronous call whose invocation has returned."""
+        """Retire a native hazard only after a successful completion proof."""
         op = getattr(self._context, "op", None)
         if op is None:
             raise RuntimeError("Source access outside a tracked transfer")
@@ -161,12 +174,17 @@ class SourceDrainTracker:
             op.hazards.add(hazard)
         try:
             result = fn(*args)
-        finally:
+            if success is not None and not success(result):
+                raise SourceTransferUnresolved("Synchronous transfer did not complete")
+        except BaseException:
             with self.lock:
-                op.hazards.discard(hazard)
+                self.poison(op.room, op.generation)
+                op.state = "unresolved"
                 self._condition.notify_all()
-        if success is not None and not success(result):
-            raise SourceTransferUnresolved("Synchronous transfer did not complete")
+            raise
+        with self.lock:
+            op.hazards.discard(hazard)
+            self._condition.notify_all()
         return result
 
     def run_with_deadline(self, fn, *args, timeout_s, success=None):
@@ -177,7 +195,7 @@ class SourceDrainTracker:
         broken transport or CQ path that ignores that deadline.  Python cannot
         safely kill a thread executing a native RDMA call, so a timed-out call
         is deliberately detached.  Its hazard remains active until the call
-        returns, which makes ``terminal``/``forget`` retain the source buffers
+        returns successfully, which makes ``terminal``/``forget`` retain the source buffers
         and lets the scheduler quarantine the request safely.
         """
         op = getattr(self._context, "op", None)
@@ -195,13 +213,23 @@ class SourceDrainTracker:
         def invoke():
             try:
                 result = fn(*args)
+                if success is not None and not success(result):
+                    raise SourceTransferUnresolved(
+                        "Synchronous transfer did not complete"
+                    )
             except BaseException as exc:
+                # Preserve the hazard even after the thread exits. #43719:
+                # a Mooncake failure may leave native writes outstanding.
+                with self.lock:
+                    self.poison(op.room, op.generation)
+                    op.state = "unresolved"
                 future.set_exception(exc)
             else:
+                with self.lock:
+                    op.hazards.discard(hazard)
                 future.set_result(result)
             finally:
                 with self.lock:
-                    op.hazards.discard(hazard)
                     self._condition.notify_all()
                 # This may complete an unresolved operation after the caller
                 # has already quarantined its request.

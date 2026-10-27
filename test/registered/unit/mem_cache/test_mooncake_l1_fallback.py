@@ -923,7 +923,8 @@ class TestLinkerFallback(unittest.TestCase):
         cls.body = [
             n
             for n in cls.body
-            if isinstance(n, ast.FunctionDef) and n.name in ("match", "load_back")
+            if isinstance(n, ast.FunctionDef)
+            and n.name in ("match", "load_back", "_raise_if_cleanup_quarantined")
         ]
         module = ast.Module(
             body=[
@@ -956,6 +957,13 @@ class TestLinkerFallback(unittest.TestCase):
                 empty_match_result=SimpleNamespace(device_indices=[])
             ),
         )
+        # This suite isolates fallback; rank identity/geometry has a dedicated
+        # production-preflight regression suite.
+        wrapper._match_preflight = Mock(
+            side_effect=lambda rid, **kw: (kw["local_valid"], kw["tail_pages"])
+        )
+        wrapper._abort_component_transfers = Mock()
+        wrapper._clear_private_slot_ownership = Mock()
         wrapper._tail_hashes = Mock(return_value=["key"])
         wrapper._sync_restorable_prefix = Mock(return_value=0)
         wrapper._update_load = Mock()
@@ -1002,8 +1010,9 @@ class TestLinkerFallback(unittest.TestCase):
         self.assertEqual(wrapper.load_back(req), ([], 5))
         self.assertFalse(wrapper.hit_markers)
         wrapper._queue_load.assert_not_called()
-        wrapper._update_load.assert_called_once()
-        self.assertEqual(wrapper._update_load.call_args.args[0], "abort")
+        wrapper._abort_component_transfers.assert_called_once()
+        self.assertEqual(wrapper._abort_component_transfers.call_args.args[2:], (2, 3))
+        wrapper._clear_private_slot_ownership.assert_called_once_with(req)
         self.assertFalse(linker.pending_loads)
 
     def test_disabled_fallback_keeps_lookup_exception_visible(self):

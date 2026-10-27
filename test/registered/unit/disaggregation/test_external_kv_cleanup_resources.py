@@ -184,7 +184,7 @@ class TestResourceCleanup(unittest.TestCase):
 
         pool = SimpleNamespace(free_slots=[], req_to_token=Slots())
         pool.free = lambda req, free=env["free"]: free(pool, req)
-        allocator = SimpleNamespace(page_size=1, free=Mock(), free_segment=Mock())
+        allocator = SimpleNamespace(page_size=1, free=Mock(), free_segments=Mock())
         # Execute ChunkCache.cache_finished_req itself, not a mock of that action.
         chunk_tree = ast.parse(
             (ROOT / "python/sglang/srt/mem_cache/chunk_cache.py").read_text(
@@ -233,6 +233,7 @@ class TestResourceCleanup(unittest.TestCase):
                 "_release_aborted_kv_cache",
                 "_release_overallocated_kv_indices",
                 "_release_donated_swa_slots",
+                "_request_kv_segments_excluding_released_private",
             ],
             env,
         )
@@ -241,7 +242,7 @@ class TestResourceCleanup(unittest.TestCase):
 
     def test_cache_success_then_tail_retry_skips_actual_chunk_cache_free(self):
         release = self.setup_kv()
-        self.token_allocator.free_segment.side_effect = [
+        self.token_allocator.free_segments.side_effect = [
             cleanup.RetryableCleanupError("before tail free"),
             None,
         ]
@@ -250,7 +251,7 @@ class TestResourceCleanup(unittest.TestCase):
         self.token_allocator.free.assert_called_once_with([10, 11])
         release(self.req, self.cache, is_insert=False)
         self.token_allocator.free.assert_called_once()
-        self.assertEqual(self.token_allocator.free_segment.call_count, 2)
+        self.assertEqual(self.token_allocator.free_segments.call_count, 2)
         self.assertEqual(self.cache.req_to_token_pool.free_slots, [1])
         self.assertIsNone(self.req.kv)
 
@@ -268,7 +269,7 @@ class TestResourceCleanup(unittest.TestCase):
         with self.assertRaises(cleanup.CleanupOutcomeUnknown):
             release(self.req, self.cache, is_insert=False)
         self.assertEqual(returned, [10])
-        self.token_allocator.free_segment.assert_not_called()
+        self.token_allocator.free_segments.assert_not_called()
         self.assertEqual(self.cache.req_to_token_pool.free_slots, [])
 
     def test_request_slot_returned_then_exception_never_duplicates_free_slot(self):
@@ -287,7 +288,7 @@ class TestResourceCleanup(unittest.TestCase):
             release(self.req, self.cache, is_insert=False)
         self.assertEqual(self.cache.req_to_token_pool.free_slots, [1])
         self.token_allocator.free.assert_called_once()
-        self.token_allocator.free_segment.assert_called_once()
+        self.token_allocator.free_segments.assert_called_once()
         self.assertIsNotNone(self.req.kv)
 
 

@@ -51,8 +51,12 @@ class Reason:
         return vars(self).copy()
 
 
-def load_methods(path, names, env):
+def load_methods(path, names, env, class_name=None):
     tree = ast.parse(path.read_text(encoding="utf-8"))
+    if class_name is not None:
+        tree = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name
+        )
     methods = []
     for name in names:
         matches = [
@@ -434,7 +438,7 @@ class TestSourceDrain(unittest.TestCase):
         self.tracker.poison(7)
         self.assertFalse(self.tracker.drained(7))
 
-    def test_sync_exception_releases_hazard_after_call_returns(self):
+    def test_sync_exception_retains_native_hazard_after_call_returns(self):
         queue = Mock()
         self.tracker.publish(self.chunk, queue, lambda: True)
         self.tracker.begin(self.chunk)
@@ -443,9 +447,10 @@ class TestSourceDrain(unittest.TestCase):
                 lambda: (_ for _ in ()).throw(RuntimeError("sync failure"))
             )
         self.tracker.mark_unresolved(self.chunk)
-        self.assertTrue(self.tracker.finish_quiesced(self.chunk))
+        self.assertFalse(self.tracker.finish_quiesced(self.chunk))
         self.tracker.poison(7)
-        self.assertTrue(self.tracker.terminal(7))
+        self.assertFalse(self.tracker.terminal(7))
+        self.assertFalse(self.tracker.forget(7))
 
     def test_watchdog_detaches_native_call_and_retains_hazard_until_return(self):
         queue = Mock()
@@ -507,7 +512,7 @@ class TestSourceDrain(unittest.TestCase):
         self.assertTrue(self.tracker.shutdown(timeout_s=1.0) == [])
         self.assertFalse(self.tracker._generations)
 
-    def test_failed_future_completion_releases_hazard(self):
+    def test_failed_future_completion_does_not_prove_native_drain(self):
         queue = Mock()
         self.tracker.publish(self.chunk, queue, lambda: True)
         self.tracker.begin(self.chunk)
@@ -519,7 +524,7 @@ class TestSourceDrain(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 future.result()
         self.tracker.mark_unresolved(self.chunk)
-        self.assertTrue(self.tracker.finish_quiesced(self.chunk))
+        self.assertFalse(self.tracker.finish_quiesced(self.chunk))
 
     def test_rejected_submit_does_not_leave_submission_hazard(self):
         class RejectingExecutor:
@@ -557,7 +562,7 @@ class TestSourceDrain(unittest.TestCase):
 
         cls = load_methods(
             CONN,
-            ["transfer_worker"],
+            ["transfer_worker", "_complete_source_chunk"],
             dict(KVPoll=KVPoll, logger=Mock(), concurrent=concurrent),
         )
         mgr = cls()
@@ -603,6 +608,7 @@ class TestSourceDrain(unittest.TestCase):
         mgr._source_drain = Mock()
         mgr._source_drain.worker_failed.return_value = {(7, 1), (8, 2)}
         mgr.request_status = {7: KVPoll.Transferring, 8: KVPoll.Failed}
+        mgr.poison_deferred_ack_room = Mock()
         mgr.conclude_failure = Mock()
         with self.assertRaises(StopWorker):
             mgr._run_transfer_worker(Mock(), Mock())
@@ -690,7 +696,9 @@ class TestTransferWorkerFailure(unittest.TestCase):
         mgr.enable_deferred_decode_kv_release = False
         mgr._wake_pd_hidden_ack_waiters = Mock()
         mgr._has_pd_hidden_state = Mock(return_value=False)
+        mgr.poison_deferred_ack_room = Mock()
         mgr.record_failure = Mock()
+        mgr.poison_deferred_ack_room = Mock()
         mgr.conclude_failure = Mock()
         mgr.update_status = Mock()
         chunk = SimpleNamespace(

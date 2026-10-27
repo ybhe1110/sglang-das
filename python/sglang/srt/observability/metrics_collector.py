@@ -518,7 +518,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:num_decode_deferred_kv_release_reqs",
             documentation=(
                 "The number of failed decode requests whose KV allocations are "
-                "held pending transfer drain acknowledgement or timeout."
+                "held pending drain acknowledgement, including quarantined releases."
             ),
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",

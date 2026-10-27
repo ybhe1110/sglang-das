@@ -120,6 +120,8 @@ class KVPoll:
 class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
+    supports_deferred_decode_kv_release: bool = False
+
     enable_deferred_decode_kv_release: bool = False
 
     @abstractmethod

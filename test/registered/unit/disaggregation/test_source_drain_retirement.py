@@ -17,8 +17,8 @@ from test_external_kv_abort_drain import (
     load_methods,
 )
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+register_cpu_ci = abort_drain_tests.register_cpu_ci
+CustomTestCase = unittest.TestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

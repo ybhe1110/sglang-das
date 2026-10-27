@@ -231,7 +231,7 @@ class DecodeKVCacheOffloadManager:
             dtype=torch.int,
         )
         if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
+            all_reduce_with_timeout(
                 pending, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
             )
         if pending.item():

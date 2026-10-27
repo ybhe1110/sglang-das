@@ -8,7 +8,11 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
-from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
+from sglang.srt.disaggregation.common.conn import (
+    AckTarget,
+    CommonKVManager,
+    CommonKVSender,
+)
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
@@ -55,8 +59,12 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+
     def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
         manager = object.__new__(MooncakeKVManager)
+        manager._maybe_ack_drained_abort = (
+            CommonKVManager._maybe_ack_drained_abort.__get__(manager)
+        )
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
         target = AckTarget("127.0.0.1", 1234, 7)
@@ -69,7 +77,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager._deferred_ack_targets = {42: {(target.ip, target.port): target}}
                 manager._deferred_ack_poisoned_rooms = set()
                 with patch.object(manager, "_send_abort_ack") as ack:
-                    sender.clear()
+                    CommonKVSender.clear(sender)
                     if outstanding:
                         ack.assert_not_called()
                         manager._staging_outstanding[42] = 0

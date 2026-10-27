@@ -2489,8 +2489,11 @@ class SchedulerDisaggregationPrefillMixin:
         if req not in self.disagg_prefill_inflight_queue:
             self.disagg_prefill_inflight_queue.append(req)
         self.abort_external_kv_request(
-            req, forward_drained=False, sender_terminal=False,
-            is_insert=False, emit_response=False,
+            req,
+            forward_drained=False,
+            sender_terminal=False,
+            is_insert=False,
+            emit_response=False,
         )
         # The inflight/chunked cleanup owner emits exactly one response.
         return False

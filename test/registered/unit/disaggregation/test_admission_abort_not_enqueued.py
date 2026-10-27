@@ -160,11 +160,11 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     "Aborted by AbortReq.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
                 # release_req already freed the KV row.
-                self.assertFalse(req.kv.holds_kv)
+                self.assertIsNone(req.req_pool_idx)
                 if marker == "metadata_buffer_index":
                     req.metadata_buffer_index = 7
                 else:
-                    req.kv.retraction_backup = object()
+                    req.retraction_backup = object()
                 self.assertFalse(is_unadmitted_reject(req))
 
                 sched = _make_scheduler()
@@ -197,10 +197,10 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                         "Aborted by AbortReq.", HTTPStatus.SERVICE_UNAVAILABLE
                     )
                     # Exactly what retract_decode leaves behind.
-                    self.assertFalse(req.kv.holds_kv)
-                    self.assertFalse(req.kv.holds_mamba)
+                    self.assertIsNone(req.req_pool_idx)
+                    self.assertIsNone(req.mamba_pool_idx)
                     self.assertEqual(req.metadata_buffer_index, -1)
-                    req.kv.retraction_backup = backup
+                    req.retraction_backup = backup
 
                     sched = _make_scheduler()
                     q = _decode_queue(sched)
@@ -228,8 +228,8 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 )
                 req.is_retracted = True
                 # Exactly what a short preemption leaves behind.
-                self.assertFalse(req.kv.holds_kv)
-                self.assertIsNone(req.kv.retraction_backup)
+                self.assertIsNone(req.req_pool_idx)
+                self.assertIsNone(req.retraction_backup)
                 self.assertEqual(req.metadata_buffer_index, -1)
                 self.assertFalse(is_unadmitted_reject(req))
 
@@ -298,7 +298,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
 
         # PREFILL arms the cache's paced-retry set via `_prefetch_kvcache`
         # before the door, and only this call clears it again.
-        sched._release_aborted_request.assert_called_once_with(req)
+        sched._release_aborted_request.assert_called_once_with(req.rid)
         session.abort_req.assert_called_once()
         self.assertIsNone(req.session)
         sched.beam_coordinator.retire_group.assert_called_once_with(req)

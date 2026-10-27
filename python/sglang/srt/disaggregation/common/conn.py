@@ -2196,9 +2196,6 @@ class CommonKVSender(BaseKVSender):
                 self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
             else:
                 self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
-                self.kv_mgr._deferred_ack_fanout_snapshots.pop(
-                    self.bootstrap_room, None
-                )
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -2447,13 +2444,7 @@ class CommonKVReceiver(BaseKVReceiver):
             f"in KVPoll.WaitingForInput",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        if (
-            not self.abort_notified
-            and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
-        ):
-            self._send_abort_notification()
-            self.abort_notified = True
+        self.ensure_abort_notified()
         return KVPoll.Failed
 
     def clear(self) -> None:
@@ -2478,7 +2469,7 @@ class CommonKVReceiver(BaseKVReceiver):
         Unlike abort(), does not overwrite the recorded root cause -- callable
         for an already-Failed room whose failure decode did not initiate."""
         if (
-            not self.abort_notified
+            (not self.abort_notified or (force_arm and self._abort_generation is None))
             and hasattr(self, "bootstrap_infos")
             and self.bootstrap_infos is not None
         ):
