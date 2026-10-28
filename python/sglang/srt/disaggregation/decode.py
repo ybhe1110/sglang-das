@@ -3577,6 +3577,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "instead of reusing memory without a native fence: "
                 + ",".join(entry[0].req.rid for entry in expired)
             )
+        for entry, done in zip(entries, ready):
+            if not done:
+                entry[0].kv_receiver.retry_abort_notification()
         to_release = [entry for entry, done in zip(entries, ready) if done]
         self._deferred_releases = [
             entry for entry, done in zip(entries, ready) if not done

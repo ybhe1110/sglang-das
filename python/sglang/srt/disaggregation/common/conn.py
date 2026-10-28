@@ -417,6 +417,7 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
         self._deferred_ack_targets: Dict[int, Dict[Tuple[str, int], AckTarget]] = {}
+        self._abort_ack_lock = threading.RLock()
         # A poisoned room has a permanently outstanding transfer whose backend
         # can no longer prove quiescent. A new room lifecycle clears this state.
         self._deferred_ack_poisoned_rooms: Set[int] = set()
@@ -577,9 +578,10 @@ class CommonKVManager(BaseKVManager):
             if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
                 # A new room lifecycle drops deferred-ACK state left by the
                 # previous request that used this bootstrap_room.
-                self._deferred_ack_targets.pop(bootstrap_room, None)
-                self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
-                self._staging_outstanding.pop(bootstrap_room, None)
+                with self._abort_ack_lock:
+                    self._deferred_ack_targets.pop(bootstrap_room, None)
+                    self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
+                    self._staging_outstanding.pop(bootstrap_room, None)
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
@@ -799,10 +801,11 @@ class CommonKVManager(BaseKVManager):
             prefill_rank,
         )
 
-    def register_deferred_abort_room(self, bootstrap_room: int) -> int:
+    def register_deferred_abort_room(self, bootstrap_room: int, generation=None) -> int:
         """Arm a new generation for a held room and return its wire id."""
         self._deferred_abort_generation += 1
-        generation = self._deferred_abort_generation
+        if generation is None:
+            generation = self._deferred_abort_generation
         self._deferred_abort_ack_tracker[bootstrap_room] = DeferredAbortAckState(
             generation=generation,
             prefill_ranks=set(),
@@ -852,7 +855,7 @@ class CommonKVManager(BaseKVManager):
             + self.attn_cp_rank
         )
 
-    def _send_abort_ack(self, room: int, target: AckTarget) -> None:
+    def _send_abort_ack(self, room: int, target: AckTarget) -> bool:
         """Best-effort ack that this rank's transfer for an aborted room drained."""
         try:
             na = NetworkAddress(target.ip, target.port)
@@ -860,28 +863,65 @@ class CommonKVManager(BaseKVManager):
                 na.to_tcp(),
                 AbortAck(room, self._prefill_unique_rank(), target.generation).to_zmq(),
                 is_ipv6=na.is_ipv6,
+                flags=zmq.DONTWAIT,
             )
+            return True
         except Exception as e:
-            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+            logger.warning(
+                "Failed to send drained ABORT_ACK room=%s generation=%s target=%s:%s; "
+                "retaining target for retry: %s",
+                room,
+                target.generation,
+                target.ip,
+                target.port,
+                e,
+            )
+            return False
+
+    def _collect_drained_abort_targets(self, room: int):
+        # Snapshot ownership only; network IO must not hold this lock or the
+        # backend source-drain lock.
+        with self._abort_ack_lock:
+            if self._staging_outstanding.get(room, 0) > 0:
+                return {}
+            if room in self._deferred_ack_poisoned_rooms:
+                return {}
+            return dict(self._deferred_ack_targets.get(room, {}))
 
     def _maybe_ack_drained_abort(self, room: int) -> None:
-        """Send the deferred ack once an aborted room's chunks have drained
-        (outstanding == 0). pop() makes it fire at most once."""
-        if self._staging_outstanding.get(room, 0) > 0:
+        targets = self._collect_drained_abort_targets(room)
+        if not targets:
             return
-        if room in self._deferred_ack_poisoned_rooms:
-            # A target registered concurrently with the poison must not fire.
-            self._deferred_ack_targets.pop(room, None)
-            return
-        self._send_abort_acks(room, self._deferred_ack_targets.pop(room, None))
+        remaining = self._send_abort_acks(room, targets)
+        with self._abort_ack_lock:
+            current = self._deferred_ack_targets.get(room)
+            if current is None:
+                return
+            for endpoint, target in targets.items():
+                # A concurrent registration owns a fresh notification, even
+                # when endpoint and generation compare equal.
+                if endpoint not in remaining and current.get(endpoint) is target:
+                    del current[endpoint]
+            if not current:
+                self._deferred_ack_targets.pop(room, None)
 
     def _send_abort_acks(
         self, room: int, targets: Optional[Dict[Tuple[str, int], AckTarget]]
-    ) -> None:
+    ) -> Dict[Tuple[str, int], AckTarget]:
         # With prefill TP < decode TP several decode ranks share one room and
         # each sends its own ABORT; fan the ACK out to every one of them.
-        for target in (targets or {}).values():
-            self._send_abort_ack(room, target)
+        remaining = {}
+        for endpoint, target in (targets or {}).items():
+            try:
+                sent = self._send_abort_ack(room, target)
+            except Exception:
+                # Backend dispatch bugs must not kill the bootstrap or transfer
+                # worker, nor discard the only record of an unsent ACK.
+                logger.exception("Abort ACK dispatch failed for room %s", room)
+                sent = False
+            if sent is not True:
+                remaining[endpoint] = target
+        return remaining
 
     def register_deferred_ack_target(self, room: int, target: AckTarget) -> None:
         """Hold this generation's ACK until the room's transfer drains.
@@ -891,20 +931,18 @@ class CommonKVManager(BaseKVManager):
         must mark the room Failed before registering so no new chunk can be
         accepted after the ACK is sent.
         """
-        if room in self._deferred_ack_poisoned_rooms:
-            return
-        # Replace instead of mutating in place: a concurrent drain pops the dict
-        # and iterates it. If the pop wins, the caller's immediate
-        # _maybe_ack_drained_abort retry re-sends the merged set, and a
-        # duplicate ACK is harmless because decode records ACKs in a set.
-        targets = dict(self._deferred_ack_targets.get(room, ()))
-        targets[(target.ip, target.port)] = target
-        self._deferred_ack_targets[room] = targets
+        with self._abort_ack_lock:
+            if room in self._deferred_ack_poisoned_rooms:
+                return
+            self._deferred_ack_targets.setdefault(room, {})[
+                (target.ip, target.port)
+            ] = target
 
     def poison_deferred_ack_room(self, room: int) -> None:
         """Drop an ACK target when the backend cannot prove the room drained."""
-        self._deferred_ack_targets.pop(room, None)
-        self._deferred_ack_poisoned_rooms.add(room)
+        with self._abort_ack_lock:
+            self._deferred_ack_targets.pop(room, None)
+            self._deferred_ack_poisoned_rooms.add(room)
 
     def validate_remote_state_transfer_abis(
         self,
@@ -1361,8 +1399,10 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    def _connect(self, endpoint: str, is_ipv6: bool = False):
-        with self._socket_lock:
+    def _connect(self, endpoint: str, is_ipv6: bool = False, *, nonblocking=False):
+        if not self._socket_lock.acquire(blocking=not nonblocking):
+            raise BlockingIOError("Control socket cache is busy")
+        try:
             sock = self._socket_cache.get(endpoint)
             if sock is not None:
                 monitor = self._monitor_cache.get(endpoint)
@@ -1377,11 +1417,17 @@ class CommonKVManager(BaseKVManager):
                         disconnected = True
                 if not disconnected:
                     return sock
-                sock.close(linger=0)
-                if monitor is not None:
-                    monitor.close()
-                self._socket_cache.pop(endpoint, None)
-                self._monitor_cache.pop(endpoint, None)
+                send_lock = self._socket_send_locks[endpoint]
+                if not send_lock.acquire(blocking=not nonblocking):
+                    raise BlockingIOError("Control socket reconnect is busy")
+                try:
+                    sock.close(linger=0)
+                    if monitor is not None:
+                        monitor.close()
+                    self._socket_cache.pop(endpoint, None)
+                    self._monitor_cache.pop(endpoint, None)
+                finally:
+                    send_lock.release()
 
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
@@ -1400,15 +1446,30 @@ class CommonKVManager(BaseKVManager):
             )
             self._socket_send_locks.setdefault(endpoint, threading.Lock())
             return sock
+        finally:
+            self._socket_lock.release()
 
     def _send_multipart_locked(
-        self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
+        self,
+        endpoint: str,
+        parts: List[bytes],
+        is_ipv6: bool = False,
+        *,
+        flags: int = 0,
     ):
         # Cached sockets are shared across sender threads and zmq sockets are
         # not thread-safe; serialize sends per endpoint.
-        sock = self._connect(endpoint, is_ipv6=is_ipv6)
-        with self._socket_send_locks[endpoint]:
-            sock.send_multipart(parts)
+        nonblocking = bool(flags & zmq.DONTWAIT)
+        sock = self._connect(endpoint, is_ipv6=is_ipv6, nonblocking=nonblocking)
+        lock = self._socket_send_locks[endpoint]
+        if not lock.acquire(blocking=not nonblocking):
+            raise BlockingIOError("Control socket send is busy")
+        try:
+            if self._socket_cache.get(endpoint) is not sock:
+                raise BlockingIOError("Control socket changed before send")
+            sock.send_multipart(parts, flags=flags)
+        finally:
+            lock.release()
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -2193,7 +2254,10 @@ class CommonKVSender(BaseKVSender):
             if hasattr(self.kv_mgr, "_staging_outstanding"):
                 # Preserve the target until in-flight writes drain, even when
                 # the scheduler has already observed Failed and cleared the room.
-                self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+                # Mooncake clear/forget holds the source lock. Its worker or
+                # the next decode retry sends the ACK outside that lock.
+                if not hasattr(self.kv_mgr, "_source_drain"):
+                    self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
             else:
                 self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
@@ -2227,6 +2291,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
         self._abort_generation: Optional[int] = None
+        self._last_abort_notification_time: Optional[float] = None
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
@@ -2375,8 +2440,10 @@ class CommonKVReceiver(BaseKVReceiver):
             return {}
 
     @classmethod
-    def _connect(cls, endpoint: str, is_ipv6: bool = False):
-        with cls._global_lock:
+    def _connect(cls, endpoint: str, is_ipv6: bool = False, *, nonblocking=False):
+        if not cls._global_lock.acquire(blocking=not nonblocking):
+            raise BlockingIOError("Bootstrap socket cache is busy")
+        try:
             if endpoint not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
@@ -2393,6 +2460,8 @@ class CommonKVReceiver(BaseKVReceiver):
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+        finally:
+            cls._global_lock.release()
 
     @classmethod
     def disconnect_endpoint(cls, endpoint: str):
@@ -2408,11 +2477,13 @@ class CommonKVReceiver(BaseKVReceiver):
             logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
-    def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
+    def _connect_to_bootstrap_server(cls, bootstrap_info: dict, *, nonblocking=False):
         ip_address = bootstrap_info["rank_ip"]
         port = bootstrap_info["rank_port"]
         na = NetworkAddress(ip_address, port)
-        sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
+        sock, lock = cls._connect(
+            na.to_tcp(), is_ipv6=na.is_ipv6, nonblocking=nonblocking
+        )
         return sock, lock
 
     def _register_kv_args(self) -> bool:
@@ -2485,25 +2556,36 @@ class CommonKVReceiver(BaseKVReceiver):
         # unarmed -- except on a partial publish, where init_time is still None
         # but earlier ranks already hold destinations; those callers defer and
         # pass force_arm.
-        if self.kv_mgr.enable_deferred_decode_kv_release and (
-            force_arm or self.init_time is not None
+        if (
+            self._abort_generation is None
+            and self.kv_mgr.enable_deferred_decode_kv_release
+            and (force_arm or self.init_time is not None)
         ):
             self._abort_generation = self.kv_mgr.register_deferred_abort_room(
-                self.bootstrap_room
+                self.bootstrap_room,
+                generation=getattr(self, "_transfer_generation", None),
             )
+        self._last_abort_notification_time = time.monotonic()
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:
-                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
+                sock, lock = self._connect_to_bootstrap_server(
+                    bootstrap_info, nonblocking=True
+                )
+                if not lock.acquire(blocking=False):
+                    continue
+                try:
                     sock.send_multipart(
                         AbortNotification(
                             room=self.bootstrap_room,
                             decode_ip=self.kv_mgr.local_ip,
                             decode_port=self.kv_mgr.rank_port,
                             generation=self._abort_generation,
-                        ).to_zmq()
+                        ).to_zmq(),
+                        flags=zmq.DONTWAIT,
                     )
+                finally:
+                    lock.release()
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
@@ -2512,6 +2594,19 @@ class CommonKVReceiver(BaseKVReceiver):
                 logger.debug(
                     f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
                 )
+
+    def retry_abort_notification(self) -> None:
+        """Repair lost ABORT/ACK messages without rearming or extending the hold.
+
+        Called only while decode still owns the deferred destination. Repeating
+        the same generation preserves ACKs already received from other ranks.
+        """
+        if self._abort_generation is None:
+            return
+        previous = self._last_abort_notification_time
+        if previous is not None and time.monotonic() - previous < 1.0:
+            return
+        self._send_abort_notification(force_arm=True)
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
