@@ -1,6 +1,7 @@
 """Retired senders stay terminal without touching a reused room (CPU only)."""
 
 import ast
+from collections import OrderedDict
 import threading
 import unittest
 from types import SimpleNamespace
@@ -72,11 +73,19 @@ def make_sender():
     )
     manager_cls = load_methods(
         CONN,
-        ["source_transfers_terminal", "source_transfers_drained"],
+        [
+            "source_transfers_terminal",
+            "source_transfers_drained",
+            "_retire_abort_binding",
+        ],
         dict(KVPoll=KVPoll),
     )
     mgr = manager_cls()
     mgr._source_drain = SourceDrainTracker()
+    mgr._abort_room_bindings = {}
+    mgr._retired_abort_rooms = OrderedDict()
+    mgr._abort_ack_lock = threading.RLock()
+    mgr._deferred_ack_targets = {}
     mgr.request_status = {7: KVPoll.Transferring}
     mgr.record_failure = Mock()
     mgr._wake_pd_hidden_ack_waiters = Mock()
@@ -212,10 +221,9 @@ class TestSourceDrainRetirement(CustomTestCase):
 
             fixture.env.update(
                 all_reduce_min_flags=reduce,
-                poll_and_all_reduce_attn_cp_tp_group=lambda senders, *args: [
-                    KVPoll.Failed
-                ]
-                * len(senders),
+                poll_and_all_reduce_attn_cp_tp_group=lambda senders, *args: (
+                    [KVPoll.Failed] * len(senders)
+                ),
                 _QuarantinedKVSender=lambda: None,
             )
             queue_cls = load_methods(
