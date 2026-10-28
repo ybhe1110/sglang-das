@@ -48,7 +48,7 @@ from fastapi import BackgroundTasks
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
@@ -1365,6 +1365,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
+            if (
+                self.disaggregation_mode
+                in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE)
+                and get_disagg().disaggregation_transfer_backend == "mooncake"
+                and envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+                and obj.bootstrap_host != FAKE_BOOTSTRAP_HOST
+                and not (
+                    isinstance(obj.bootstrap_pair_key, str)
+                    and 0 < len(obj.bootstrap_pair_key) <= 128
+                    and obj.bootstrap_pair_key.isascii()
+                )
+            ):
+                raise ValueError(
+                    "Mooncake P/D requires bootstrap_pair_key shared by both requests; "
+                    "upgrade the router or supply a fresh pair key for each bootstrap attempt"
+                )
             bootstrap_room = obj.bootstrap_room
             if (
                 bootstrap_room is None
@@ -1390,6 +1406,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                bootstrap_pair_key=obj.bootstrap_pair_key,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,

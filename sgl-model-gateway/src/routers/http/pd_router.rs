@@ -248,10 +248,12 @@ impl PDRouter {
             let mut hosts = Vec::with_capacity(n);
             let mut ports = Vec::with_capacity(n);
             let mut rooms = Vec::with_capacity(n);
+            let mut pair_keys = Vec::with_capacity(n);
             for _ in 0..n {
                 hosts.push(prefill_worker.bootstrap_host());
                 ports.push(prefill_worker.bootstrap_port());
                 rooms.push(super::pd_types::generate_room_id());
+                pair_keys.push(uuid::Uuid::new_v4().to_string());
             }
             // Use static string keys to avoid per-request allocations
             obj.insert(
@@ -274,6 +276,10 @@ impl PDRouter {
                 Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::Array(rooms.into_iter().map(Value::from).collect()),
             );
+            obj.insert(
+                "bootstrap_pair_key".to_string(),
+                Value::Array(pair_keys.into_iter().map(Value::from).collect()),
+            );
         } else {
             // Use static string keys to avoid per-request allocations
             obj.insert(
@@ -290,6 +296,10 @@ impl PDRouter {
             obj.insert(
                 Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::from(super::pd_types::generate_room_id()),
+            );
+            obj.insert(
+                "bootstrap_pair_key".to_string(),
+                Value::from(uuid::Uuid::new_v4().to_string()),
             );
         }
         Ok(original)
@@ -1868,6 +1878,7 @@ mod tests {
             "bootstrap_host": "prefill",
             "bootstrap_port": 8998,
             "bootstrap_room": 1234,
+            "bootstrap_pair_key": "independent-pair-identity",
         });
 
         let (prefill_request, decode_request) =
@@ -1889,8 +1900,29 @@ mod tests {
         assert_eq!(decode_request.body["data_parallel_rank"], 1);
         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
         assert_eq!(decode_request.body["bootstrap_room"], 1234);
+        assert_eq!(prefill_request.body["bootstrap_pair_key"], "independent-pair-identity");
+        assert_eq!(decode_request.body["bootstrap_pair_key"], prefill_request.body["bootstrap_pair_key"]);
         assert!(matches!(prefill_request.body, Cow::Owned(_)));
         assert!(matches!(decode_request.body, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_bootstrap_pair_identity_is_fresh_for_retries_and_batch_items() {
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill { bootstrap_port: Some(8998) })
+            .build();
+        let original = json!({"rid": "same-rid", "bootstrap_pair_key": "stale"});
+        let first = PDRouter::inject_bootstrap_into_value(original.clone(), &prefill, None).unwrap();
+        let retry = PDRouter::inject_bootstrap_into_value(original.clone(), &prefill, None).unwrap();
+        assert_ne!(first["bootstrap_pair_key"], "stale");
+        assert_ne!(first["bootstrap_pair_key"], retry["bootstrap_pair_key"]);
+        let batch = PDRouter::inject_bootstrap_into_value(original, &prefill, Some(3)).unwrap();
+        let keys = batch["bootstrap_pair_key"].as_array().unwrap();
+        assert_eq!(keys.len(), 3);
+        for i in 0..keys.len() {
+            assert!(uuid::Uuid::parse_str(keys[i].as_str().unwrap()).is_ok());
+            for j in 0..i { assert_ne!(keys[i], keys[j]); }
+        }
     }
 
     #[tokio::test]

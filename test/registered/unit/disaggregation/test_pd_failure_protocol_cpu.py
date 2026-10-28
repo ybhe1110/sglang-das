@@ -88,6 +88,8 @@ def wire_managers():
     msgspec's data containers are replaced by stdlib dataclasses for this test.
     """
     env = dict(
+        InvalidBootstrapPairKey=ValueError,
+        time=time,
         logger=Mock(),
         ABORT_TAG=b"ABORT",
         ABORT_ACK_TAG=b"ABORT_ACK",
@@ -159,6 +161,10 @@ def wire_managers():
     p, d = init(cls()), init(base())
     p._source_drain = SourceDrainTracker()
     p._abort_room_bindings = {}
+    p._source_room_pair_keys = {}
+    p._pending_abort_metadata = {}
+    p._pending_abort_metadata_count = 0
+    p._pending_abort_metadata_times = OrderedDict()
     p._retired_abort_rooms = OrderedDict()
     sent = []
 
@@ -390,7 +396,7 @@ class TestGenerationAndNativeDrain(CustomTestCase):
         r.kv_mgr = d
         d.local_ip, d.rank_port = "decode", 6000
         r._transfer_generation = 12345
-        source_generation = p._open_source_room(7)
+        source_generation = p._open_source_room(7, "pair-7")
         p.request_status[7] = env["KVPoll"].Bootstrapping
         p._abort_room_bindings[7] = (
             source_generation,
@@ -435,8 +441,8 @@ class TestGenerationAndNativeDrain(CustomTestCase):
     def test_old_abort_cannot_cancel_reused_room_before_or_after_metadata(self):
         p, d, sent, env = wire_managers()
         old = 123456
-        p._open_source_room(7)
-        info = SimpleNamespace(endpoint="decode", dst_port=6000, abort_generation=old)
+        p._open_source_room(7, "pair-7")
+        info = SimpleNamespace(bootstrap_pair_key="pair-7", endpoint="decode", dst_port=6000, abort_generation=old)
         self.assertTrue(p._bind_abort_metadata(7, info))
         p._source_drain.poison(7)
         self.assertTrue(p._source_drain.forget(7))
@@ -444,12 +450,13 @@ class TestGenerationAndNativeDrain(CustomTestCase):
         msg = env["AbortNotification"](7, "decode", 6000, old).to_zmq()
         p._handle_abort_notification(msg)  # Retired generation may still ACK.
         self.assertEqual(len(sent), 1)
-        p._open_source_room(7)
+        p._open_source_room(7, "pair-new")
         p.request_status[7] = env["KVPoll"].Bootstrapping
         for metadata_bound in (False, True):
             with self.subTest(metadata_bound=metadata_bound):
                 if metadata_bound:
                     info.abort_generation = 789012
+                    info.bootstrap_pair_key = "pair-new"
                     self.assertTrue(p._bind_abort_metadata(7, info))
                 p._handle_abort_notification(msg)
                 self.assertEqual(p.request_status[7], env["KVPoll"].Bootstrapping)
@@ -483,6 +490,7 @@ class TestGenerationAndNativeDrain(CustomTestCase):
         )
         r = cls()
         r._transfer_generation = 2**100 + 12345
+        r._bootstrap_pair_key = "pair-7"
         r.session_id, r.bootstrap_room, r.required_dst_info_num = "native", 7, 1
         r.bootstrap_infos = [{"is_dummy": True}]
         r.kv_mgr = SimpleNamespace(
@@ -496,8 +504,9 @@ class TestGenerationAndNativeDrain(CustomTestCase):
         r.send_metadata(None)
         info = wire.from_zmq(frames[0])
         self.assertEqual(info.abort_generation, r._transfer_generation)
-        p._open_source_room(7)
-        p.transfer_infos = {}
+        self.assertEqual(info.bootstrap_pair_key, r._bootstrap_pair_key)
+        p._open_source_room(7, "pair-7")
+        self.prepare_destinations(p)
         self.assertTrue(p._bind_abort_metadata(7, info, "native"))
         p.request_status[7] = env["KVPoll"].Bootstrapping
         gen = d.register_deferred_abort_room(7, generation=r._transfer_generation)
@@ -509,30 +518,127 @@ class TestGenerationAndNativeDrain(CustomTestCase):
 
     def test_new_metadata_before_sender_does_not_inherit_retired_binding(self):
         p, d, sent, env = wire_managers()
-        old = SimpleNamespace(endpoint="decode", dst_port=6000, abort_generation=11)
-        p._open_source_room(7)
+        old = self.metadata("old", 11)
+        p._open_source_room(7, "old")
         self.assertTrue(p._bind_abort_metadata(7, old))
         p._source_drain.poison(7)
         self.assertTrue(p._source_drain.forget(7))
         p._retire_abort_binding(7)
-        self.assertFalse(p._bind_abort_metadata(7, old))
-        new = SimpleNamespace(endpoint="decode", dst_port=6000, abort_generation=22)
-        self.assertTrue(p._bind_abort_metadata(7, new))
-        p._open_source_room(7)
+        self.assertFalse(p._bind_abort_metadata(7, old, "session"))
+        new = self.metadata("new", 22)
+        self.prepare_destinations(p)
+        self.assertFalse(p._bind_abort_metadata(7, new, "session"))
+        self.assertNotIn(7, p.transfer_infos)
+        p._open_source_room(7, "new")
+        self.assertIs(p.transfer_infos[7]["session"], new)
         p.request_status[7] = env["KVPoll"].Bootstrapping
-        p._handle_abort_notification(
-            env["AbortNotification"](7, "decode", 6000, 11).to_zmq()
-        )
+        p._handle_abort_notification(env["AbortNotification"](7, "decode", 6000, 11).to_zmq())
         self.assertEqual(p.request_status[7], env["KVPoll"].Bootstrapping)
         self.assertEqual(sent, [])
-        p._handle_abort_notification(
-            env["AbortNotification"](7, "decode", 6000, 22).to_zmq()
-        )
+        p._handle_abort_notification(env["AbortNotification"](7, "decode", 6000, 22).to_zmq())
         self.assertEqual(len(sent), 1)
+
+    @staticmethod
+    def metadata(pair_key, generation):
+        return SimpleNamespace(
+            bootstrap_pair_key=pair_key, endpoint="decode", dst_port=6000,
+            abort_generation=generation, required_dst_info_num=1,
+            decode_prefix_len=0, spec_metadata=None,
+        )
+
+    @staticmethod
+    def prepare_destinations(p):
+        p.transfer_infos = {}
+        p.req_to_decode_prefix_len = {}
+        p.req_to_pd_hidden_meta = {}
+        p.resolve_kv_replica_factor = Mock()
+
+    def test_old_metadata_cannot_rebind_reused_room_even_after_tombstone_eviction(self):
+        p, d, sent, env = wire_managers()
+        self.prepare_destinations(p)
+        old = self.metadata("old-pair", 11)
+        p._open_source_room(7, "old-pair")
+        self.assertTrue(p._bind_abort_metadata(7, old))
+        p._source_drain.poison(7)
+        self.assertTrue(p._source_drain.forget(7))
+        p._retire_abort_binding(7)
+        # Retention of retired identities is not the security boundary.
+        p._retired_abort_rooms.clear()
+        p._abort_room_bindings.clear()
+        p._source_room_pair_keys.clear()
+        p._open_source_room(7, "new-pair")
+        p.request_status[7] = env["KVPoll"].Bootstrapping
+        self.assertFalse(p._bind_abort_metadata(7, old, "session"))
+        self.assertNotIn(7, p.transfer_infos)
+        p._handle_abort_notification(env["AbortNotification"](7, "decode", 6000, 11).to_zmq())
+        self.assertEqual(p.request_status[7], env["KVPoll"].Bootstrapping)
+        self.assertEqual(sent, [])
+        new = self.metadata("new-pair", 22)
+        self.assertTrue(p._bind_abort_metadata(7, new, "session"))
+        self.assertIs(p.transfer_infos[7]["session"], new)
+
+    def test_unseen_stale_metadata_before_sender_cannot_choose_source_owner(self):
+        p, d, sent, env = wire_managers()
+        self.prepare_destinations(p)
+        old = self.metadata("unseen-old", 11)
+        new = self.metadata("new", 22)
+        self.assertFalse(p._bind_abort_metadata(7, old, "old-session"))
+        self.assertFalse(p._bind_abort_metadata(7, new, "new-session"))
+        self.assertNotIn(7, p.transfer_infos)
+        p._open_source_room(7, "new")
+        self.assertEqual(set(p.transfer_infos[7]), {"new-session"})
+        self.assertEqual(p._abort_room_bindings[7][1], {("decode", 6000): 22})
+        self.assertNotIn(7, p._pending_abort_metadata)
+
+    def test_missing_shared_pair_key_is_fail_closed(self):
+        p, d, sent, env = wire_managers()
+        with self.assertRaisesRegex(ValueError, "bootstrap_pair_key"):
+            p._open_source_room(7)
+        self.assertNotIn(7, p._source_drain._generations)
+        self.assertFalse(p._bind_abort_metadata(7, self.metadata(None, 11), "session"))
+        self.assertEqual(p._pending_abort_metadata, {})
+
+    def test_retired_pair_key_cannot_be_reused_for_new_source(self):
+        p, d, sent, env = wire_managers()
+        p._open_source_room(7, "old")
+        p._source_drain.poison(7)
+        self.assertTrue(p._source_drain.forget(7))
+        p._retire_abort_binding(7)
+        with self.assertRaisesRegex(ValueError, "fresh bootstrap_pair_key"):
+            p._open_source_room(7, "old")
+        self.assertNotIn(7, p._source_drain._generations)
+
+    def test_unpublished_metadata_expiry_does_not_clear_active_ownership(self):
+        p, d, sent, env = wire_managers()
+        info = self.metadata("pending", 11)
+        self.assertFalse(p._bind_abort_metadata(7, info, "session"))
+        p._pending_abort_metadata_times[(7, "pending", "session")] -= 301
+        p._open_source_room(8, "active")
+        self.assertTrue(p._bind_abort_metadata(8, self.metadata("active", 22)))
+        self.assertNotIn(7, p._pending_abort_metadata)
+        self.assertEqual(p._pending_abort_metadata_count, 0)
+        self.assertEqual(p._source_room_pair_keys[8], "active")
+        self.assertEqual(p._abort_room_bindings[8][1], {("decode", 6000): 22})
+
+    def test_unowned_metadata_budget_and_claim_are_bounded(self):
+        p, d, sent, env = wire_managers()
+        info = self.metadata("new", 22)
+        self.prepare_destinations(p)
+        self.assertFalse(p._bind_abort_metadata(7, info, "session"))
+        self.assertEqual(p._pending_abort_metadata_count, 1)
+        self.assertFalse(p._bind_abort_metadata(7, info, "session"))
+        self.assertEqual(p._pending_abort_metadata_count, 1)
+        p._pending_abort_metadata_count = 4096
+        self.assertFalse(p._bind_abort_metadata(8, info, "other-session"))
+        self.assertNotIn(8, p._pending_abort_metadata)
+        p._pending_abort_metadata_count = 1
+        p._open_source_room(7, "new")
+        self.assertEqual(p._pending_abort_metadata_count, 0)
+        self.assertEqual(p._pending_abort_metadata, {})
 
     def test_unknown_or_legacy_abort_never_authorizes_free(self):
         p, d, sent, env = wire_managers()
-        p._open_source_room(7)
+        p._open_source_room(7, "pair-7")
         p.request_status[7] = env["KVPoll"].Bootstrapping
         for generation in (None, 111):
             p._handle_abort_notification(
@@ -544,21 +650,23 @@ class TestGenerationAndNativeDrain(CustomTestCase):
             p._bind_abort_metadata(
                 7,
                 SimpleNamespace(
-                    endpoint="decode", dst_port=6000, abort_generation=None
+                    endpoint="decode", dst_port=6000, abort_generation=None,
+                    bootstrap_pair_key="pair-7",
                 ),
             )
         )
 
     def test_metadata_before_sender_cannot_ack_before_source_owner_is_terminal(self):
         p, d, sent, env = wire_managers()
-        info = SimpleNamespace(endpoint="decode", dst_port=6000, abort_generation=19)
-        p.transfer_infos = {}
-        self.assertTrue(p._bind_abort_metadata(7, info, "session"))
+        info = self.metadata("pair-7", 19)
+        self.prepare_destinations(p)
+        self.assertFalse(p._bind_abort_metadata(7, info, "session"))
+        self.assertNotIn(7, p.transfer_infos)
         msg = env["AbortNotification"](7, "decode", 6000, 19).to_zmq()
         p._handle_abort_notification(msg)
         self.assertEqual(sent, [])
         p.request_status[7] = env["KVPoll"].Bootstrapping
-        p._open_source_room(7)
+        p._open_source_room(7, "pair-7")
         p._handle_abort_notification(msg)
         self.assertEqual(p.request_status[7], env["KVPoll"].Failed)
         self.assertEqual(len(sent), 1)

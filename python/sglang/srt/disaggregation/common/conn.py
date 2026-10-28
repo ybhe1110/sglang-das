@@ -128,6 +128,10 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
     return session
 
 
+class InvalidBootstrapPairKey(ValueError):
+    """Reject an invalid request capability without killing the scheduler."""
+
+
 class KVTransferError(Exception):
     def __init__(
         self,
@@ -1403,6 +1407,11 @@ class CommonKVManager(BaseKVManager):
         if not self._socket_lock.acquire(blocking=not nonblocking):
             raise BlockingIOError("Control socket cache is busy")
         try:
+            if (
+                getattr(self, "_shutdown_event", None) is not None
+                and self._shutdown_event.is_set()
+            ):
+                raise RuntimeError("Control transport is shutting down")
             sock = self._socket_cache.get(endpoint)
             if sock is not None:
                 monitor = self._monitor_cache.get(endpoint)
@@ -1465,6 +1474,11 @@ class CommonKVManager(BaseKVManager):
         if not lock.acquire(blocking=not nonblocking):
             raise BlockingIOError("Control socket send is busy")
         try:
+            if (
+                getattr(self, "_shutdown_event", None) is not None
+                and self._shutdown_event.is_set()
+            ):
+                raise RuntimeError("Control transport is shutting down")
             if self._socket_cache.get(endpoint) is not sock:
                 raise BlockingIOError("Control socket changed before send")
             sock.send_multipart(parts, flags=flags)
