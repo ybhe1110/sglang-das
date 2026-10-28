@@ -38,7 +38,10 @@ from sglang.srt.disaggregation.checksum import (
     page_indices_for_request,
     state_indices_for_request,
 )
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    InvalidBootstrapPairKey,
+)
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
@@ -609,12 +612,22 @@ class PrefillBootstrapQueue:
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
-        req.disagg_kv_sender = kv_sender_class(
-            mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
-            bootstrap_room=req.bootstrap_room,
-            req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
-        )
+        try:
+            req.disagg_kv_sender = kv_sender_class(
+                mgr=self.kv_manager,
+                bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+                bootstrap_room=req.bootstrap_room,
+                req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
+                **(
+                    {"bootstrap_pair_key": req.bootstrap_pair_key}
+                    if backend == TransferBackend.MOONCAKE
+                    else {}
+                ),
+            )
+        except InvalidBootstrapPairKey as error:
+            prepare_abort(req, str(error), status_code=HTTPStatus.BAD_REQUEST)
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            return False
         self._process_req(req)
         req.pending_bootstrap = True
         return True
