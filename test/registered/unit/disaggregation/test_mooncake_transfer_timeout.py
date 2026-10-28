@@ -178,7 +178,7 @@ class TestMooncakeTransferTimeout(unittest.TestCase):
         manager_shutdown = next(
             n
             for n in manager_class.body
-            if isinstance(n, ast.FunctionDef) and n.name == "shutdown"
+            if isinstance(n, ast.FunctionDef) and n.name == "_shutdown_transport"
         )
         shutdown_attrs = {
             n.func.attr

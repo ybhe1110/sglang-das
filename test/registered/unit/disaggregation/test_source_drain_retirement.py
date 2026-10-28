@@ -83,6 +83,7 @@ def make_sender():
     mgr = manager_cls()
     mgr._source_drain = SourceDrainTracker()
     mgr._abort_room_bindings = {}
+    mgr._source_room_pair_keys = {}
     mgr._retired_abort_rooms = OrderedDict()
     mgr._abort_ack_lock = threading.RLock()
     mgr._deferred_ack_targets = {}

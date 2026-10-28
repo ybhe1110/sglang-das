@@ -245,7 +245,13 @@ class PDHiddenEventManager:
 
         def trigger_wakeup() -> None:
             with self.ack_wakeup_lock:
-                self.ack_wakeup_sender.send(b"ACK_READY")
+                if self.owner._shutdown_event.is_set() or self.ack_wakeup_sender is None:
+                    return
+                try:
+                    self.ack_wakeup_sender.send(b"ACK_READY", flags=zmq.DONTWAIT)
+                except zmq.Again:
+                    # A full wakeup socket already has a notification queued.
+                    pass
 
         if event is None:
             completion["success"] = True
