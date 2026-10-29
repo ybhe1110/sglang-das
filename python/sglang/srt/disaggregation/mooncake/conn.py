@@ -8,7 +8,8 @@ import os
 import struct
 import threading
 import time
-from collections import defaultdict
+import uuid
+from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -23,6 +24,7 @@ from sglang.srt.disaggregation.common.conn import (
     AbortNotification,
     CommonKVBootstrapServer,
     CommonKVManager,
+    InvalidBootstrapPairKey,
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
@@ -110,6 +112,19 @@ FAILED_SESSION_RECOVERIES = Counter(
 )
 
 
+def _summarize_zmq_msg(msg, frame_prefix_bytes: int = 64, max_len: int = 512) -> str:
+    """Return a bounded repr of a multipart ZMQ message for log messages.
+
+    Truncates each frame to ``frame_prefix_bytes`` and the whole repr to
+    ``max_len`` so that a stray large or non-utf8 frame cannot flood
+    logs or raise on formatting.
+    """
+    try:
+        return repr([m[:frame_prefix_bytes] for m in msg])[:max_len]
+    except Exception:
+        return "<unrepresentable>"
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -125,6 +140,8 @@ class TransferInfo:
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
     spec_metadata: Optional[dict] = None
+    abort_generation: Optional[int] = None
+    bootstrap_pair_key: Optional[str] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -157,6 +174,12 @@ class TransferInfo:
                 np.frombuffer(msg[9], dtype=np.int32)
                 if len(msg) > 9 and msg[9] != b""
                 else None
+            ),
+            abort_generation=(
+                int(msg[11].decode("ascii")) if len(msg) > 11 and msg[11] else None
+            ),
+            bootstrap_pair_key=(
+                msg[12].decode("ascii") if len(msg) > 12 and msg[12] else None
             ),
             spec_metadata=(
                 json.loads(msg[10].decode("utf-8"))
@@ -304,6 +327,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self._source_drain = SourceDrainTracker()
+        self._abort_room_bindings = {}
+        self._source_room_pair_keys = {}
+        self._pending_abort_metadata = {}
+        self._pending_abort_metadata_count = 0
+        self._pending_abort_metadata_times = OrderedDict()
+        self._retired_abort_rooms = OrderedDict()
+        self._shutdown_event = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = False
+        self._receiver_threads = []
         self.init_engine()
         self.register_buffer_to_engine()
         self.pd_hidden_pool = None
@@ -567,7 +600,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_indices: List[int],
     ) -> None:
         na = NetworkAddress(remote, dst_port)
-        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+        self._send_multipart_locked(
+            na.to_tcp(),
             [
                 self.PD_HIDDEN_CHUNK_READY_HEADER,
                 str(room).encode("ascii"),
@@ -580,7 +614,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 else b"",
                 self.local_ip.encode("ascii"),
                 str(self.rank_port).encode("ascii"),
-            ]
+            ],
+            is_ipv6=na.is_ipv6,
         )
 
     def ack_pd_hidden_chunk(
@@ -593,13 +628,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         hidden_start: int,
     ) -> None:
         na = NetworkAddress(remote, dst_port)
-        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+        self._send_multipart_locked(
+            na.to_tcp(),
             [
                 self.PD_HIDDEN_CHUNK_ACK_HEADER,
                 str(room).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
                 str(hidden_start).encode("ascii"),
-            ]
+            ],
+            is_ipv6=na.is_ipv6,
         )
 
     def init_engine(self):
@@ -636,6 +673,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.engine.batch_register(list(ptrs), list(lens))
 
     def deregister_buffer_to_engine(self):
+        if getattr(self, "_shutdown_buffers_deregistered", False):
+            return
         regions = self._registerable_regions()
         if regions:
             ptrs, _ = zip(*regions)
@@ -647,106 +686,44 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
                 self.connection_pool.clear()
+        self._shutdown_buffers_deregistered = True
 
     def teardown(self) -> None:
-        self.shutdown()
+        # Role switches must not discard the owner until transport shutdown finishes.
+        if not self.shutdown():
+            raise SourceTransferUnresolved("Mooncake teardown is still pending")
 
-    def shutdown(self) -> None:
-        """Stop worker threads and release transport resources so this
-        KVManager can be discarded during a P<->D role switch.
+    def shutdown(self, timeout_s: float = 10.0) -> bool:
+        """Bound the caller's wait; unfinished native work retains its resources.
 
-        The KV cache pool memory is owned by the scheduler and is NOT freed
-        here; only mooncake-side registrations / sockets are released.
+        One teardown worker owns all destruction. Concurrent/repeated callers
+        wait for that worker, never interpret "started" as "completed". Native
+        calls, executor joins and context.term may block indefinitely, so they
+        must not run on the scheduler's shutdown thread.
         """
-        if self._source_drain.shutdown(timeout_s=3.0):
-            raise SourceTransferUnresolved(
-                "Cannot tear down Mooncake with unresolved source transfers"
-            )
-        self._stopped = True
-
-        # Stop the failed-session probe loop (PREFILL role) if running.
-        probe_shutdown = getattr(self, "_failed_session_probe_shutdown", None)
-        if probe_shutdown is not None:
-            probe_shutdown.set()
-
-        # Stop the heartbeat checker thread (DECODE role) if running.
-        heartbeat_shutdown = getattr(self, "_heartbeat_shutdown", None)
-        if heartbeat_shutdown is not None:
-            heartbeat_shutdown.set()
-
-        # Transfer workers (PREFILL role) park in FastQueue.get(), which has no
-        # timeout; push a None sentinel per shard to wake and stop them so the
-        # join below returns instead of leaking the thread.
-        for queue in getattr(self, "transfer_queues", []):
-            try:
-                queue.put(None)
-            except Exception:
-                logger.exception(
-                    "Failed to signal mooncake transfer worker on teardown"
+        deadline = time.monotonic() + max(float(timeout_s or 0.0), 0.0)
+        if not self._shutdown_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            if self._shutdown_complete:
+                return True
+            self._stop_heartbeat_checker(timeout_s=0.0)
+            worker = getattr(self, "_shutdown_worker", None)
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._shutdown_transport,
+                    args=(max(0.0, deadline - time.monotonic()),),
+                    name="MooncakeShutdown",
+                    daemon=True,
                 )
-
-        # Shutdown thread pool executors (PREFILL role).
-        for executor in getattr(self, "executors", []):
-            try:
-                executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                # Python < 3.9 does not support cancel_futures
-                executor.shutdown(wait=False)
-            except Exception:
-                logger.exception("Failed to shutdown executor on teardown")
-        self.executors = []
-
-        # Join workers before touching their sockets: ZMQ sockets aren't
-        # thread-safe, so don't close server_socket while a worker may poll it.
-        for t in self._worker_threads:
-            t.join(timeout=3.0)
-        if any(t.is_alive() for t in self._worker_threads):
-            raise SourceTransferUnresolved(
-                "Mooncake workers did not stop during teardown"
-            )
-        self._worker_threads = []
-
-        # Drop the queues so their buffered tasks/senders are released too.
-        self.transfer_queues = []
-
-        # Close cached PUSH sockets (used by _connect for status sync).
-        with self._socket_lock:
-            for sock in self._socket_cache.values():
-                try:
-                    sock.close(linger=0)
-                except Exception:
-                    pass
-            for monitor in self._monitor_cache.values():
-                try:
-                    monitor.close()
-                except Exception:
-                    pass
-            self._socket_cache.clear()
-            self._monitor_cache.clear()
-
-        try:
-            self.server_socket.close(linger=0)
-        except Exception:
-            logger.exception("Failed to close mooncake server_socket during teardown")
-
-        # destroy() force-closes every socket in the context; plain term()
-        # would block waiting on them.
-        try:
-            self._zmq_ctx.destroy(linger=0)
-        except Exception:
-            logger.exception("Failed to destroy mooncake zmq context during teardown")
-
-        # Deregister memory from the transfer engine.
-        try:
-            self.deregister_buffer_to_engine()
-        except Exception:
-            logger.exception("Failed to deregister buffers during teardown")
-            raise
-
-        logger.info(
-            "MooncakeKVManager torn down (was role=%s)",
-            self.disaggregation_mode.value,
-        )
+                self._shutdown_worker = worker
+                worker.start()
+        finally:
+            self._shutdown_lock.release()
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        return self._shutdown_complete
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -3599,7 +3576,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if notification is None:
             return True
         room = notification.room
-        self._source_drain.poison(room)
         status = self.request_status.get(room)
         room_active = status is not None and status != KVPoll.Success
 
@@ -3613,26 +3589,53 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self, notification: AbortNotification, room_active: bool
     ) -> None:
         room = notification.room
-        if room_active or self._staging_outstanding.get(room, 0) > 0:
-            self.update_status(room, KVPoll.Failed)
-            self._wake_pd_hidden_ack_waiters(room)
-
         ack_target = notification.deferred_ack_target()
         if ack_target is None:
             return
-        self.register_deferred_ack_target(room, ack_target)
+        bootstrap_notification = None
+        with self._source_drain.lock:
+            binding = self._abort_room_bindings.get(room)
+            epoch = self._source_drain._generations.get(room)
+            if (
+                binding is None
+                or (epoch is not None and binding[0] != epoch)
+                or binding[1].get((ack_target.ip, ack_target.port))
+                != ack_target.generation
+            ):
+                logger.warning(
+                    "Ignoring unknown/stale ABORT lifecycle room=%s generation=%s target=%s:%s",
+                    room,
+                    ack_target.generation,
+                    ack_target.ip,
+                    ack_target.port,
+                )
+                return
+            if epoch is None and binding[0] is None:
+                # Metadata may arrive before its source owner. No active
+                # transfer is not yet a terminal fence: ACKing here would let
+                # decode reuse addresses that a later sender could consume.
+                # Decode keeps the destination and retries the same identity.
+                return
+            # v4.1 CommonKVManager.update_status does not close source drain.
+            # Do this only after identity validation, never for a stale ABORT.
+            self._source_drain.poison(room, epoch)
+            status = self.request_status.get(room)
+            if status is not None and status != KVPoll.Success:
+                # The v4.1 status helper also sends deferred-bootstrap replies.
+                # Capture that reply here, but send only after unlocking drain.
+                self.request_status[room] = KVPoll.Failed
+                if self.deferred_bootstrap is not None:
+                    bootstrap_notification = self.deferred_bootstrap.fail(room)
+            self.register_deferred_ack_target(room, ack_target)
+        if bootstrap_notification is not None:
+            self._notify_bootstrap(room, bootstrap_notification)
         self._maybe_ack_drained_abort(room)
-        if room_active:
-            logger.debug(
-                "Received abort notification for room %s, marked as Failed; "
-                "ACK deferred until transfer drains",
-                room,
-            )
 
     def _handle_legacy_abort_notification(
         self, notification: AbortNotification, room_active: bool
     ) -> None:
         room = notification.room
+        self._source_drain.poison(room)
         if room_active:
             self.update_status(room, KVPoll.Failed)
             self._wake_pd_hidden_ack_waiters(room)
@@ -3667,221 +3670,43 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             logger.debug("Failed to send ABORT_ACK for room %s: %s", room, exc)
 
     def start_prefill_thread(self):
-        recv = self._make_worker_recv(self.server_socket)
+        """Start the prefill-side bootstrap receiver thread.
 
-        def bootstrap_thread():
-            """This thread recvs pre-alloc notification from the decode engine"""
-            # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
-            while not self._stopped:
-                waiting_req_bytes = recv()
-                if waiting_req_bytes is None:
-                    continue
-                if waiting_req_bytes[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_ACK_HEADER:
-                    room = int(waiting_req_bytes[1].decode("ascii"))
-                    prefill_rank = int(waiting_req_bytes[2].decode("ascii"))
-                    hidden_start = int(waiting_req_bytes[3].decode("ascii"))
-                    self._handle_pd_hidden_chunk_ack(
-                        room, prefill_rank, hidden_start
-                    )
-                    continue
-                room = waiting_req_bytes[0].decode("ascii")
-                # Staging: decode reports consumption watermark back to prefill
-                if room == "WATERMARK":
-                    handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
-                    continue
-                # Staging: decode replies with allocated staging offset
-                if room == "STAGING_RSP":
-                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
-                    continue
-                if self._handle_abort_notification(waiting_req_bytes):
-                    continue
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    try:
-                        self.validate_remote_state_transfer_abis(
-                            decode_kv_args.dst_state_data_formats,
-                            decode_kv_args.dst_state_item_lens,
-                        )
-                    except RuntimeError as error:
-                        decode_kv_args.registration_error = str(error)
-                        logger.error(
-                            "Decode peer %s registered an incompatible state ABI: %s",
-                            mooncake_session_id,
-                            error,
-                        )
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
-                    if decode_kv_args.requires_dcp_relayout:
-                        num_entries = len(self.kv_args.kv_item_lens)
-                        num_draft = self.kv_args.num_draft_entries
-                        dst_item_lens: List[Optional[int]] = [
-                            decode_kv_args.dst_kv_item_len
-                        ] * (num_entries - num_draft) + [None] * num_draft
-                        decode_kv_args.dcp_token_item_lens = (
-                            self.prepare_dcp_token_item_lens(
-                                dst_item_lens,
-                                decode_kv_args.dst_dcp_size,
-                            )
-                        )
-                        self._init_dcp_pack_buffers_once(
-                            decode_kv_args.dst_dcp_size, include_draft=True
-                        )
-                    layout_mismatch = self._publish_peer_registration(
-                        mooncake_session_id, decode_kv_args
-                    )
-                    if layout_mismatch is not None:
-                        logger.error(
-                            "Rejecting state transfers to decode session %s: %s",
-                            mooncake_session_id,
-                            layout_mismatch,
-                        )
-                    else:
-                        logger.debug(
-                            f"Register KVArgs from {mooncake_session_id} successfully"
-                        )
-                    continue
-                else:
-                    if len(waiting_req_bytes) < 8:
-                        logger.warning(
-                            "Ignoring malformed Mooncake bootstrap message: "
-                            "room=%s frames=%d",
-                            room,
-                            len(waiting_req_bytes),
-                        )
-                        continue
-                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
-                    room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
-                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
-                    self.transfer_infos[room][mooncake_session_id] = transfer_info
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
-                        pd_hidden_meta = next(
-                            (
-                                info.spec_metadata
-                                for info in self.transfer_infos[room].values()
-                                if info.spec_metadata
-                                and info.spec_metadata.get("pd_hidden")
-                            ),
-                            None,
-                        )
-                        if pd_hidden_meta:
-                            self.req_to_pd_hidden_meta[room] = pd_hidden_meta
-                        self.update_status(room, KVPoll.WaitingForInput)
-
-        t = threading.Thread(target=bootstrap_thread, daemon=True)
-        t.start()
-        self._worker_threads.append(t)
+        The thread transitions rooms from ``KVPoll.Bootstrapping`` to
+        ``KVPoll.WaitingForInput`` and handles decode-side abort
+        notifications. It must never die: dispatch errors on a single
+        message are logged and the loop continues on the next message,
+        because a dead receiver silently freezes all in-flight KV
+        transfers on this prefill (decode sees no incoming chunks and
+        eventually times out its bootstrap window).
+        """
+        thread = threading.Thread(
+            target=self._run_bootstrap_receiver_loop,
+            name="MooncakePrefillReceiver",
+            daemon=True,
+        )
+        self._receiver_threads.append(thread)
+        thread.start()
 
     def start_decode_thread(self):
-        recv = self._make_worker_recv(self.server_socket)
+        """Start the decode-side response receiver thread.
 
-        def decode_thread():
-            poller = zmq.Poller()
-            poller.register(self.server_socket, zmq.POLLIN)
-            poller.register(self.pd_hidden_events.ack_wakeup_receiver, zmq.POLLIN)
-            while not self._stopped:
-                events = dict(
-                    poller.poll(500 if self.server_args.enable_pd_role_switch else None)
-                )
-                if self.pd_hidden_events.ack_wakeup_receiver in events:
-                    while True:
-                        try:
-                            self.pd_hidden_events.ack_wakeup_receiver.recv(zmq.NOBLOCK)
-                        except zmq.Again:
-                            break
-                    self._drain_pd_hidden_ack_completions()
-                if self.server_socket not in events:
-                    continue
-                msg = self.server_socket.recv_multipart()
-                if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
-                    self._handle_aux_data(msg)
-                    continue
-                if msg[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_READY_HEADER:
-                    room = int(msg[1].decode("ascii"))
-                    prefill_rank = int(msg[2].decode("ascii"))
-                    hidden_start = int(msg[3].decode("ascii"))
-                    row_len = int(msg[4].decode("ascii"))
-                    is_last_hidden_chunk = msg[5] == b"1"
-                    dst_indices = (
-                        list(np.frombuffer(msg[6], dtype=np.int32).astype(np.int64))
-                        if len(msg[6]) > 0
-                        else []
-                    )
-                    ack_host = msg[7].decode("ascii")
-                    ack_port = int(msg[8].decode("ascii"))
-                    self.pd_hidden_events.append_ready_chunk(
-                        room,
-                        {
-                            "room": room,
-                            "prefill_rank": prefill_rank,
-                            "hidden_start": hidden_start,
-                            "row_len": row_len,
-                            "is_last_hidden_chunk": is_last_hidden_chunk,
-                            "dst_indices": [int(x) for x in dst_indices],
-                            "ack_host": ack_host,
-                            "ack_port": ack_port,
-                        },
-                    )
-                    continue
-                # Staging: prefill notifies a chunk written to staging buffer
-                if msg[0] == b"CHUNK_READY":
-                    room = int(msg[1].decode("ascii"))
-                    chunk_idx = int(msg[2].decode("ascii"))
-                    page_start = int(msg[3].decode("ascii"))
-                    num_pages = int(msg[4].decode("ascii"))
-                    session_id = msg[5].decode("ascii")
-                    handler = self._staging_handler
-                    assert handler is not None, (
-                        "CHUNK_READY received before staging handler initialized"
-                    )
-                    handler.handle_chunk_arrived(
-                        room,
-                        chunk_idx,
-                        page_start,
-                        num_pages,
-                        session_id,
-                    )
-                    continue
-
-                # Staging: prefill pre-requests staging allocation before forward
-                if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
-                    continue
-
-                if self.handle_abort_ack_message(msg):
-                    continue
-
-                parsed = self.parse_kv_status_message(msg)
-                if parsed is None:
-                    continue
-                room, status, prefill_rank, reason = parsed
-                self.apply_prefill_status(
-                    bootstrap_room=room,
-                    status=status,
-                    prefill_rank=prefill_rank,
-                    failure_reason=reason,
-                )
-
-        t = threading.Thread(target=decode_thread, daemon=True)
-        t.start()
-        self._worker_threads.append(t)
-        t = self._start_heartbeat_checker_thread()
-        self._worker_threads.append(t)
+        The thread updates room status from prefill KVPoll responses and
+        handles staging/abort acknowledgements. As with
+        ``start_prefill_thread``, it must not die on a single bad
+        message: dispatch errors are logged and the loop advances.
+        """
+        thread = threading.Thread(
+            target=self._run_decode_receiver_loop,
+            name="MooncakeDecodeReceiver",
+            daemon=True,
+        )
+        self._receiver_threads.append(thread)
+        thread.start()
+        # Exactly once per manager - keep this out of the per-message
+        # receiver/dispatch path (see the latch + rationale in
+        # CommonKVManager._start_heartbeat_checker_thread).
+        self._worker_threads.append(self._start_heartbeat_checker_thread())
 
     def add_transfer_request(
         self,
@@ -4060,14 +3885,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._wake_pd_hidden_ack_waiters(room)
         return self._source_drain.terminal(room, generation)
 
-    def _maybe_ack_drained_abort(self, room: int) -> None:
-        # The community counter covers dequeued chunks; the local tracker also
-        # covers queued work, detached native calls and failed native hazards.
-        tracker = self._source_drain
-        with tracker.lock:
-            if room in tracker._generations and not tracker.terminal(room):
-                return
-            super()._maybe_ack_drained_abort(room)
 
     def _complete_source_chunk(self, chunk) -> None:
         self._source_drain.complete(chunk)
@@ -4169,6 +3986,473 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             "Failed to publish worker-exit status for room %s", room
                         )
 
+    def _collect_drained_abort_targets(self, room: int):
+        # Return a snapshot, not a network send, from the native ownership lock.
+        tracker = self._source_drain
+        with tracker.lock:
+            if room in tracker._generations and not tracker.terminal(room):
+                return {}
+            return super()._collect_drained_abort_targets(room)
+
+    def _open_source_room(self, room, bootstrap_pair_key=None):
+        # This key comes from the P request, independently of D's metadata.
+        # RID is deliberately not used: routers may assign different P/D RIDs.
+        if self.enable_deferred_decode_kv_release and not (
+            isinstance(bootstrap_pair_key, str)
+            and 0 < len(bootstrap_pair_key) <= 128
+            and bootstrap_pair_key.isascii()
+        ):
+            raise InvalidBootstrapPairKey(
+                "Mooncake deferred release requires a shared bootstrap_pair_key; upgrade the P/D router"
+            )
+        with self._source_drain.lock:
+            if (
+                self.enable_deferred_decode_kv_release
+                and room in self._retired_abort_rooms
+                and self._source_room_pair_keys.get(room) == bootstrap_pair_key
+            ):
+                raise InvalidBootstrapPairKey(
+                    "Reused Mooncake room requires a fresh bootstrap_pair_key"
+                )
+            generation = self._source_drain.open(room)
+            self._source_room_pair_keys[room] = bootstrap_pair_key
+            self._abort_room_bindings[room] = (generation, {})
+            self._retired_abort_rooms.pop(room, None)
+            # Early metadata is only a proposal. Publish destinations only
+            # after the scheduler has independently identified the source owner.
+            pending = self._pending_abort_metadata.pop(room, {})
+            self._pending_abort_metadata_count -= len(pending)
+            for (pair_key, session_id), info in pending.items():
+                self._pending_abort_metadata_times.pop(
+                    (room, pair_key, session_id), None
+                )
+                if pair_key == bootstrap_pair_key:
+                    self._bind_abort_metadata(room, info, session_id)
+            return generation
+
+    def _bind_abort_metadata(self, room, transfer_info, session_id=None):
+        """Validate the request's shared capability before publishing addresses.
+
+        Receiver UUIDs bind ABORT/ACK to a receiver; bootstrap_pair_key binds
+        that receiver to the independently created P request. Neither identity
+        is inferred from the first metadata message received for a reused room.
+        """
+        with self._source_drain.lock:
+            # Expire only unpublished proposals, never live bindings, DMA
+            # hazards or ACK ownership. A late source must bootstrap again.
+            now = time.monotonic()
+            times = self._pending_abort_metadata_times
+            while times:
+                key, received = next(iter(times.items()))
+                if now - received < 300.0:
+                    break
+                times.pop(key)
+                pending_room, pair, session = key
+                proposals = self._pending_abort_metadata[pending_room]
+                proposals.pop((pair, session))
+                self._pending_abort_metadata_count -= 1
+                if not proposals:
+                    self._pending_abort_metadata.pop(pending_room)
+            generation = transfer_info.abort_generation
+            pair_key = transfer_info.bootstrap_pair_key
+            if self.enable_deferred_decode_kv_release and (
+                generation is None
+                or not isinstance(pair_key, str)
+                or not 0 < len(pair_key) <= 128
+                or not pair_key.isascii()
+            ):
+                logger.error(
+                    "Missing shared P/D lifecycle in metadata for room %s; refusing destinations",
+                    room,
+                )
+                return False
+            epoch = self._source_drain._generations.get(room)
+            if epoch is None:
+                if (
+                    room in self._retired_abort_rooms
+                    and self._source_room_pair_keys.get(room) == pair_key
+                ):
+                    return False
+                # Bound unowned proposals. They never authorize a write or ACK;
+                # overflow is fail-closed and decode's bootstrap timeout applies.
+                if session_id is not None:
+                    pending = self._pending_abort_metadata
+                    key = (pair_key, session_id)
+                    proposals = pending.get(room, {})
+                    if key not in proposals:
+                        if self._pending_abort_metadata_count >= 4096:
+                            logger.warning(
+                                "Unowned Mooncake metadata limit reached; dropping room=%s",
+                                room,
+                            )
+                            return False
+                        self._pending_abort_metadata_count += 1
+                    pending.setdefault(room, {})[key] = transfer_info
+                    times[(room, pair_key, session_id)] = now
+                    times.move_to_end((room, pair_key, session_id))
+                return False
+            if self._source_room_pair_keys.get(room) != pair_key:
+                logger.warning(
+                    "Ignoring metadata for a different P/D lifecycle room=%s", room
+                )
+                return False
+            binding = self._abort_room_bindings[room]
+            endpoint = (transfer_info.endpoint, transfer_info.dst_port)
+            prior = binding[1].get(endpoint)
+            if prior is not None and prior != generation:
+                logger.warning(
+                    "Ignoring conflicting metadata lifecycle for room %s", room
+                )
+                return False
+            binding[1][endpoint] = generation
+            if session_id is not None:
+                self.transfer_infos.setdefault(room, {})[session_id] = transfer_info
+                infos = self.transfer_infos[room]
+                if len(infos) == transfer_info.required_dst_info_num:
+                    self.resolve_kv_replica_factor(infos)
+                    self.req_to_decode_prefix_len[room] = next(
+                        (
+                            info.decode_prefix_len
+                            for info in infos.values()
+                            if info.decode_prefix_len is not None
+                        ),
+                        0,
+                    )
+                    hidden = next(
+                        (
+                            info.spec_metadata
+                            for info in infos.values()
+                            if info.spec_metadata
+                            and info.spec_metadata.get("pd_hidden")
+                        ),
+                        None,
+                    )
+                    if hidden:
+                        self.req_to_pd_hidden_meta[room] = hidden
+                    self.update_status(room, KVPoll.WaitingForInput)
+            return True
+
+    def _retire_abort_binding(self, room):
+        # Keep bounded tombstones for ACK retransmission after clear/forget.
+        # Eviction can only lose an ACK, never authorize releasing unknown DMA.
+        self._retired_abort_rooms[room] = True
+        self._retired_abort_rooms.move_to_end(room)
+        while len(self._retired_abort_rooms) > 4096:
+            old_room, _ = self._retired_abort_rooms.popitem(last=False)
+            if old_room not in self._source_drain._generations:
+                self._abort_room_bindings.pop(old_room, None)
+                self._source_room_pair_keys.pop(old_room, None)
+                with self._abort_ack_lock:
+                    self._deferred_ack_targets.pop(old_room, None)
+
+    def _shutdown_transport(self, drain_timeout_s: float) -> None:
+        """Single teardown owner. A failed/uncertain drain may be retried."""
+        try:
+            probe_event = getattr(self, "_failed_session_probe_shutdown", None)
+            if probe_event is not None:
+                probe_event.set()
+            drain = getattr(self, "_source_drain", None)
+            if drain is not None:
+                self._shutdown_source_remaining = drain.shutdown(
+                    timeout_s=drain_timeout_s
+                )
+
+            if not getattr(self, "_shutdown_queues_woken", False):
+                for queue in getattr(self, "transfer_queues", []):
+                    queue.put(None)
+                self._shutdown_queues_woken = True
+
+            # Receivers use bounded polling and stop without a cross-thread
+            # socket close. Join users before destroying their sockets/buffers.
+            threads = list(self._worker_threads) + list(self._receiver_threads)
+            heartbeat = getattr(self, "_heartbeat_checker_thread", None)
+            if heartbeat is not None:
+                threads.append(heartbeat)
+            for thread in threads:
+                thread.join()
+            executors = list(getattr(self, "executors", []))
+            recompute = getattr(self, "_prefill_recompute_executor", None)
+            if recompute is not None:
+                executors.append(recompute)
+            for executor in executors:
+                executor.shutdown(wait=True, cancel_futures=True)
+
+            # Executor completion is not a native DMA fence. Recheck the source
+            # tracker, including detached operations and unresolved hazards.
+            if drain is not None:
+                self._shutdown_source_remaining = drain.shutdown(timeout_s=0.0)
+            if getattr(self, "_shutdown_source_remaining", ()):
+                logger.error(
+                    "Mooncake source drain still active during shutdown; retaining "
+                    "buffers for rooms=%s",
+                    self._shutdown_source_remaining,
+                )
+                return
+            self._close_zmq_resources()
+            self.deregister_buffer_to_engine()
+            self._shutdown_complete = True
+        except Exception:
+            logger.exception(
+                "Mooncake shutdown incomplete; resources retained for retry"
+            )
+
+    def _close_zmq_resources(self) -> None:
+        # No new connection/send may enter once shutdown is set. Keep lock
+        # entries alive: a sender may already have fetched its socket/lock.
+        with self._socket_lock:
+            for endpoint, sock in list(self._socket_cache.items()):
+                with self._socket_send_locks[endpoint]:
+                    sock.close(linger=0)
+                    monitor = self._monitor_cache.get(endpoint)
+                    if monitor is not None:
+                        monitor.close(linger=0)
+                        self._monitor_cache.pop(endpoint, None)
+                    self._socket_cache.pop(endpoint, None)
+            for endpoint, monitor in list(self._monitor_cache.items()):
+                monitor.close(linger=0)
+                self._monitor_cache.pop(endpoint, None)
+        server_socket = getattr(self, "server_socket", None)
+        if server_socket is not None:
+            server_socket.close(linger=0)
+        # ack_wakeup sockets are created from _zmq_ctx but are not in
+        # _socket_cache, so they must be closed explicitly before
+        # context.term() — an open socket blocks term() indefinitely.
+        pd_hidden = getattr(self, "pd_hidden_events", None)
+        if pd_hidden is not None:
+            with pd_hidden.ack_wakeup_lock:
+                for attr in ("ack_wakeup_receiver", "ack_wakeup_sender"):
+                    sock = getattr(pd_hidden, attr, None)
+                    if sock is not None:
+                        sock.close(linger=0)
+                        setattr(pd_hidden, attr, None)
+        context = getattr(self, "_zmq_ctx", None)
+        if context is not None:
+            context.term()
+
+    def _stop_heartbeat_checker(self, timeout_s=0.0):
+        self._stopped = True
+        self._shutdown_event.set()
+        heartbeat = getattr(self, "_heartbeat_shutdown", None)
+        if heartbeat is not None:
+            heartbeat.set()
+
+    def _dispatch_bootstrap_msg(self, msg):
+        if not msg:
+            return
+        # Keep v4.1's prefill-complete readiness handshake. ABORT must bypass
+        # the generic handler, which has no receiver-generation validation.
+        if msg[0] == b"BOOTSTRAP" and self._handle_bootstrap_message(msg):
+            return
+        if msg[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_ACK_HEADER:
+            room = int(msg[1].decode("ascii"))
+            prefill_rank = int(msg[2].decode("ascii"))
+            hidden_start = int(msg[3].decode("ascii"))
+            self._handle_pd_hidden_chunk_ack(room, prefill_rank, hidden_start)
+            return
+        room = msg[0].decode("ascii")
+        # Staging: decode reports consumption watermark back to prefill
+        if room == "WATERMARK":
+            handle_watermark_msg(self._staging_ctx, msg)
+            return
+        # Staging: decode replies with allocated staging offset
+        if room == "STAGING_RSP":
+            handle_staging_rsp(msg, self.transfer_infos)
+            return
+        if self._handle_abort_notification(msg):
+            return
+        mooncake_session_id = msg[3].decode("ascii")
+        if room == "None":
+            decode_kv_args = KVArgsRegisterInfo.from_zmq(msg)
+            try:
+                self.validate_remote_state_transfer_abis(
+                    decode_kv_args.dst_state_data_formats,
+                    decode_kv_args.dst_state_item_lens,
+                )
+            except RuntimeError as error:
+                decode_kv_args.registration_error = str(error)
+                logger.error(
+                    "Decode peer %s registered an incompatible state ABI: %s",
+                    mooncake_session_id,
+                    error,
+                )
+            decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+                decode_kv_args.dst_dcp_size,
+                decode_kv_args.dst_dcp_rank,
+            )
+            if decode_kv_args.requires_dcp_relayout:
+                num_entries = len(self.kv_args.kv_item_lens)
+                num_draft = self.kv_args.num_draft_entries
+                dst_item_lens: List[Optional[int]] = [
+                    decode_kv_args.dst_kv_item_len
+                ] * (num_entries - num_draft) + [None] * num_draft
+                decode_kv_args.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
+                    dst_item_lens,
+                    decode_kv_args.dst_dcp_size,
+                )
+                self._init_dcp_pack_buffers_once(
+                    decode_kv_args.dst_dcp_size, include_draft=True
+                )
+            layout_mismatch = self._publish_peer_registration(
+                mooncake_session_id, decode_kv_args
+            )
+            if layout_mismatch is not None:
+                logger.error(
+                    "Rejecting state transfers to decode session %s: %s",
+                    mooncake_session_id,
+                    layout_mismatch,
+                )
+            else:
+                logger.debug(f"Register KVArgs from {mooncake_session_id} successfully")
+            return
+        else:
+            if len(msg) < 8:
+                logger.warning(
+                    "Ignoring malformed Mooncake bootstrap message: room=%s frames=%d",
+                    room,
+                    len(msg),
+                )
+                return
+            room = int(room)
+            transfer_info = TransferInfo.from_zmq(msg)
+            self._bind_abort_metadata(room, transfer_info, mooncake_session_id)
+
+    def _dispatch_decode_msg(self, msg):
+        if not msg:
+            return
+        if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
+            self._handle_aux_data(msg)
+            return
+        if msg[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_READY_HEADER:
+            room = int(msg[1].decode("ascii"))
+            prefill_rank = int(msg[2].decode("ascii"))
+            hidden_start = int(msg[3].decode("ascii"))
+            row_len = int(msg[4].decode("ascii"))
+            is_last_hidden_chunk = msg[5] == b"1"
+            dst_indices = (
+                list(np.frombuffer(msg[6], dtype=np.int32).astype(np.int64))
+                if len(msg[6]) > 0
+                else []
+            )
+            ack_host = msg[7].decode("ascii")
+            ack_port = int(msg[8].decode("ascii"))
+            self.pd_hidden_events.append_ready_chunk(
+                room,
+                {
+                    "room": room,
+                    "prefill_rank": prefill_rank,
+                    "hidden_start": hidden_start,
+                    "row_len": row_len,
+                    "is_last_hidden_chunk": is_last_hidden_chunk,
+                    "dst_indices": [int(x) for x in dst_indices],
+                    "ack_host": ack_host,
+                    "ack_port": ack_port,
+                },
+            )
+            return
+        # Staging: prefill notifies a chunk written to staging buffer
+        if msg[0] == b"CHUNK_READY":
+            room = int(msg[1].decode("ascii"))
+            chunk_idx = int(msg[2].decode("ascii"))
+            page_start = int(msg[3].decode("ascii"))
+            num_pages = int(msg[4].decode("ascii"))
+            session_id = msg[5].decode("ascii")
+            handler = self._staging_handler
+            assert handler is not None, (
+                "CHUNK_READY received before staging handler initialized"
+            )
+            handler.handle_chunk_arrived(
+                room,
+                chunk_idx,
+                page_start,
+                num_pages,
+                session_id,
+            )
+            return
+
+        # Staging: prefill pre-requests staging allocation before forward
+        if msg[0] == b"STAGING_REQ":
+            self._handle_staging_req(msg)
+            return
+
+        if self.handle_abort_ack_message(msg):
+            return
+
+        parsed = self.parse_kv_status_message(msg)
+        if parsed is None:
+            return
+        room, status, prefill_rank, reason = parsed
+        self.apply_prefill_status(
+            bootstrap_room=room,
+            status=status,
+            prefill_rank=prefill_rank,
+            failure_reason=reason,
+        )
+
+    def _run_bootstrap_receiver_loop(self):
+        while not self._shutdown_event.is_set():
+            try:
+                if not self.server_socket.poll(100, zmq.POLLIN):
+                    continue
+                if self._shutdown_event.is_set():
+                    return
+                msg = self.server_socket.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                continue
+            except Exception:
+                if self._shutdown_event.is_set():
+                    return
+                logger.exception(
+                    "bootstrap_thread recv_multipart failed; retrying after 50ms"
+                )
+                time.sleep(0.05)
+                continue
+            try:
+                self._dispatch_bootstrap_msg(msg)
+            except Exception:
+                logger.exception(
+                    "bootstrap_thread dispatch failed for msg=%s; continuing",
+                    _summarize_zmq_msg(msg),
+                )
+
+    def _run_decode_receiver_loop(self):
+        # The ack-wakeup socket is polled alongside the control socket so a
+        # PD-hidden completion queued by a writer thread is drained here.
+        poller = zmq.Poller()
+        poller.register(self.server_socket, zmq.POLLIN)
+        poller.register(self.pd_hidden_events.ack_wakeup_receiver, zmq.POLLIN)
+        while not self._shutdown_event.is_set():
+            events = dict(poller.poll(100))
+            if self.pd_hidden_events.ack_wakeup_receiver in events:
+                while True:
+                    try:
+                        self.pd_hidden_events.ack_wakeup_receiver.recv(zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+                self._drain_pd_hidden_ack_completions()
+            if self.server_socket not in events:
+                continue
+            try:
+                if self._shutdown_event.is_set():
+                    return
+                msg = self.server_socket.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                continue
+            except Exception:
+                if self._shutdown_event.is_set():
+                    return
+                logger.exception(
+                    "decode_thread recv_multipart failed; retrying after 50ms"
+                )
+                time.sleep(0.05)
+                continue
+            try:
+                self._dispatch_decode_msg(msg)
+            except Exception:
+                logger.exception(
+                    "decode_thread dispatch failed for msg=%s; continuing",
+                    _summarize_zmq_msg(msg),
+                )
+
 
 class MooncakeFailureExceptionMixin:
     """Shared `failure_exception` for the Mooncake sender and receiver.
@@ -4204,14 +4488,17 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         bootstrap_addr: str,
         bootstrap_room: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        bootstrap_pair_key: Optional[str] = None,
     ):
+        self._source_generation = mgr._open_source_room(
+            bootstrap_room, bootstrap_pair_key
+        )
         super().__init__(
             mgr,
             bootstrap_addr,
             bootstrap_room,
             req_has_disagg_prefill_dp_rank,
         )
-        self._source_generation = mgr._source_drain.open(bootstrap_room)
         self._source_transfers_forgotten = False
         self.init_time = time.time()
         self._source_event = None
@@ -4408,21 +4695,31 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 return False
             # Clear room-keyed state before another sender can reuse the room,
             # including when the scheduler calls forget without calling clear.
-            super().clear()
+            notification = super().clear(defer_notification=True)
             if not tracker.forget(self.bootstrap_room, generation):
                 return False
+            self.kv_mgr._retire_abort_binding(self.bootstrap_room)
             self._source_transfers_forgotten = True
             self._source_generation = None
-            return True
+        if notification is not None:
+            endpoint, failed = notification
+            self.kv_mgr.send_kv_status_message(
+                targets=[endpoint],
+                bootstrap_room=self.bootstrap_room,
+                status=KVPoll.Failed if failed else KVPoll.Success,
+                failure_reason="Prefill bootstrap failed" if failed else None,
+            )
+        return True
 
     def clear(self):
         # Keep transfer destinations until the worker has stopped: failure_exception
         # may run before its final failure broadcast and PD-hidden cleanup.
-        with self.kv_mgr._source_drain.lock:
-            if self._source_transfers_forgotten:
-                return
-            if self.is_transfer_terminal():
-                self.forget_source_transfers()
+        if self._source_transfers_forgotten:
+            return
+        if self.is_transfer_terminal():
+            # forget rechecks the generation under the lock; readiness above
+            # cannot authorize retiring a different owner during room reuse.
+            self.forget_source_transfers()
 
 
 class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
@@ -4431,7 +4728,18 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        bootstrap_pair_key: Optional[str] = None,
     ):
+        if mgr.enable_deferred_decode_kv_release and not (
+            isinstance(bootstrap_pair_key, str)
+            and 0 < len(bootstrap_pair_key) <= 128
+            and bootstrap_pair_key.isascii()
+        ):
+            raise InvalidBootstrapPairKey(
+                "Mooncake deferred release requires a shared bootstrap_pair_key; upgrade the P/D router"
+            )
+        self._bootstrap_pair_key = bootstrap_pair_key
+        self._transfer_generation = uuid.uuid4().int
         self.session_id = mgr.get_session_id()
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
@@ -4627,6 +4935,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 if local_spec_metadata
                                 else b""
                             ),
+                            str(self._transfer_generation).encode("ascii"),
+                            (self._bootstrap_pair_key or "").encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:

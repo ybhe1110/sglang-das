@@ -47,7 +47,11 @@ from sglang.srt.disaggregation.checksum import (
     page_indices_for_request,
     state_indices_for_request,
 )
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    InvalidBootstrapPairKey,
+)
 from sglang.srt.disaggregation.common.utils import (
     PDHiddenChunk,
     PDHiddenRequestState,
@@ -890,9 +894,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            decode_req = self._create_receiver_and_enqueue(
-                req, is_rebootstrap=is_rebootstrap
-            )
+            try:
+                decode_req = self._create_receiver_and_enqueue(
+                    req, is_rebootstrap=is_rebootstrap
+                )
+            except InvalidBootstrapPairKey as error:
+                prepare_abort(req, str(error), status_code=HTTPStatus.BAD_REQUEST)
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                return
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req):
@@ -1073,6 +1082,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
 
+        if (
+            is_rebootstrap
+            and backend == TransferBackend.MOONCAKE
+            and req.bootstrap_pair_key
+        ):
+            # Each D rank derives the same NEW pair identity; the recompute
+            # request forwards it to P. Never reuse the previous transfer key.
+            req.bootstrap_pair_key = hashlib.sha256(
+                (req.bootstrap_pair_key + ":rebootstrap").encode("ascii")
+            ).hexdigest()
+
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
             # Fake transfer has no prefill endpoint; do not resolve a missing host.
@@ -1081,6 +1101,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "" if backend == TransferBackend.FAKE else _bootstrap_addr(req)
             ),
             bootstrap_room=req.bootstrap_room,
+            **(
+                {"bootstrap_pair_key": req.bootstrap_pair_key}
+                if backend == TransferBackend.MOONCAKE
+                else {}
+            ),
         )
 
         decode_req = DecodeRequest(
@@ -3904,6 +3929,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "instead of reusing memory without a native fence: "
                 + ",".join(entry[0].req.rid for entry in expired)
             )
+        for entry, done in zip(entries, ready):
+            if not done:
+                entry[0].kv_receiver.retry_abort_notification()
         to_release = [entry for entry, done in zip(entries, ready) if done]
         self._deferred_releases = [
             entry for entry, done in zip(entries, ready) if not done

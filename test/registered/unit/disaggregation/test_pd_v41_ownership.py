@@ -14,7 +14,6 @@ from test_external_kv_abort_drain import (
     KVPoll,
     PREFILL,
     ROOT,
-    SourceDrainTracker,
     load_methods,
     register_cpu_ci,
 )
@@ -146,26 +145,16 @@ class TestV41PrefillOwnership(unittest.TestCase):
 
 class TestV41NativeShutdown(unittest.TestCase):
     def manager(self, outstanding):
-        cls = load_methods(
-            CONN,
-            ["shutdown"],
-            {"SourceTransferUnresolved": RuntimeError, "logger": Mock()},
-            class_name="MooncakeKVManager",
-        )
-        m = cls()
+        from test_mooncake_shutdown_races import manager
+
+        m = manager()
         m._source_drain = NS(shutdown=Mock(return_value=outstanding))
-        m._worker_threads = []
-        m._socket_lock = threading.Lock()
-        m._socket_cache, m._monitor_cache = {}, {}
         m.server_socket, m._zmq_ctx = Mock(), Mock()
-        m.deregister_buffer_to_engine = Mock()
-        m.disaggregation_mode = NS(value="prefill")
         return m
 
     def test_unresolved_source_prevents_socket_and_memory_teardown(self):
         m = self.manager([(7, 1)])
-        with self.assertRaises(RuntimeError):
-            m.shutdown()
+        self.assertFalse(m.shutdown(0.01))
         m.deregister_buffer_to_engine.assert_not_called()
         m._zmq_ctx.destroy.assert_not_called()
 
@@ -176,10 +165,30 @@ class TestV41NativeShutdown(unittest.TestCase):
 
     def test_alive_worker_prevents_deregistration(self):
         m = self.manager([])
-        m._worker_threads = [NS(join=Mock(), is_alive=lambda: True)]
-        with self.assertRaises(RuntimeError):
-            m.shutdown()
+        release = threading.Event()
+        worker = threading.Thread(target=release.wait)
+        worker.start()
+        m._worker_threads = [worker]
+        self.assertFalse(m.shutdown(0.01))
         m.deregister_buffer_to_engine.assert_not_called()
+        release.set()
+        worker.join(2)
+        m._shutdown_worker.join(2)
+        self.assertTrue(m.shutdown(1))
+
+    def test_role_switch_rejects_incomplete_shutdown(self):
+        cls = load_methods(
+            CONN,
+            ["teardown"],
+            {"SourceTransferUnresolved": RuntimeError},
+            class_name="MooncakeKVManager",
+        )
+        m = cls()
+        m.shutdown = Mock(return_value=False)
+        with self.assertRaisesRegex(RuntimeError, "teardown"):
+            m.teardown()
+        m.shutdown.return_value = True
+        m.teardown()
 
     def engine(self, native):
         cls = load_methods(
@@ -224,6 +233,68 @@ class TestV41NativeShutdown(unittest.TestCase):
         self.assertTrue(e.shutdown())
         native.close.assert_called_once()
         self.assertEqual(e._peer_sessions, set())
+
+
+class TestV41BootstrapDrain(unittest.TestCase):
+    def test_clear_sends_bootstrap_terminal_outside_source_lock_once(self):
+        from test_source_drain_retirement import make_sender
+
+        sender = make_sender()
+        manager = sender.kv_mgr
+        manager.deferred_bootstrap = NS(
+            close=Mock(return_value=(("decode", 6000), True))
+        )
+        sender._owns_bootstrap_room = True
+        manager.send_kv_status_message = Mock(
+            side_effect=lambda **kwargs: self.assertFalse(
+                manager._source_drain.lock._is_owned()
+            )
+        )
+        sender.clear()
+        sender.clear()
+        self.assertTrue(sender.forget_source_transfers())
+        manager.deferred_bootstrap.close.assert_called_once()
+        manager.send_kv_status_message.assert_called_once()
+
+    def test_valid_abort_notifies_deferred_bootstrap_outside_source_lock(self):
+        from test_pd_failure_protocol_cpu import wire_managers
+
+        p, d, sent, env = wire_managers()
+        generation = p._open_source_room(7, "pair")
+        p._abort_room_bindings[7] = (generation, {("decode", 6000): 123})
+        p.request_status[7] = env["KVPoll"].WaitingForInput
+        p.deferred_bootstrap = NS(fail=Mock(return_value=(("decode", 6000), True)))
+        p._notify_bootstrap = Mock(
+            side_effect=lambda *args: self.assertFalse(p._source_drain.lock._is_owned())
+        )
+        p._handle_abort_notification(
+            env["AbortNotification"](7, "decode", 6000, 123).to_zmq()
+        )
+        p._notify_bootstrap.assert_called_once()
+        self.assertTrue(p._source_drain.terminal(7, generation))
+        self.assertEqual(len(sent), 1)
+
+    def test_bootstrap_dispatch_keeps_readiness_but_does_not_bypass_abort_identity(
+        self,
+    ):
+        from test_pd_failure_protocol_cpu import wire_managers
+
+        p, d, sent, env = wire_managers()
+        env["MooncakeKVManager"] = NS(PD_HIDDEN_CHUNK_ACK_HEADER=b"HIDDEN_ACK")
+        cls = load_methods(CONN, ["_dispatch_bootstrap_msg"], env)
+        p._handle_bootstrap_message = Mock(return_value=True)
+        bootstrap = [b"BOOTSTRAP", b"7", b"decode", b"6000"]
+        cls._dispatch_bootstrap_msg(p, bootstrap)
+        p._handle_bootstrap_message.assert_called_once_with(bootstrap)
+        epoch = p._open_source_room(7, "new-pair")
+        p.request_status[7] = env["KVPoll"].Bootstrapping
+        cls._dispatch_bootstrap_msg(
+            p, env["AbortNotification"](7, "decode", 6000, 999).to_zmq()
+        )
+        p._handle_bootstrap_message.assert_called_once()
+        self.assertEqual(p.request_status[7], env["KVPoll"].Bootstrapping)
+        self.assertNotIn((7, epoch), p._source_drain._closed)
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":
