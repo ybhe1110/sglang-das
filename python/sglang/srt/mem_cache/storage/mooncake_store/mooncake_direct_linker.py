@@ -9,6 +9,7 @@ from queue import Empty, Queue
 
 import torch
 
+from sglang.srt.disaggregation.utils import all_reduce_with_timeout
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -290,9 +291,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             extra_config=extra_config,
             dp_rank=getattr(params, "dp_rank", None),
         )
-        self.l1_fallback_enabled = (
-            os.environ.get("SGLANG_MOONCAKE_L1_FALLBACK", "1") == "1"
-        )
+        # Diagnostic branch: storage failures must not become L1 recomputation.
+        # Keep the bounded metadata worker; disabling it would change RPC wait
+        # semantics as well as fallback and invalidate the comparison.
         self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
         self.read_plan_reuse_ranges = (
             os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
@@ -369,30 +370,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 created._batch_exist = guarded_exists
             return created
 
-        if self.l1_fallback_enabled:
-            self._availability = MasterAvailability(
-                create_storage,
-                # A missing probe key (0) proves RPC health just as a hit does.
-                lambda st: checked_exists(
-                    st.store.batch_is_exist(["__sglang_master_health_probe__"]), 1
-                ),
-                timeout_s=float(
-                    os.environ.get("SGLANG_MOONCAKE_MASTER_TIMEOUT_S", "2")
-                ),
-                retry_s=float(os.environ.get("SGLANG_MOONCAKE_MASTER_RETRY_S", "10")),
-            )
-            self._availability.initialize()
-            self.storage = self._availability.storage
-        else:
-            self.storage = create_storage()
+        self._availability = MasterAvailability(
+            create_storage,
+            # A missing probe key (0) proves RPC health just as a hit does.
+            lambda st: checked_exists(
+                st.store.batch_is_exist(["__sglang_master_health_probe__"]), 1
+            ),
+            timeout_s=float(os.environ.get("SGLANG_MOONCAKE_MASTER_TIMEOUT_S", "2")),
+            retry_s=float(os.environ.get("SGLANG_MOONCAKE_MASTER_RETRY_S", "10")),
+        )
+        self._availability.initialize()
+        self.storage = self._availability.storage
         logger.info(
-            "Mooncake direct linker: rank_replicated=%s tp=%d/%d owner=%s suffix=%s L1_fallback=%s",
+            "Mooncake direct linker: rank_replicated=%s tp=%d/%d owner=%s suffix=%s "
+            "L1_fallback=False (diagnostic branch; storage errors are fatal)",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
             storage_suffix,
-            self.l1_fallback_enabled,
         )
 
         self.storage_metrics_collector = None
@@ -506,7 +502,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # PP0 queries every PP shard; the wrapper's existing TP/CP reduction
         # then selects a boundary that all ranks can restore.
         if not self._storage_ready():
-            return []
+            raise StoreUnavailable("Mooncake store unavailable; L1 fallback disabled")
         try:
             result = self._storage_metadata_call(
                 "lookup",
@@ -516,12 +512,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 query_all_pp=True,
             )
         except Exception as error:
-            if not getattr(self, "l1_fallback_enabled", True):
-                raise
             self._storage_failed(error)
-            # The wrapper still performs its TP/CP reduction with this empty
-            # result; never skip that collective on a locally failed lookup.
-            return []
+            # The wrapper agrees on failure across TP/CP before raising. Never
+            # represent an RPC failure as the successful answer "no keys".
+            raise
         restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
         if restorable:
@@ -538,18 +532,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         groups = getattr(self, "_load_revalidation_groups", ())
         if groups:
             # LayerSplit shards can be evicted independently after lookup.
-            # All CP ranks must either restore or recompute the same prefix.
+            # All CP ranks must agree before restoring or rejecting the prefix.
             verdict = torch.tensor([int(valid)], dtype=torch.int)
             for group in groups:
-                torch.distributed.all_reduce(
+                all_reduce_with_timeout(
                     verdict, op=torch.distributed.ReduceOp.MIN, group=group
                 )
             valid = bool(verdict.item())
         if not valid and getattr(self, "pp_size", 1) > 1:
             # PP0 has already distributed the prefix boundary. Preserve its
             # shape; the queued load reports failure via the existing PP abort
-            # path. Future PP0 lookups while down return no external hit.
+            # path. Future PP0 lookups while down fail before mask reduction.
             return True
+        if not valid:
+            raise StoreUnavailable(
+                "Mooncake load revalidation rejected across ranks; "
+                "L1 fallback disabled (including keys evicted after lookup)"
+            )
         return valid
 
     def _revalidate_load_local(self, transfers: list[PoolTransfer]) -> bool:
@@ -559,10 +558,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         The match-time lookup and ``batch_get_session_start`` can be minutes
         apart; master-side memory-watermark eviction in that window expires
         replicas and would fail the layer-wise load fatally. Re-checking here
-        lets the caller degrade the request to a plain cache miss instead.
+        lets all ranks reject the load before asynchronous I/O starts.
 
-        Connection failures become a cache miss before device slots are
-        published. PP uses its already-agreed boundary and aborts on load failure.
+        False is a local verdict, never a request to recompute. The caller
+        reduces it and raises; PP keeps its boundary and aborts on load failure.
         """
         if not self._storage_ready():
             return False
@@ -594,7 +593,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             logger.warning(
                 "Mooncake direct linker load revalidation failed: "
                 "missing=%d/%d keys (master eviction race), "
-                "degrading request to cache miss",
+                "rejecting load (L1 fallback disabled)",
                 len(missing),
                 len(key_strs),
             )

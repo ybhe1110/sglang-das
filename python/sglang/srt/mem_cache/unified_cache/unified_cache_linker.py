@@ -284,7 +284,7 @@ class UnifiedCacheLinkerWrapper:
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         if known_hit_len is None:
             hit_pages = self._sync_restorable_prefix(
-                self.cache_linker.lookup(req.rid, lookup_transfers),
+                self._lookup_with_failure_consensus(req.rid, lookup_transfers),
                 num_pages=len(tail_hashes),
                 device_hit_pages=0,
             )
@@ -318,6 +318,28 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _lookup_with_failure_consensus(self, rid, transfers):
+        # All ranks have already agreed on match identity and geometry. A
+        # rank-local RPC exception must not leave peers in the variable mask
+        # collective, nor silently turn the failed lookup into recomputation.
+        error = None
+        restorable = []
+        try:
+            restorable = self.cache_linker.lookup(rid, transfers)
+        except Exception as exc:
+            error = exc
+            logger.error(
+                "External KV lookup failed; L1 fallback disabled: rid=%s: %s", rid, exc
+            )
+        verdict = torch.tensor([int(error is None)], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+        if not bool(verdict.item()):
+            raise DisaggregationCollectiveError(
+                f"external KV lookup failed on an attention rank; "
+                f"L1 fallback disabled: rid={rid}"
+            ) from error
+        return restorable
 
     def _match_preflight(
         self,
@@ -501,11 +523,21 @@ class UnifiedCacheLinkerWrapper:
         # Keys can be evicted remotely (master memory-watermark eviction)
         # between the match-time lookup and this load-back; a stale hit would
         # then fail the async layer-wise session fatally. Re-check existence
-        # here so the request degrades to a plain cache miss instead.
+        # here before submitting any asynchronous I/O.
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
-        if revalidate is not None and not revalidate(
-            [transfer for _, transfer in component_transfers]
-        ):
+        try:
+            valid = revalidate is None or revalidate(
+                [transfer for _, transfer in component_transfers]
+            )
+        except BaseException:
+            # These slots are not in private_loads yet and no worker has seen
+            # them. Return them exactly once even when strict revalidation or
+            # its collective raises; retain quarantine if ABORT itself fails.
+            self._abort_component_transfers(
+                req, component_transfers, device_hit_len, prefix_len
+            )
+            raise
+        if not valid:
             self._abort_component_transfers(
                 req, component_transfers, device_hit_len, prefix_len
             )

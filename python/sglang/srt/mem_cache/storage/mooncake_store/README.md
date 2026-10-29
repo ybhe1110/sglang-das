@@ -333,19 +333,19 @@ Distributed deployment of Mooncake is straightforward. Similar to the single-nod
 
 Mooncake also supports high availability mode. This mode enhances fault tolerance by running the `master service` as a cluster of multiple master nodes coordinated through an `etcd` cluster. The master nodes use `etcd` to elect a leader, which is responsible for handling client requests. For more details about how to deploy in this mode, please refer to our [documents](https://kvcache-ai.github.io/Mooncake/).
 
-### Automatic L1 fallback for the UnifiedCache direct linker
+### No-L1-fallback diagnostic branch for the UnifiedCache direct linker
 
-`MooncakeDirectLinker` treats the remote store as an optional cache. By default,
-startup connection failures, metadata RPC errors (including negative error codes
-and malformed replies), metadata RPC result timeouts, and asynchronous load/write-back
-failures open a local circuit breaker. New remote lookups return no external hit:
-existing device L1 prefixes remain usable, and missing tokens are recomputed.
-This does not restore KV that exists only in Mooncake into L1.
+This branch removes the conversion of storage faults into L1 recomputation.
+Lookup exceptions, invalid metadata replies, timeouts and an open metadata circuit
+are agreed across the attention ranks and cause a fatal scheduler error before
+the variable-size mask collective. A rejected load revalidation also fails in PP1,
+after releasing allocations that have not been handed to a worker. Normal complete
+L1 hits and successful L3 queries reporting missing keys still work normally.
+`SGLANG_MOONCAKE_L1_FALLBACK` is ignored on this diagnostic branch, even if set to 1.
 
 Set these environment variables on **all SGLang ranks**:
 
 ```bash
-export SGLANG_MOONCAKE_L1_FALLBACK=1       # default; 0 disables the circuit breaker
 export SGLANG_MOONCAKE_MASTER_TIMEOUT_S=2 # initial setup / each metadata wait phase budget
 export SGLANG_MOONCAKE_MASTER_RETRY_S=10  # cooldown before another recovery attempt
 ```
@@ -362,12 +362,12 @@ Metadata queries have two separate wait budgets, each set by
 `SGLANG_MOONCAKE_MASTER_TIMEOUT_S`: waiting for the worker (including dispatch),
 and waiting for the RPC result after the worker starts the operation. A query
 can therefore wait up to approximately twice this value. Exhausting the worker
-budget skips only the current lookup, revalidation, or write-back; it does not
+budget fails the current lookup, revalidation, or write-back; it does not
 mark the store unhealthy or extend the circuit-breaker cooldown. An RPC result
 timeout or SDK error still opens the circuit. An RPC timeout alone does not prove
 that the master is down; SDK execution can also be slow.
 
-With fallback enabled, metadata diagnostics include four fields on every query
+Metadata diagnostics include four fields on every query
 that completes, fails in the SDK, or times out:
 
 | Field | Meaning |
@@ -402,12 +402,12 @@ returns. The SDK must release the Python GIL during blocking calls for the Pytho
 wait budget to work; configure finite native RPC timeouts in the deployed SDK too.
 
 TP/CP lookups and load revalidation keep group agreement. A failure before load
-admission becomes a local-cache miss. A request already admitted to an external
+admission is fatal in PP1, not a local-cache miss. A request already admitted to an external
 load may still receive an abort response through the request cleanup state
 machine. In PP, once PP0 has distributed a prefix boundary, later stages preserve
 that boundary and report load failure through the existing PP abort path; they
 must not independently recompute different token lengths. A master-wide outage
-makes subsequent PP0 lookups miss. A connection failure isolated to another PP
+makes subsequent PP0 lookups fail. A connection failure isolated to another PP
 stage can still abort requests while PP0 remains connected.
 
 This feature covers the **UnifiedCache direct-linker storage path**, not the
@@ -424,12 +424,12 @@ CPU regression tests:
 python -m pytest -q test/registered/unit/mem_cache/test_mooncake_l1_fallback.py
 ```
 
-Before production rollout, validate on the deployed Linux GPU/DCU and Mooncake
-build: warm L1, stop the master during queries and active loads/write-backs,
-continue both repeated and new prompts, check process health and KV usage, then
-restart the master and check recovery. Repeat with TP/CP and PP, including a master
-that is unreachable at server startup. CPU fault injection does not establish
-native RPC timeout, DMA drain, or distributed liveness guarantees.
+This is an experiment, not an availability improvement: metadata faults can now
+restart the scheduler. Upgrade/rollback a whole communicating group; the new
+fixed-size lookup verdict collective must not be mixed with the release protocol.
+See [the A/B procedure](../../../../../../test/manual/disaggregation/no_l1_fallback_validation.md).
+CPU fault injection does not establish native RPC timeout, DMA drain, distributed
+liveness, or whether the original pool imbalance is caused by fallback.
 
 ### Deployment with Dummy Client (Experimental)
 

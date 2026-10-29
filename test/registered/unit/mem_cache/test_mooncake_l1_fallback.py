@@ -1,4 +1,4 @@
-"""CPU fault tests for optional Mooncake master availability and L1 fallback.
+"""CPU fault tests for the no-L1-fallback diagnostic branch.
 
 Loads production code without importing the GPU runtime; no Mooncake service is
 needed. Native data transfers are deliberately never timed out by this guard.
@@ -38,6 +38,28 @@ MasterAvailability = availability.MasterAvailability
 StoreUnavailable = availability.StoreUnavailable
 checked_exists = availability.checked_exists
 
+# Reuse CustomTestCase without importing the accelerator runtime on this
+# source-only CPU harness. Only CI GPU-idle/retry infrastructure is stubbed.
+test_utils_tree = ast.parse(
+    (ROOT / "python/sglang/test/test_utils.py").read_text(encoding="utf-8")
+)
+test_case_node = next(
+    n
+    for n in test_utils_tree.body
+    if isinstance(n, ast.ClassDef) and n.name == "CustomTestCase"
+)
+test_case_env = dict(
+    unittest=unittest,
+    _wait_for_gpu_idle_in_ci=lambda: None,
+    envs=SimpleNamespace(SGLANG_TEST_MAX_RETRY=SimpleNamespace(get=lambda: 0)),
+    retry=lambda action, **kwargs: action(),
+)
+exec(
+    compile(ast.Module(body=[test_case_node], type_ignores=[]), "test_utils", "exec"),
+    test_case_env,
+)
+CustomTestCase = test_case_env["CustomTestCase"]
+
 
 def eventually(predicate):
     deadline = time.monotonic() + 2
@@ -56,7 +78,7 @@ class Clock:
         return self.now
 
 
-class TestAvailability(unittest.TestCase):
+class TestAvailability(CustomTestCase):
     def setUp(self):
         self.clock = Clock()
         self.factory = Mock(return_value=object())
@@ -397,6 +419,9 @@ def linker_class(clock, pool_group, torch):
         StoreUnavailable=StoreUnavailable,
         checked_exists=checked_exists,
         arm_load_failure_injection=lambda *args: None,
+        all_reduce_with_timeout=lambda *args, **kwargs: torch.distributed.all_reduce(
+            *args, **kwargs
+        ),
     )
     exec(compile(module, "production linker", "exec"), env)
     return env["MooncakeDirectLinker"]
@@ -410,7 +435,7 @@ class Verdict:
         return self.value
 
 
-class TestLinkerFallback(unittest.TestCase):
+class TestLinkerFallback(CustomTestCase):
     def setUp(self):
         self.clock = Clock()
         self.raw = SimpleNamespace(
@@ -554,8 +579,10 @@ class TestLinkerFallback(unittest.TestCase):
 
         self.store.batch_set_v2.side_effect = writeback
         with self.assertLogs(availability.logger, level="WARNING") as logs:
-            self.assertEqual(linker.lookup("r", [self.transfer]), [])
-            self.assertFalse(linker.revalidate_load([self.transfer]))
+            with self.assertRaises(StoreUnavailable):
+                linker.lookup("r", [self.transfer])
+            with self.assertRaises(StoreUnavailable):
+                linker.revalidate_load([self.transfer])
             self.assertTrue(linker.offload([self.transfer]))
             eventually(lambda: linker.num_completed_offloads() == 1)
             self.assertFalse(linker.pop_completed_offload())
@@ -764,31 +791,35 @@ class TestLinkerFallback(unittest.TestCase):
         self.assertTrue(linker._storage_ready())
         backend.current_device.assert_called_once_with()
         backend.set_device.assert_called_once_with(3)
-        self.assertEqual({event[1] for event in events}, {threading.get_ident()})
+        self.assertNotEqual(events[-1][1], threading.get_ident())
         self.assertEqual(linker.lookup("r", [self.transfer]), [1])
 
-    def test_lookup_exception_is_miss_and_recovery_restores_hits(self):
+    def test_lookup_exception_is_fatal_and_recovery_restores_hits(self):
         linker = self.make_linker()
         self.assertEqual(linker.lookup("r", [self.transfer]), [1])
         self.raw.batch_is_exist.side_effect = ConnectionError("master down")
-        self.assertEqual(linker.lookup("r", [self.transfer]), [])
+        with self.assertRaises(StoreUnavailable):
+            linker.lookup("r", [self.transfer])
         count = self.raw.batch_is_exist.call_count
         for _ in range(10):
-            self.assertEqual(linker.lookup("r", [self.transfer]), [])
+            with self.assertRaises(StoreUnavailable):
+                linker.lookup("r", [self.transfer])
         self.assertEqual(self.raw.batch_is_exist.call_count, count)
         self.raw.batch_is_exist.side_effect = None
         self.clock.now = 5
         eventually(linker._storage_ready)
         self.assertEqual(linker.lookup("r", [self.transfer]), [1])
 
-    def test_lookup_timeout_returns_miss_without_accepting_late_remote_hit(self):
+    def test_lookup_timeout_is_fatal_without_accepting_late_remote_hit(self):
         linker = self.make_linker()
         release = threading.Event()
         self.raw.batch_is_exist.side_effect = lambda keys: (release.wait(2), [1])[1]
         try:
-            self.assertEqual(linker.lookup("r", [self.transfer]), [])
+            with self.assertRaises(StoreUnavailable):
+                linker.lookup("r", [self.transfer])
             self.assertFalse(linker._storage_ready())
-            self.assertEqual(linker.lookup("next-request", [self.transfer]), [])
+            with self.assertRaises(StoreUnavailable):
+                linker.lookup("next-request", [self.transfer])
             self.raw.batch_is_exist.assert_called_once()
         finally:
             release.set()
@@ -802,24 +833,27 @@ class TestLinkerFallback(unittest.TestCase):
         eventually(lambda: linker.num_completed_offloads() == 1)
         self.assertFalse(linker.pop_completed_offload())
         self.assertFalse(linker._storage_ready())
-        self.assertEqual(linker.lookup("next-request", [self.transfer]), [])
+        with self.assertRaises(StoreUnavailable):
+            linker.lookup("next-request", [self.transfer])
         self.raw.batch_is_exist.assert_not_called()
 
-    def test_startup_registration_failure_uses_l1_then_recovers(self):
+    def test_startup_registration_failure_rejects_lookup_then_recovers(self):
         self.raw.register_buffer.side_effect = ConnectionError("master down at startup")
         linker = self.make_linker()
         self.assertIsNone(linker.storage)
-        self.assertEqual(linker.lookup("r", [self.transfer]), [])
+        with self.assertRaises(StoreUnavailable):
+            linker.lookup("r", [self.transfer])
         self.raw.register_buffer.side_effect = None
         self.clock.now = 5
         eventually(linker._storage_ready)
         self.assertEqual(linker.lookup("r", [self.transfer]), [1])
 
-    def test_revalidation_exception_is_false_and_still_participates_in_reduction(self):
+    def test_revalidation_exception_reduces_before_fatal_exit(self):
         self.params.attn_tp_cache_group = object()
         linker = self.make_linker()
         self.raw.batch_is_exist.side_effect = ConnectionError("master down")
-        self.assertFalse(linker.revalidate_load([self.transfer]))
+        with self.assertRaises(StoreUnavailable):
+            linker.revalidate_load([self.transfer])
         self.torch.distributed.all_reduce.assert_called_once()
         self.assertEqual(self.torch.distributed.all_reduce.call_args.args[0].item(), 0)
 
@@ -828,7 +862,8 @@ class TestLinkerFallback(unittest.TestCase):
         self.params.attn_tp_cache_group = object()
         linker = self.make_linker()
         linker._availability.failed("master down")
-        self.assertFalse(linker.revalidate_load([self.transfer]))
+        with self.assertRaises(StoreUnavailable):
+            linker.revalidate_load([self.transfer])
         self.assertEqual(
             [
                 call.kwargs["group"]
@@ -852,7 +887,8 @@ class TestLinkerFallback(unittest.TestCase):
         self.assertFalse(linker._storage_ready())
         linker.layer_done_counter.set_consumer(index)
         linker.layer_done_counter.wait_until(0)
-        self.assertEqual(linker.lookup("next-request", [self.transfer]), [])
+        with self.assertRaises(StoreUnavailable):
+            linker.lookup("next-request", [self.transfer])
         self.raw.batch_is_exist.assert_not_called()
 
     def test_remote_rank_failure_disables_local_load(self):
@@ -861,7 +897,8 @@ class TestLinkerFallback(unittest.TestCase):
         self.torch.distributed.all_reduce.side_effect = lambda value, **kwargs: setattr(
             value, "value", 0
         )
-        self.assertFalse(linker.revalidate_load([self.transfer]))
+        with self.assertRaises(StoreUnavailable):
+            linker.revalidate_load([self.transfer])
 
     def test_pp_preserves_agreed_shape_then_reports_failed_load(self):
         self.params.pp_size = 2
@@ -903,7 +940,8 @@ class TestLinkerFallback(unittest.TestCase):
             self.assertTrue(started.wait(1))
             linker._availability.failed("master failed during write")
             self.assertEqual(linker.num_completed_offloads(), 0)
-            self.assertEqual(linker.lookup("r", [self.transfer]), [])
+            with self.assertRaises(StoreUnavailable):
+                linker.lookup("r", [self.transfer])
         finally:
             release.set()
         eventually(lambda: linker.num_completed_offloads() == 1)
@@ -924,7 +962,18 @@ class TestLinkerFallback(unittest.TestCase):
             n
             for n in cls.body
             if isinstance(n, ast.FunctionDef)
-            and n.name in ("match", "load_back", "_raise_if_cleanup_quarantined")
+            and n.name
+            in (
+                "match",
+                "load_back",
+                "_raise_if_cleanup_quarantined",
+                "_lookup_with_failure_consensus",
+                "_abort_component_transfers",
+                "_remember_private_slot_range",
+                "_mark_private_slots_released",
+                "_abort_transfers_with_quarantine",
+                "_update_load",
+            )
         ]
         module = ast.Module(
             body=[
@@ -939,7 +988,12 @@ class TestLinkerFallback(unittest.TestCase):
         env = dict(
             LinkerTransferPhase=SimpleNamespace(LOOKUP="lookup", LOAD="load"),
             ExternalLinkerLoadPhase=SimpleNamespace(ABORT="abort"),
+            PoolName=SimpleNamespace(KV="kv"),
             _PrivateLoad=SimpleNamespace,
+            torch=self.torch,
+            logger=logging.getLogger("linker-strict-test"),
+            DisaggregationCollectiveError=RuntimeError,
+            ExternalLinkerCleanupError=RuntimeError,
         )
         exec(compile(module, str(path), "exec"), env)
         wrapper = env[cls.name]()
@@ -952,6 +1006,7 @@ class TestLinkerFallback(unittest.TestCase):
         wrapper.cache = SimpleNamespace(
             page_size=1,
             pp_size=1,
+            _all_reduce_attn_groups=lambda value, op: None,
             _components_tuple=(component,),
             tree_core=SimpleNamespace(
                 empty_match_result=SimpleNamespace(device_indices=[])
@@ -962,11 +1017,9 @@ class TestLinkerFallback(unittest.TestCase):
         wrapper._match_preflight = Mock(
             side_effect=lambda rid, **kw: (kw["local_valid"], kw["tail_pages"])
         )
-        wrapper._abort_component_transfers = Mock()
         wrapper._clear_private_slot_ownership = Mock()
         wrapper._tail_hashes = Mock(return_value=["key"])
         wrapper._sync_restorable_prefix = Mock(return_value=0)
-        wrapper._update_load = Mock()
         wrapper._queue_load = Mock()
         result = SimpleNamespace(
             device_indices=SimpleNamespace(numel=lambda: device_hit_len)
@@ -984,16 +1037,13 @@ class TestLinkerFallback(unittest.TestCase):
             lookup.assert_not_called()
         self.raw.batch_is_exist.assert_not_called()
 
-    def test_partial_l1_hit_survives_failed_lookup_and_keeps_collective(self):
+    def test_partial_l1_hit_rejects_failed_lookup_before_mask_collective(self):
         linker = self.make_linker()
         self.raw.batch_is_exist.side_effect = ConnectionError("master down")
         wrapper, result = self.make_wrapper(linker, 2)
-        self.assertIs(
-            wrapper.match([1, 2, 3], SimpleNamespace(rid="r"), result), result
-        )
-        wrapper._sync_restorable_prefix.assert_called_once_with(
-            [], num_pages=1, device_hit_pages=0
-        )
+        with self.assertRaisesRegex(RuntimeError, "L1 fallback disabled"):
+            wrapper.match([1, 2, 3], SimpleNamespace(rid="r"), result)
+        wrapper._sync_restorable_prefix.assert_not_called()
         self.assertFalse(wrapper.hit_markers)
         self.assertEqual(result.device_indices.numel(), 2)
 
@@ -1007,20 +1057,117 @@ class TestLinkerFallback(unittest.TestCase):
             "master failed after lookup"
         )
         req = SimpleNamespace(rid="r", last_node=5)
-        self.assertEqual(wrapper.load_back(req), ([], 5))
+        # Observe the actual wrapper ABORT ownership transition, using an
+        # allocator boundary that rejects a duplicate free.
+        owned = {42}
+        self.transfer.device_indices = SimpleNamespace(numel=lambda: 1)
+
+        def release(phase, req, full, transfer, end, **kwargs):
+            self.assertEqual(phase, "abort")
+            owned.remove(42)
+
+        wrapper.cache._components_tuple[0].update_external_linker_load = release
+        with self.assertRaisesRegex(StoreUnavailable, "L1 fallback disabled"):
+            wrapper.load_back(req)
+        self.assertEqual(owned, set())
+        self.assertTrue(req.external_kv_private_slots_released)
+        self.assertEqual(
+            (req.external_kv_private_slots_start, req.external_kv_private_slots_end),
+            (2, 3),
+        )
         self.assertFalse(wrapper.hit_markers)
         wrapper._queue_load.assert_not_called()
-        wrapper._abort_component_transfers.assert_called_once()
-        self.assertEqual(wrapper._abort_component_transfers.call_args.args[2:], (2, 3))
-        wrapper._clear_private_slot_ownership.assert_called_once_with(req)
         self.assertFalse(linker.pending_loads)
+        self.assertFalse(wrapper.private_loads)
+        # No hit marker remains, so repeated cleanup cannot free slot 42 again.
+        self.assertEqual(wrapper.load_back(req), ([], 5))
 
     def test_disabled_fallback_keeps_lookup_exception_visible(self):
         os.environ["SGLANG_MOONCAKE_L1_FALLBACK"] = "0"
         linker = self.make_linker()
         self.raw.batch_is_exist.side_effect = ConnectionError("master down")
-        with self.assertRaises(ConnectionError):
+        with self.assertRaises(StoreUnavailable):
             linker.lookup("r", [self.transfer])
+
+    def test_true_l3_miss_remains_a_miss_but_stale_admitted_hit_is_rejected(self):
+        linker = self.make_linker()
+        self.raw.batch_is_exist.return_value = [0]
+        self.assertEqual(linker.lookup("cold", [self.transfer]), [])
+        self.assertTrue(linker._storage_ready())
+        with self.assertRaisesRegex(StoreUnavailable, "keys evicted after lookup"):
+            linker.revalidate_load([self.transfer])
+        self.assertEqual(linker.pending_loads, {})
+        self.assertEqual(linker.num_completed_loads(), 0)
+
+    def test_one_rank_lookup_error_stops_both_ranks_before_mask(self):
+        """A healthy rank must not proceed to variable reduction or L1 fallback."""
+
+        def fail(*args):
+            raise StoreUnavailable("injected metadata failure")
+
+        wrappers = [
+            self.make_wrapper(SimpleNamespace(lookup=lambda *args: [1]), 2),
+            self.make_wrapper(SimpleNamespace(lookup=fail), 2),
+        ]
+        barrier = threading.Barrier(2, timeout=2)
+        lock = threading.Lock()
+        votes, outcomes = [], []
+
+        def reduce_min(value, op):
+            with lock:
+                votes.append(value.item())
+            barrier.wait()
+            value.value = min(votes)
+            barrier.wait()
+
+        def run(wrapper, result):
+            try:
+                wrapper.match([1, 2, 3], SimpleNamespace(rid="same-rid"), result)
+                outcomes.append("unsafe continuation")
+            except RuntimeError as error:
+                outcomes.append(str(error))
+
+        threads = []
+        for wrapper, result in wrappers:
+            wrapper.cache._all_reduce_attn_groups = reduce_min
+            thread = threading.Thread(target=run, args=(wrapper, result), daemon=True)
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(sorted(votes), [0, 1])
+        self.assertEqual(len(outcomes), 2)
+        self.assertTrue(all("L1 fallback disabled" in message for message in outcomes))
+        for wrapper, _ in wrappers:
+            self.assertEqual(wrapper.hit_markers, {})
+            self.assertEqual(wrapper.private_loads, {})
+            wrapper._sync_restorable_prefix.assert_not_called()
+
+    def test_revalidation_release_error_keeps_quarantine_and_never_retries_free(self):
+        linker = self.make_linker()
+        linker._availability.failed("down after match")
+        wrapper, _ = self.make_wrapper(linker, 2)
+        wrapper.hit_markers["r"] = SimpleNamespace(
+            device_hit_len=2, tail_hashes=["key"]
+        )
+        self.transfer.device_indices = SimpleNamespace(numel=lambda: 1)
+        owned = {42}
+
+        def partial_free(*args, **kwargs):
+            owned.remove(42)
+            raise RuntimeError("allocator failed after side effect")
+
+        wrapper.cache._components_tuple[0].update_external_linker_load = partial_free
+        req = SimpleNamespace(rid="r", last_node=5)
+        with self.assertRaisesRegex(RuntimeError, "release uncertain"):
+            wrapper.load_back(req)
+        self.assertEqual(owned, set())
+        self.assertEqual(wrapper.cleanup_quarantine["r"]["states"], ("uncertain",))
+        self.assertIs(wrapper.cleanup_quarantine["r"]["req"], req)
+        with self.assertRaisesRegex(RuntimeError, "cleanup quarantined"):
+            wrapper.load_back(req)
+        self.assertEqual(linker.pending_loads, {})
 
 
 if __name__ == "__main__":

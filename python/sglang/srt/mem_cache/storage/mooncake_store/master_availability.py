@@ -1,4 +1,4 @@
-"""Bounded metadata calls and L1 fallback for the optional Mooncake store.
+"""Bounded metadata calls and availability tracking for the Mooncake store.
 
 Only initialization and existence queries run here. Never time out a GPU transfer
 and report it completed: a late native transfer may still access its buffers.
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class StoreUnavailable(RuntimeError):
-    """Remote caching is temporarily unavailable; use a local cache miss."""
+    """Remote caching is unavailable; callers decide how to fail the request."""
 
 
 def checked_exists(values, count):
@@ -113,7 +113,7 @@ class MasterAvailability:
     def _trip_locked(self, error):
         if self._healthy or self.failures == 0:
             logger.warning(
-                "Mooncake store unavailable; using L1 cache and recomputation: %s",
+                "Mooncake store unavailable; metadata circuit open: %s",
                 error,
             )
         self._healthy = False
@@ -222,8 +222,8 @@ class MasterAvailability:
         queue_deadline = timing.queued_at + self.timeout_s
 
         def worker_timeout():
-            # Local contention is not evidence of a failed master. The linker
-            # treats StoreUnavailable as a miss without calling failed() again.
+            # Local contention is not evidence of a failed master. Callers
+            # must not trip the circuit again for this StoreUnavailable error.
             timing.log(
                 "worker_timeout", logging.WARNING, "waiting for worker timed out"
             )
