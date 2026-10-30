@@ -1206,6 +1206,47 @@ class PrefillAdder:
 
         return self.budget_state()
 
+    @contextmanager
+    def _load_back_admission(self, req: Req):
+        linker = getattr(self.tree_cache, "linker", None)
+        if linker is None:
+            yield
+        else:
+            with linker.load_back_admission(req, self.can_run_list):
+                yield
+
+    def _get_prefill_admission_tokens(
+        self,
+        prefix_len: int,
+        fill_len: int,
+        chunk_tokens_limit: Optional[int],
+        truncation_align_size: Optional[int],
+    ) -> Optional[int]:
+        """Plan admission without allocating a load-back prefix.
+
+        Run again after load-back: revalidation can turn an external hit into
+        an L1 miss, increasing the compute required by this request.
+        """
+        input_tokens = self.ceil_paged_tokens(fill_len - prefix_len)
+        if (
+            self.rem_chunk_tokens is None
+            and self.can_run_list
+            and input_tokens >= self.rem_input_tokens
+        ):
+            return None
+        if self.dllm_config is not None:
+            if self.rem_dllm_tokens <= 0:
+                return None
+            assert truncation_align_size is None
+            return input_tokens
+        if chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
+            return input_tokens
+        trunc_len = chunk_tokens_limit // self.page_size * self.page_size
+        if truncation_align_size is not None:
+            trunc_len = trunc_len // truncation_align_size * truncation_align_size
+        end = (prefix_len + trunc_len) // self.page_size * self.page_size
+        return end - prefix_len if end > prefix_len else None
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
@@ -1278,7 +1319,7 @@ class PrefillAdder:
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
-        with self._lock_node(req.last_node):
+        with self._lock_node(req.last_node), self._load_back_admission(req):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
@@ -1303,6 +1344,25 @@ class PrefillAdder:
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+
+            # The chunk/alignment/tile gates must precede init_load_back too.
+            # A waiting L3 hit must not allocate on every step of a different
+            # request whose chunk already consumed the whole token budget.
+            expected_prefix_len = prefix_len + (
+                req.host_hit_length if req.needs_host_load_back() else 0
+            )
+            admission_tokens = self._get_prefill_admission_tokens(
+                expected_prefix_len,
+                len(req.full_untruncated_fill_ids),
+                chunk_tokens_limit,
+                truncation_align_size,
+            )
+            if admission_tokens is None:
+                return AddReqResult.OTHER
+            if (
+                tile_stop := self._check_prefill_tile_budget(admission_tokens)
+            ) is not None:
+                return tile_stop
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
             # report not-prefillable via finalize()) and before init_load_back
@@ -1342,37 +1402,23 @@ class PrefillAdder:
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
 
-            if (
-                self.rem_chunk_tokens is None
-                and len(self.can_run_list) != 0
-                and input_tokens >= self.rem_input_tokens
-            ):
-                # If without chunked prefill:
-                # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
-                # - if the can_run_list is empty, always accept the first prefill request
+            admission_tokens = self._get_prefill_admission_tokens(
+                prefix_len,
+                len(req.full_untruncated_fill_ids),
+                chunk_tokens_limit,
+                truncation_align_size,
+            )
+            if admission_tokens is None:
                 return AddReqResult.OTHER
+            if (
+                tile_stop := self._check_prefill_tile_budget(admission_tokens)
+            ) is not None:
+                return tile_stop
 
             if self.dllm_config is not None:
-                if self.rem_dllm_tokens <= 0:
-                    return AddReqResult.OTHER
-
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
-
-                if (
-                    tile_stop := self._check_prefill_tile_budget(input_tokens)
-                ) is not None:
-                    return tile_stop
-
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
-                if (
-                    tile_stop := self._check_prefill_tile_budget(input_tokens)
-                ) is not None:
-                    return tile_stop
-
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1393,35 +1439,7 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
-                # Make sure at least one page is available
-                trunc_len = chunk_tokens_limit // self.page_size * self.page_size
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
-                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
-                # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
-                    if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
-                    else:
-                        trunc_len = truncation_align_size * (
-                            trunc_len // truncation_align_size
-                        )
-
-                now_input_len = trunc_len + len(req.prefix_indices)
-                now_input_len = now_input_len // self.page_size * self.page_size
-                trunc_len = now_input_len - len(req.prefix_indices)
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                if (
-                    tile_stop := self._check_prefill_tile_budget(trunc_len)
-                ) is not None:
-                    return tile_stop
-
+                trunc_len = admission_tokens
                 # Chunked prefill
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.prefix_indices) + trunc_len

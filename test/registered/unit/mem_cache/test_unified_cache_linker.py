@@ -653,6 +653,10 @@ def test_private_load_abort_during_worker_waits_for_completion():
 
 def test_private_load_success_releases_ownership_without_abort():
     wrapper, _linker, calls, req = _private_load_wrapper(queued=False)
+    req.req_pool_idx = 0
+    req.prefix_indices = wrapper.private_loads[req.rid].device_indices
+    req.kv = SimpleNamespace(kv_allocated_len=1)
+    wrapper.bind_private_load(req)
     wrapper.taken_loads = [(["private-rid"], True)]
 
     assert wrapper.commit_completed_loads([True]) == []

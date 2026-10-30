@@ -3607,6 +3607,15 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _prepare_prefill_batch(self, batch: ScheduleBatch) -> None:
+        # Preserve L2's start order. Direct L3 loads use request-private slots:
+        # establish their request-row owner before starting asynchronous I/O.
+        if self.enable_hierarchical_cache:
+            batch.hicache_consumer_index = self.tree_cache.ready_to_load_host_cache()
+        batch.prepare_for_extend()
+        if self.enable_unified_cache_external_linker:
+            batch.hicache_consumer_index = self.tree_cache.ready_to_load_host_cache()
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3852,13 +3861,7 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
-            )
-
-        new_batch.prepare_for_extend()
+        self._prepare_prefill_batch(new_batch)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
