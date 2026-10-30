@@ -492,6 +492,13 @@ def alloc_for_extend(
         req.kv.kv_committed_len = seq_len
         batch.tree_cache.maybe_hand_to_session(req)
 
+    # A private L3 prefix is owned by the request only after its row has been
+    # written and its allocated range recorded, not merely after admission.
+    linker = getattr(batch.tree_cache, "linker", None)
+    if linker is not None:
+        for req in batch.reqs:
+            linker.bind_private_load(req)
+
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 

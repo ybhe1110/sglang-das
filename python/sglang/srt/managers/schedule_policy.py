@@ -1295,6 +1295,17 @@ class PrefillAdder:
 
         return self.budget_state()
 
+    @contextmanager
+    def _load_back_admission(self, req: Req):
+        linker = getattr(self.tree_cache, "linker", None)
+        if linker is None:
+            yield
+            return
+        with linker.load_back_admission(
+            req, lambda: any(candidate is req for candidate in self.can_run_list)
+        ):
+            yield
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
@@ -1322,7 +1333,7 @@ class PrefillAdder:
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
-        with self._lock_node(req.last_node):
+        with self._lock_node(req.last_node), self._load_back_admission(req):
             admission = self._select_prefill_admission(
                 req,
                 total_tokens=total_tokens,

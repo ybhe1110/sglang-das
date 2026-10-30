@@ -22,6 +22,8 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import contextmanager
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -153,6 +155,7 @@ class _PrivateLoad:
     device_indices: torch.Tensor
     cancelled: bool = False
     adopted: bool = False
+    bound: bool = False
 
 
 class _PendingOffload(NamedTuple):
@@ -222,10 +225,64 @@ class UnifiedCacheLinkerWrapper:
                 f"rids={list(self.cleanup_quarantine)}"
             )
 
+    @contextmanager
+    def load_back_admission(self, req: Req, admitted):
+        """Cancel unadmitted loads before restoring the waiting request's state."""
+        self._raise_if_cleanup_quarantined()
+        if req.rid in self.private_loads:
+            raise ExternalLinkerCleanupError(
+                f"External KV admission already owns private slots: rid={req.rid}"
+            )
+        saved_kv = copy(req.kv)
+        saved_kv.component_evicted_seqlens = req.kv.component_evicted_seqlens.copy()
+        saved = (req.prefix_len, req.last_node, req.host_loaded_length, saved_kv)
+        try:
+            yield
+        finally:
+            if not admitted():
+                self._raise_if_cleanup_quarantined()
+                private = self.private_loads.get(req.rid)
+                if private is not None:
+                    if private.adopted or private.bound:
+                        raise ExternalLinkerCleanupError(
+                            f"Unadmitted external KV already has a row owner: {req.rid}"
+                        )
+                    if not self.cache_linker.cancel_queued_load(req.rid):
+                        raise ExternalLinkerCleanupError(
+                            f"Cannot cancel unadmitted external KV load: {req.rid}"
+                        )
+                    self.private_loads.pop(req.rid)
+                    self._abort_transfers(req, private.transfers, private.prefix_len)
+                    req.external_kv_load_pending = False
+                req.prefix_len, req.last_node, req.host_loaded_length, req.kv = saved
+
+    def bind_private_load(self, req: Req) -> None:
+        """Allow I/O only after the row and its allocated extent are established."""
+        self._raise_if_cleanup_quarantined()
+        private = self.private_loads.get(req.rid)
+        if private is None:
+            return
+        if (
+            private.req is not req
+            or not private.adopted
+            or req.kv.req_pool_idx is None
+            or req.prefix_len < private.prefix_len
+            or req.kv.kv_allocated_len < private.prefix_len
+        ):
+            raise ExternalLinkerCleanupError(
+                f"External KV load has no allocated request-row owner: {req.rid}"
+            )
+        private.bound = True
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         self._raise_if_cleanup_quarantined()
+        private = self.private_loads.get(req.rid)
+        if private is not None and not private.bound:
+            raise ExternalLinkerCleanupError(
+                f"Cannot rematch unadmitted external KV load: {req.rid}"
+            )
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -345,11 +402,11 @@ class UnifiedCacheLinkerWrapper:
 
     def load_back(self, req: Req) -> tuple[int, NodeId]:
         self._raise_if_cleanup_quarantined()
+        if req.rid in self.private_loads:
+            raise ExternalLinkerCleanupError(f"Duplicate private load: {req.rid}")
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return 0, req.last_node
-        if req.rid in self.private_loads:
-            raise RuntimeError(f"Duplicate private load: {req.rid}")
         end = hit.device_hit_len + len(hit.tail_hashes) * self.cache.page_size
         transfers = []
         try:
@@ -427,6 +484,8 @@ class UnifiedCacheLinkerWrapper:
         self._raise_if_cleanup_quarantined()
         private = self.private_loads.get(req.rid)
         if private is not None:
+            if private.req is not req:
+                raise ExternalLinkerCleanupError(f"External KV owner changed: {req.rid}")
             private.adopted = True
 
     def prefix_device_indices(self, req):
@@ -514,7 +573,7 @@ class UnifiedCacheLinkerWrapper:
         failed = []
         for (rid, _), ok in zip(batch, statuses.tolist()):
             private = self.private_loads[rid]
-            if ok and not private.adopted:
+            if ok and not (private.adopted and private.bound):
                 raise RuntimeError(
                     f"Completed external load has no request owner: {rid}"
                 )
@@ -601,6 +660,11 @@ class UnifiedCacheLinkerWrapper:
 
     def start_layer_wise_loading(self) -> int:
         self._raise_if_cleanup_quarantined()
+        unbound = [rid for rid, private in self.private_loads.items() if not private.bound]
+        if unbound:
+            raise ExternalLinkerCleanupError(
+                f"Cannot start unadmitted external KV loads: rids={unbound}"
+            )
         scheduled = {rid for rids in self.load_batches.values() for rid in rids}
         rids = [rid for rid in self.private_loads if rid not in scheduled]
         preflight(self.cache, 6, rids, (len(rids), 0, 0))

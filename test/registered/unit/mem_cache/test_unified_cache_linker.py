@@ -424,7 +424,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         consumer_req_pool.req_to_token[req.kv.req_pool_idx, : len(tokens)] = indices
         req.origin_input_ids = req.full_untruncated_fill_ids = array("q", tokens)
         req.kv.kv_allocated_len = req.kv.kv_committed_len = len(tokens)
+        req.prefix_len = req.kv.kv_allocated_len
         consumer.linker.adopt_request(req)
+        consumer.linker.bind_private_load(req)
         index = consumer.ready_to_load_host_cache()
         consumer_linker.complete_started_loads()
         assert consumer.finish_external_linker_loads(index) == []
@@ -478,7 +480,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
                     cache.linker.prefix_device_indices(req),
                 )
                 req.kv.kv_allocated_len = req.kv.kv_committed_len = 6
+                req.prefix_len = req.kv.kv_allocated_len
                 cache.linker.adopt_request(req)
+                cache.linker.bind_private_load(req)
                 index = cache.ready_to_load_host_cache()
                 backend.completed_loads.append([(req.rid, False)])
                 self.assertEqual(cache.finish_external_linker_loads(index), [req])
@@ -678,7 +682,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         req.origin_input_ids = req.full_untruncated_fill_ids = array("q", tokens[:4])
         req.kv.kv_allocated_len = req.kv.kv_committed_len = 4
         req.kv.cache_protected_len = 2
+        req.prefix_len = req.kv.kv_allocated_len
         consumer.linker.adopt_request(req)
+        consumer.linker.bind_private_load(req)
         index = consumer.ready_to_load_host_cache()
         consumer_linker.complete_started_loads()
         self.assertEqual(consumer.finish_external_linker_loads(index), [])
