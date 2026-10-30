@@ -23,6 +23,8 @@ import hashlib
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import contextmanager
+from copy import copy
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -158,6 +160,8 @@ class _PrivateLoad(NamedTuple):
     prev_prefix_len: int
     prefix_len: int
     device_indices: torch.Tensor
+    # Set only after alloc_for_extend writes this prefix into a request row.
+    bound: bool = False
 
 
 class UnifiedCacheLinkerWrapper:
@@ -221,10 +225,77 @@ class UnifiedCacheLinkerWrapper:
                 f"rids={list(self.cleanup_quarantine)}"
             )
 
+    @contextmanager
+    def load_back_admission(self, req: Req, admitted_reqs: list[Req]):
+        """Roll back a private load if a later admission gate rejects the request.
+
+        Admission and backend start run on the scheduler thread. Only a positive
+        cancel result proves that a rejected load is still safe to release.
+        """
+        self._raise_if_cleanup_quarantined()
+        if req.rid in self.private_loads:
+            raise ExternalLinkerCleanupError(
+                f"external KV admission still owns a private load: rid={req.rid}"
+            )
+        prefix = req.prefix_indices
+        last_node = req.last_node
+        host_loaded_length = getattr(req, "host_loaded_length", 0)
+        protected_len = req.cache_protected_len
+        kv = copy(req.kv)
+        try:
+            yield
+        finally:
+            if not any(candidate is req for candidate in admitted_reqs):
+                self._raise_if_cleanup_quarantined()
+                private = self.private_loads.get(req.rid)
+                if private is not None:
+                    if private.bound or not self.cache_linker.cancel_queued_load(
+                        req.rid
+                    ):
+                        # Retain the descriptor and its slots. A worker may be
+                        # writing; neither a rematch nor a timed wait is a fence.
+                        raise ExternalLinkerCleanupError(
+                            "cannot cancel unadmitted external KV load; "
+                            f"private slots retained: rid={req.rid}"
+                        )
+                    self.private_loads.pop(req.rid)
+                    self._abort_private_load(req.rid, private)
+                    self._clear_private_slot_ownership(req)
+                # PREPARE may have created ReqKvInfo or advanced its SWA
+                # boundary. Restore it along with the original L1 prefix.
+                req.prefix_indices = prefix
+                req.last_node = last_node
+                req.host_loaded_length = host_loaded_length
+                req.cache_protected_len = protected_len
+                req.kv = kv
+                self.hit_markers.pop(req.rid, None)
+
+    def bind_private_load(self, req: Req) -> None:
+        """Record the request-row owner after its prefix indices are written."""
+        private = self.private_loads.get(req.rid)
+        if private is None:
+            return
+        if (
+            private.req is not req
+            or req.req_pool_idx is None
+            or len(req.prefix_indices) != private.prefix_len
+            or req.kv is None
+            or req.kv.kv_allocated_len < private.prefix_len
+        ):
+            raise ExternalLinkerCleanupError(
+                f"external KV request-row handoff is incomplete: rid={req.rid}"
+            )
+        self.private_loads[req.rid] = private._replace(bound=True)
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         self._raise_if_cleanup_quarantined()
+        private = self.private_loads.get(req.rid)
+        if private is not None and not private.bound:
+            raise ExternalLinkerCleanupError(
+                f"cannot rematch unbound external KV slots: rid={req.rid}"
+            )
         cache = self.cache
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
@@ -474,6 +545,10 @@ class UnifiedCacheLinkerWrapper:
 
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         self._raise_if_cleanup_quarantined()
+        if req.rid in self.private_loads:
+            raise ExternalLinkerCleanupError(
+                f"external KV load already has an owner: rid={req.rid}"
+            )
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
         hit = self.hit_markers.pop(req.rid, None)
@@ -487,9 +562,16 @@ class UnifiedCacheLinkerWrapper:
         # Build per-component linker transfers.
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
         for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
-            )
+            try:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, tail_hashes
+                )
+            except BaseException:
+                # Reclaim earlier components when a later allocation fails.
+                self._abort_component_transfers(
+                    req, component_transfers, device_hit_len, prefix_len
+                )
+                raise
             if transfer is None:
                 self._abort_component_transfers(
                     req, component_transfers, device_hit_len, prefix_len
@@ -503,9 +585,17 @@ class UnifiedCacheLinkerWrapper:
         # then fail the async layer-wise session fatally. Re-check existence
         # here so the request degrades to a plain cache miss instead.
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
-        if revalidate is not None and not revalidate(
-            [transfer for _, transfer in component_transfers]
-        ):
+        try:
+            valid = revalidate is None or revalidate(
+                [transfer for _, transfer in component_transfers]
+            )
+        except BaseException:
+            # No backend worker has seen these allocations yet.
+            self._abort_component_transfers(
+                req, component_transfers, device_hit_len, prefix_len
+            )
+            raise
+        if not valid:
             self._abort_component_transfers(
                 req, component_transfers, device_hit_len, prefix_len
             )
@@ -891,6 +981,16 @@ class UnifiedCacheLinkerWrapper:
         assert len(successes) <= len(self.taken_loads)
         failed: list[str] = []
         for success in successes:
+            # A successful read does not establish a request-row owner. Check
+            # the whole batch before retiring any descriptor or completion.
+            if success:
+                for rid in self.taken_loads[0][0]:
+                    private = self.private_loads.get(rid)
+                    if private is not None and not private.bound:
+                        raise ExternalLinkerCleanupError(
+                            "completed external KV load has no request-row owner; "
+                            f"private slots retained: rid={rid}"
+                        )
             rids, _local_success = self.taken_loads.pop(0)
             for rid in rids:
                 private = self.private_loads.pop(rid, None)
@@ -1067,6 +1167,13 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def start_layer_wise_loading(self) -> int:
+        unbound = [
+            rid for rid, private in self.private_loads.items() if not private.bound
+        ]
+        if unbound:
+            raise ExternalLinkerCleanupError(
+                f"cannot start unadmitted external KV loads: rids={unbound}"
+            )
         return self.cache_linker.start_layer_wise_loading()
 
     # ---- lifecycle ----
