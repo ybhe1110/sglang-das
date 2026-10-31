@@ -37,6 +37,7 @@ availability = load_module("master_availability_test", BASE / "master_availabili
 MasterAvailability = availability.MasterAvailability
 StoreUnavailable = availability.StoreUnavailable
 checked_exists = availability.checked_exists
+native_guard = load_module("fallback_native_guard", BASE / "native_read_guard.py")
 
 
 def eventually(predicate):
@@ -394,6 +395,8 @@ def linker_class(clock, pool_group, torch):
         MasterAvailability=lambda *args, **kwargs: MasterAvailability(
             *args, clock=clock, **kwargs
         ),
+        NativeReadGuard=native_guard.NativeReadGuard,
+        read_failure_contract=native_guard.read_failure_contract,
         StoreUnavailable=StoreUnavailable,
         checked_exists=checked_exists,
         arm_load_failure_injection=lambda *args: None,
@@ -485,6 +488,7 @@ class TestLinkerFallback(unittest.TestCase):
                 "SGLANG_MOONCAKE_MASTER_RETRY_S": "5",
                 "SGLANG_MOONCAKE_READ_PLAN": "0",
                 "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES": "0",
+                "SGLANG_MOONCAKE_NATIVE_READ_CONTRACT": "",
             },
         )
         self.env.start()
@@ -844,6 +848,9 @@ class TestLinkerFallback(unittest.TestCase):
         plan.wait.side_effect = plan.run.side_effect
         self.raw.create_read_plan = Mock(return_value=plan)
         linker = self.make_linker()
+        # This synchronous fake has no late DMA. Do not infer this contract for
+        # an installed wheel merely because plan.run raises.
+        linker._native_read_guard.contract = {"read_plan_failure_drained": True}
         linker._prepare_read_plan_layouts = Mock(return_value=[])
         self.assertTrue(linker.load("r", [self.transfer]))
         index = linker.start_layer_wise_loading()
@@ -854,6 +861,101 @@ class TestLinkerFallback(unittest.TestCase):
         linker.layer_done_counter.wait_until(0)
         self.assertEqual(linker.lookup("next-request", [self.transfer]), [])
         self.raw.batch_is_exist.assert_not_called()
+
+    def range_linker(self, *, verified=False):
+        """Exercise the real load worker with a synchronous fake native store."""
+        linker = self.cls(self.args, self.params, components=(), storage=self.store)
+        self.cls.load_layer_wise.__globals__["arm_load_failure_injection"] = (
+            lambda *args: lambda *args: None
+        )
+        self.transfer.host_indices = [7]
+        self.pools["kv"].prepare_locations = lambda indices: indices
+        self.pools["kv"].get_prepared_layer_range_meta = (
+            lambda locations, layer: ([[100]], [[16]], [[0]])
+        )
+        self.raw.batch_get_session_start = Mock(return_value=[0])
+        self.raw.batch_get_session_end = Mock(return_value=0)
+        self.raw.batch_get_into_multi_buffer_ranges = Mock(return_value=[16])
+        if verified:
+            linker._native_read_guard.contract = {"range_get_failure_drained": True}
+
+        def stop_test_threads():
+            # Unknown DMA ownership intentionally prevents production close().
+            # These fakes have no DMA: stop test threads without retiring owners.
+            linker.load_queue.put(None)
+            linker.offload_queue.put(None)
+            linker.load_thread.join(2)
+            linker.offload_thread.join(2)
+            self.assertFalse(linker.load_thread.is_alive())
+            self.assertFalse(linker.offload_thread.is_alive())
+            linker._availability.close()
+            if not linker._native_read_guard.snapshot()["uncertain_reads"]:
+                linker._native_read_guard.close()
+
+        self.addCleanup(stop_test_threads)
+        return linker
+
+    def test_unverified_native_failure_withholds_completion_and_sessions(self):
+        linker = self.range_linker()
+        self.raw.batch_get_into_multi_buffer_ranges.return_value = [-707]
+        self.assertTrue(linker.load("old-owner", [self.transfer]))
+        linker.start_layer_wise_loading()
+        eventually(lambda: linker.load_queue.unfinished_tasks == 0)
+        self.raw.batch_get_into_multi_buffer_ranges.assert_called_once()
+        self.raw.batch_get_session_end.assert_not_called()
+        self.assertTrue(linker.completed_loads.empty())
+        self.assertTrue(linker.has_unresolved_transfers())
+        for operation in (linker.num_completed_loads, linker.reset, linker.close):
+            with self.assertRaises(native_guard.NativeReadUncertain):
+                operation()
+        self.assertEqual(linker._uncertain_sessions, [("key",)])
+        self.store.close.assert_not_called()
+
+    def test_verified_failure_retires_once_then_next_batch_can_succeed(self):
+        linker = self.range_linker(verified=True)
+        self.raw.batch_get_into_multi_buffer_ranges.side_effect = [[-800], [16]]
+        self.assertTrue(linker.load("failed", [self.transfer]))
+        linker.start_layer_wise_loading()
+        eventually(lambda: linker.num_completed_loads() == 1)
+        self.assertEqual(linker.pop_completed_load(), (["failed"], False))
+        self.assertEqual(self.raw.batch_get_session_end.call_count, 1)
+        self.clock.now += 5
+        eventually(linker._storage_ready)
+        self.assertTrue(linker.load("recovered", [self.transfer]))
+        linker.start_layer_wise_loading()
+        eventually(lambda: linker.num_completed_loads() == 1)
+        self.assertEqual(linker.pop_completed_load(), (["recovered"], True))
+        self.assertEqual(self.raw.batch_get_session_end.call_count, 2)
+        self.assertFalse(linker.has_unresolved_transfers())
+
+    def test_slow_native_blocks_admission_without_publishing_early_completion(self):
+        linker = self.range_linker()
+        linker._native_read_guard.stall_s = 0.02
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def read(*args):
+            started.set()
+            release.wait(2)
+            return [16]
+
+        self.raw.batch_get_into_multi_buffer_ranges.side_effect = read
+        self.assertTrue(linker.load("slow", [self.transfer]))
+        linker.start_layer_wise_loading()
+        self.assertTrue(started.wait(1))
+        eventually(linker._native_read_guard.admission_blocked)
+        self.clock.now += 100
+        for _ in range(10):
+            self.assertFalse(linker._storage_ready())
+        self.assertTrue(linker.has_unresolved_transfers())
+        self.assertTrue(linker.completed_loads.empty())
+        self.raw.batch_get_session_end.assert_not_called()
+        self.raw.batch_is_exist.assert_not_called()
+        release.set()
+        eventually(lambda: linker.num_completed_loads() == 1)
+        self.assertEqual(linker.pop_completed_load(), (["slow"], False))
+        self.raw.batch_get_session_end.assert_called_once_with(["key"])
+        self.assertFalse(linker.has_unresolved_transfers())
 
     def test_remote_rank_failure_disables_local_load(self):
         self.params.attn_tp_cache_group = object()

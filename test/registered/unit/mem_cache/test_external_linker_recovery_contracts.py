@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     LayerWiseLoadCounter,
     MooncakeDirectLinker,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.native_read_guard import NativeReadGuard
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalLinkerCleanupError,
     UnifiedCacheLinkerWrapper,
@@ -183,11 +184,18 @@ class TestSessionOwnership(CustomTestCase):
         linker.layer_done_counter.fail.assert_called_once()
 
     def _range_failure_then_recovery(self, *, fail_at=0, raises=False, page_wise=False):
-        """Run the real worker, loader, counter and session cleanup for two batches.
+        """Run worker, loader, counter and session cleanup for two batches.
 
         Native reads and device events are simulated; this does not establish a
         native DMA fence. The second batch succeeds without restarting the worker.
         """
+        # This fake never writes after returning. Real wheels need the explicit
+        # binary-pinned contract, rather than inheriting that assumption.
+        self.linker._native_read_guard = NativeReadGuard(
+            self.linker._storage_failed,
+            contract={"range_get_failure_drained": True},
+        )
+        self.addCleanup(self.linker._native_read_guard.close)
         linker = self.linker
         linker.tp_rank = 0
         linker.num_layers = 3

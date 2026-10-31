@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import (
@@ -58,6 +60,7 @@ class SchedulerInvariantChecker:
     get_inflight_req_count: Callable[[], int] = lambda: 0
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
+    _last_idle_audit: float = field(default=float("-inf"), init=False)
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
@@ -77,7 +80,8 @@ class SchedulerInvariantChecker:
         leak = total_accounted != total
         msg = (
             f"[{pool_name}] {total=}, {available=}, {evictable=}, "
-            f"{protected=}, {session_held=}, {uncached=}"
+            f"{protected=}, {session_held=}, {uncached=}, "
+            f"accounted={total_accounted}, delta={total_accounted - total}"
         )
         return leak, msg
 
@@ -512,6 +516,30 @@ class SchedulerInvariantChecker:
             "count_memory_leak_warnings",
             msg,
         )
+
+    def audit_idle_pools(self, ps: PoolStats) -> Tuple[bool, List[str]]:
+        """Log an actual drained audit, including successful FULL/SWA balances.
+
+        No estimates are added to uncached. The caller must first establish
+        full scheduler idleness; recheck external owners at the audit boundary.
+        """
+        linker = getattr(self.tree_cache, "linker", None)
+        if linker is not None and linker.has_pending_operations():
+            raise RuntimeError("Idle KV pool audit requested before linker drain")
+        has_leak, messages = self._check_all_pools(ps)
+        now = time.monotonic()
+        if has_leak or now - self._last_idle_audit >= 30:
+            logger.log(
+                logging.ERROR if has_leak else logging.INFO,
+                "Idle KV pool audit: status=%s drained=true pid=%d audit_time=%s %s %s",
+                "fail" if has_leak else "pass",
+                os.getpid(),
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                " | ".join(messages),
+                self._pool_owner_diagnostics(),
+            )
+            self._last_idle_audit = now
+        return has_leak, messages
 
     def _check_all_pools(
         self, ps: PoolStats, uncached: int = 0

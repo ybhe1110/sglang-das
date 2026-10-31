@@ -99,6 +99,31 @@ class TestPairedL3FailureValidation(CustomTestCase):
         result = self.stream([record], expect_abort=False)
         self.assertEqual(result["meta"]["finish_reason"]["type"], "length")
 
+    def test_mixed_fault_round_accepts_load_abort_or_safe_recompute(self):
+        for record in (
+            self.abort(),
+            {"meta_info": {"finish_reason": {"type": "length"}}},
+        ):
+            self.client.validate_terminal(record, 1, None, "external KV")
+
+    def test_mixed_fault_round_rejects_unrelated_abort(self):
+        record = self.abort()
+        record["meta_info"]["finish_reason"]["message"] = "Cancelled by client"
+        with self.assertRaisesRegex(RuntimeError, "expected cause"):
+            self.client.validate_terminal(record, 1, None, "external KV")
+
+    def test_pair_has_common_lifecycle_key_and_explicit_dp_ranks(self):
+        payload = {"rid": "test-rid", "bootstrap_room": 42}
+        p, d = self.client.paired_payloads(payload, 13)
+        self.assertEqual(p["bootstrap_pair_key"], d["bootstrap_pair_key"])
+        self.assertTrue(p["bootstrap_pair_key"])
+        self.assertEqual((p["routed_dp_rank"], d["routed_dp_rank"]), (0, 13))
+        self.assertEqual(p["disagg_prefill_dp_rank"], 0)
+        self.assertEqual(d["disagg_prefill_dp_rank"], 0)
+        self.assertNotIn("bootstrap_pair_key", payload)
+        retry, _ = self.client.paired_payloads(payload, 13)
+        self.assertNotEqual(p["bootstrap_pair_key"], retry["bootstrap_pair_key"])
+
 
 if __name__ == "__main__":
     unittest.main()
