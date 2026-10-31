@@ -26,10 +26,6 @@ from sglang.srt.mem_cache.storage.mooncake_store.master_availability import (
     StoreUnavailable,
     checked_exists,
 )
-from sglang.srt.mem_cache.storage.mooncake_store.native_read_guard import (
-    NativeReadGuard,
-    read_failure_contract,
-)
 from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
 )
@@ -161,9 +157,8 @@ class LayerWiseLoadCounter:
 class ReadPlanLoadCounter:
     """Publish one Mooncake ReadPlan; wait for each layer without holding the GIL."""
 
-    def __init__(self, num_layers: int, on_progress=None):
+    def __init__(self, num_layers: int):
         self.num_layers = num_layers
-        self.on_progress = on_progress
         self.producer_index = self.consumer_index = -1
         self.plans: dict[int, Future] = {}
         # Batch indices already logged: one line per failed plan, not per layer.
@@ -192,8 +187,6 @@ class ReadPlanLoadCounter:
             return
         try:
             future.result().wait(threshold)
-            if self.on_progress is not None:
-                self.on_progress(index)
         except BaseException as error:
             # Do not raise from the model forward. A rank-local failure here can
             # strand peer TP/CP ranks in a later model collective and brings the
@@ -299,29 +292,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.l1_fallback_enabled = (
             os.environ.get("SGLANG_MOONCAKE_L1_FALLBACK", "1") == "1"
-        )
-        contract_path = os.environ.get("SGLANG_MOONCAKE_NATIVE_READ_CONTRACT")
-        binary = None
-        if contract_path:
-            from importlib.util import find_spec
-
-            spec = find_spec("mooncake.store")
-            binary = spec.origin if spec is not None else None
-        contract = read_failure_contract(contract_path, binary)
-        self._native_read_guard = NativeReadGuard(
-            self._storage_failed,
-            stall_s=float(os.environ.get("SGLANG_MOONCAKE_READ_STALL_S", "5")),
-            min_bytes_per_s=float(os.environ.get("SGLANG_MOONCAKE_READ_MIN_MBPS", "64"))
-            * 1024**2,
-            contract=contract,
-        )
-        logger.info(
-            "Mooncake native read safety: stall_s=%s failure_drained=%s "
-            "read_plan_failure_drained=%s; stall detection only stops admission, "
-            "it does not cancel DMA",
-            self._native_read_guard.stall_s,
-            contract.get("range_get_failure_drained", False),
-            contract.get("read_plan_failure_drained", False),
         )
         self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
         self.read_plan_reuse_ranges = (
@@ -444,9 +414,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage_metrics_collector = collector_cls(labels=labels)
 
         if self.read_plan_enabled:
-            self.layer_done_counter = ReadPlanLoadCounter(
-                self.num_layers, on_progress=self._native_read_guard.progress
-            )
+            self.layer_done_counter = ReadPlanLoadCounter(self.num_layers)
         else:
             self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
@@ -496,9 +464,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             context.source = previous
 
     def _storage_ready(self) -> bool:
-        guard = getattr(self, "_native_read_guard", None)
-        if guard is not None and guard.admission_blocked():
-            return False
         availability = getattr(self, "_availability", None)
         if availability is None:
             return True
@@ -673,30 +638,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def _raise_if_session_cleanup_uncertain(self) -> None:
-        guard = getattr(self, "_native_read_guard", None)
-        if guard is not None:
-            guard.check()
         error = getattr(self, "_session_cleanup_error", None)
         if error is not None:
             raise RuntimeError(error)
-
-    def _run_native_read(self, operation, **kwargs):
-        guard = getattr(self, "_native_read_guard", None)
-        if guard is None:
-            # Also fail closed for callers constructing a linker without __init__.
-            guard = self._native_read_guard = NativeReadGuard(self._storage_failed)
-        return guard.run(operation, **kwargs)
-
-    def has_unresolved_transfers(self) -> bool:
-        guard = getattr(self, "_native_read_guard", None)
-        state = guard.snapshot() if guard is not None else {}
-        return bool(
-            state.get("active_reads", 0)
-            or state.get("uncertain_reads", 0)
-            or getattr(self, "_session_cleanup_error", None)
-            or self.load_queue.unfinished_tasks
-            or self.offload_queue.unfinished_tasks
-        )
 
     def _quarantine_sessions(self, keys: list[str], reason: str) -> None:
         # An exception does not tell us whether native acquired/released some
@@ -809,20 +753,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 finally:
                     success = self.layer_done_counter.finish(counter_index) and success
                     self._finish_prefetch_metrics(list(pending), success is True)
-                    guard = getattr(self, "_native_read_guard", None)
-                    native_uncertain = (
-                        guard is not None and guard.snapshot()["uncertain_reads"]
-                    )
-                    if (
-                        getattr(self, "_session_cleanup_error", None) is None
-                        and not native_uncertain
-                    ):
+                    if getattr(self, "_session_cleanup_error", None) is None:
                         self.completed_loads.put((list(pending), success))
                     else:
                         logger.error(
                             "Withholding external load completion: batch=%d rids=%s; "
-                            "session/native ownership uncertain, "
-                            "private slots retained",
+                            "session ownership uncertain, private slots retained",
                             counter_index,
                             list(pending),
                         )
@@ -878,15 +814,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         continue
                     ptrs, sizes, offsets = meta
                     maybe_fail(name, f"layer={layer}")
-                    expected = [sum(item) for item in sizes]
-                    self._run_native_read(
-                        lambda: self.storage.store.batch_get_into_multi_buffer_ranges(
-                            keys, ptrs, sizes, offsets
-                        ),
-                        batch=counter_index,
-                        stage=f"pool={name},layer={layer}",
-                        expected=expected,
+                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
+                        keys,
+                        ptrs,
+                        sizes,
+                        offsets,
                     )
+                    expected = [sum(item) for item in sizes]
+                    if (
+                        result is None
+                        or isinstance(result, int)
+                        or list(result) != expected
+                    ):
+                        raise RuntimeError(
+                            f"Mooncake range get failed for pool={name}, "
+                            f"layer={layer}: transferred={result}, "
+                            f"expected={expected}"
+                        )
                 self.layer_done_counter.complete(counter_index, layer)
             success = True
         except BaseException as error:
@@ -894,16 +838,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
-            guard = getattr(self, "_native_read_guard", None)
-            if guard is not None and guard.snapshot()["uncertain_reads"]:
-                # Ending cached metadata is not cancellation. Retain all known
-                # sessions and private slots until process teardown.
-                self._quarantine_sessions(
-                    [key for keys in started for key in keys],
-                    "native read failure has no verified DMA drain contract",
-                )
-                success = False
-            elif not self._end_load_sessions(started):
+            if not self._end_load_sessions(started):
                 self.layer_done_counter.fail(
                     counter_index, RuntimeError(self._session_cleanup_error)
                 )
@@ -990,15 +925,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Mooncake's range API is key-major and does not take a pool argument,
         # so differently suffixed physical-pool objects can share one call.
         maybe_fail("aggregated", "complete_page")
-        expected = [sum(item) for item in all_sizes]
-        self._run_native_read(
-            lambda: self.storage.store.batch_get_into_multi_buffer_ranges(
-                all_keys, all_ptrs, all_sizes, all_offsets
-            ),
-            batch=counter_index,
-            stage="complete_page",
-            expected=expected,
+        result = self.storage.store.batch_get_into_multi_buffer_ranges(
+            all_keys, all_ptrs, all_sizes, all_offsets
         )
+        expected = [sum(item) for item in all_sizes]
+        if result is None or isinstance(result, int) or list(result) != expected:
+            pool_counts = {str(name): len(keys) for name, (keys, _) in batches.items()}
+            raise RuntimeError(
+                "Mooncake aggregated range get failed for "
+                f"pools={pool_counts}, complete_page: transferred={result}, "
+                f"expected={expected}"
+            )
 
         # Page-wise loading gives up layer overlap. Release the read sessions
         # only after every complete page is loaded, and before any layer becomes
@@ -1061,17 +998,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.layer_done_counter.bind(counter_index, plan)
         # run() and wait() release the GIL. Each layer becomes visible only after
         # every pool's bytes have been checked; the last wait includes cleanup.
-        byte_count = sum(
-            len(locations) * sum(item[2] for layer in layout for item in layer)
-            for _, locations, _, layout in layouts
-        )
-        self._run_native_read(
-            plan.run,
-            batch=counter_index,
-            stage="read_plan",
-            read_plan=True,
-            byte_count=byte_count,
-        )
+        plan.run()
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
@@ -1172,9 +1099,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def close(self) -> None:
         self.reset()
-        guard = getattr(self, "_native_read_guard", None)
-        if guard is not None:
-            guard.close()
         self.load_queue.put(None)
         self.offload_queue.put(None)
         self.load_thread.join()

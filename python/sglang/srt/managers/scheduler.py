@@ -4675,7 +4675,7 @@ class Scheduler(
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
         if not self.enable_hisparse and not deferred_pending:
-            has_leak, messages = self.invariant_checker.audit_idle_pools(
+            has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
             )
             if has_leak:
@@ -4734,8 +4734,6 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
-                idle &= not self._external_kv_cleanup_quarantine
-                idle &= not self._external_kv_cleanup_rids
 
                 # Retry reclaiming stranded failed linker chains periodically
                 if self.enable_unified_cache_external_linker:

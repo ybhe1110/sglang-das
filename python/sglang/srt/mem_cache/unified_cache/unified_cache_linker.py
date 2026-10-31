@@ -67,10 +67,6 @@ class UnifiedCacheLinker(ABC):
 
     layer_done_counter: object
 
-    def has_unresolved_transfers(self) -> bool:
-        """Native workers may retain buffers after the scheduler queue empties."""
-        return False
-
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         """Return every prefix length (in pages) that is fully restorable.
@@ -213,9 +209,6 @@ class UnifiedCacheLinkerWrapper:
         return rid in self.hit_markers
 
     def has_pending_operations(self) -> bool:
-        native_pending = getattr(
-            type(self.cache_linker), "has_unresolved_transfers", None
-        )
         return bool(
             self.pending_loads
             or self.failed_chains
@@ -223,7 +216,6 @@ class UnifiedCacheLinkerWrapper:
             or self.pending_offloads
             or self.taken_loads
             or getattr(self, "cleanup_quarantine", {})
-            or (native_pending is not None and native_pending(self.cache_linker))
         )
 
     def _raise_if_cleanup_quarantined(self) -> None:
