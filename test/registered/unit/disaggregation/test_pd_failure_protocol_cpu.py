@@ -94,6 +94,7 @@ def wire_managers():
     """
     env = dict(
         InvalidBootstrapPairKey=ValueError,
+        DisaggregationMode=SimpleNamespace(PREFILL="prefill", DECODE="decode"),
         time=time,
         logger=Mock(),
         ABORT_TAG=b"ABORT",
@@ -136,6 +137,7 @@ def wire_managers():
         "register_deferred_ack_target",
         "poison_deferred_ack_room",
         "update_status",
+        "check_status",
     }
     base = extract_class(COMMON, "CommonKVManager", shared, [], env)
     cls = extract_class(
@@ -148,6 +150,9 @@ def wire_managers():
             "_retire_abort_binding",
             "_handle_abort_notification",
             "_handle_deferred_abort_notification",
+            "_cancel_paired_source",
+            "_mark_source_failed_locked",
+            "source_transfers_terminal",
             "_handle_legacy_abort_notification",
         },
         ["CommonKVManager"],
@@ -165,6 +170,8 @@ def wire_managers():
         return m
 
     p, d = init(cls()), init(base())
+    p.disaggregation_mode = "prefill"
+    d.disaggregation_mode = "decode"
     p._source_drain = SourceDrainTracker()
     p._abort_room_bindings = {}
     p._source_room_pair_keys = {}
@@ -172,6 +179,9 @@ def wire_managers():
     p._pending_abort_metadata_count = 0
     p._pending_abort_metadata_times = OrderedDict()
     p._retired_abort_rooms = OrderedDict()
+    p._cancelled_source_pairs = set()
+    p._cancelled_source_pair_limit = 65536
+    p._source_admission_fenced = False
     sent = []
 
     def deliver(endpoint, frames, **kwargs):
