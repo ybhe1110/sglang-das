@@ -374,6 +374,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._pending_abort_metadata_count = 0
             self._pending_abort_metadata_times = OrderedDict()
             self._retired_abort_rooms = OrderedDict()
+            # Unlike retransmission caches, cancellation fences cannot expire:
+            # a delayed HTTP request/metadata must not resurrect an ACKed pair.
+            self._cancelled_source_pairs = set()
+            self._cancelled_source_pair_limit = 65536
+            self._source_admission_fenced = False
             self.session_lock = threading.Lock()
             self._transfer_completion_condition = threading.Condition()
             self.pd_hidden_events.init_prefill_state()
@@ -3402,6 +3407,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 "Mooncake deferred release requires a shared bootstrap_pair_key; upgrade the P/D router"
             )
         with self._source_drain.lock:
+            if self.enable_deferred_decode_kv_release and (
+                self._source_admission_fenced
+                or (room, bootstrap_pair_key) in self._cancelled_source_pairs
+            ):
+                # No generation or room state is acquired. Return a Failed
+                # sender for TP/CP/PP bootstrap consensus, not a rank-local
+                # exception. Repeated late requests cannot touch a newer owner.
+                return None
             if (
                 self.enable_deferred_decode_kv_release
                 and room in self._retired_abort_rooms
@@ -3414,6 +3427,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._source_room_pair_keys[room] = bootstrap_pair_key
             self._abort_room_bindings[room] = (generation, {})
             self._retired_abort_rooms.pop(room, None)
+            # Publish opening status in the same critical section as ownership.
+            # ABORT between here and CommonKVSender.__init__ must latch Failed.
+            self.update_status(room, KVPoll.Bootstrapping)
             # Early metadata is only a proposal. Publish destinations only
             # after the scheduler has independently identified the source owner.
             pending = self._pending_abort_metadata.pop(room, {})
@@ -3461,6 +3477,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 return False
             epoch = self._source_drain._generations.get(room)
+            if self.enable_deferred_decode_kv_release and (
+                (room, pair_key) in self._cancelled_source_pairs
+                or (epoch is None and self._source_admission_fenced)
+                or (room, epoch) in self._source_drain._closed
+            ):
+                # This also covers cancellation before any metadata arrived.
+                return False
             if epoch is None:
                 if (
                     room in self._retired_abort_rooms
@@ -4352,6 +4375,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ack_target = notification.deferred_ack_target()
         if ack_target is None:
             return
+        if notification.bootstrap_pair_key is not None:
+            self._cancel_paired_source(
+                room, notification.bootstrap_pair_key, ack_target
+            )
+            return
         with self._source_drain.lock:
             binding = self._abort_room_bindings.get(room)
             epoch = self._source_drain._generations.get(room)
@@ -4380,6 +4408,83 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self.update_status(room, KVPoll.Failed)
             self.register_deferred_ack_target(room, ack_target)
         self._maybe_ack_drained_abort(room)
+
+    def _cancel_paired_source(self, room, pair_key, ack_target):
+        """Fence future writers before ACKing a cancellation without a P owner.
+
+        The router's shared pair key identifies the request; D's generation
+        identifies its receiver. P's source generation is an independent epoch.
+        All admissions, metadata publication and source submissions serialize
+        on this lock. No network operation is performed inside the lock.
+        """
+        tracker = self._source_drain
+        with tracker.lock:
+            current_pair = self._source_room_pair_keys.get(room)
+            epoch = tracker._generations.get(room)
+            binding = self._abort_room_bindings.get(room)
+            if current_pair == pair_key and binding is not None:
+                prior = binding[1].get((ack_target.ip, ack_target.port))
+                if (epoch is not None and binding[0] != epoch) or (
+                    prior is not None and prior != ack_target.generation
+                ):
+                    logger.warning(
+                        "Ignoring conflicting paired ABORT room=%s generation=%s",
+                        room,
+                        ack_target.generation,
+                    )
+                    return
+
+            new_fence = (
+                not self._source_admission_fenced
+                and (room, pair_key) not in self._cancelled_source_pairs
+            )
+            if not self._source_admission_fenced:
+                if len(self._cancelled_source_pairs) < self._cancelled_source_pair_limit:
+                    self._cancelled_source_pairs.add((room, pair_key))
+                elif (room, pair_key) not in self._cancelled_source_pairs:
+                    # Do not evict a safety fence to admit new work. Existing
+                    # owners can drain; future senders fail through normal
+                    # bootstrap consensus, without killing the scheduler.
+                    self._source_admission_fenced = True
+                    logger.error(
+                        "Source cancellation fence capacity exhausted; rejecting new "
+                        "source admissions until process replacement (limit=%s)",
+                        self._cancelled_source_pair_limit,
+                    )
+
+            proposals = self._pending_abort_metadata.get(room, {})
+            for key in list(proposals):
+                if key[0] == pair_key:
+                    proposals.pop(key)
+                    self._pending_abort_metadata_count -= 1
+                    self._pending_abort_metadata_times.pop((room, *key), None)
+            if not proposals:
+                self._pending_abort_metadata.pop(room, None)
+
+            same_owner = current_pair == pair_key
+            if same_owner:
+                if epoch is not None:
+                    tracker.poison(room, epoch)
+                    if self.request_status.get(room) != KVPoll.Success:
+                        self.update_status(room, KVPoll.Failed)
+                # A live/retired owner still uses native/staging drain checks.
+                self.register_deferred_ack_target(room, ack_target)
+
+        if same_owner:
+            self._maybe_ack_drained_abort(room)
+        else:
+            # No source for this pair exists, and its future admission is now
+            # fenced. A different pair in the same room must remain untouched.
+            # Failed/lost sends are repaired by D retrying the same cancellation;
+            # the fence survives clear/forget and ACK-cache eviction.
+            if new_fence:
+                logger.info(
+                    "Fenced P/D cancellation without source owner; sending ACK "
+                    "room=%s generation=%s",
+                    room,
+                    ack_target.generation,
+                )
+            self._send_abort_ack(room, ack_target)
 
     def _handle_legacy_abort_notification(
         self, notification: AbortNotification, room_active: bool
@@ -4697,13 +4802,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
 
     def update_status(self, bootstrap_room, status):
-        super().update_status(bootstrap_room, status)
         if not hasattr(self, "_source_drain"):
-            return
-        if status == KVPoll.Failed:
-            self._source_drain.poison(bootstrap_room)
-        elif status == KVPoll.Success:
-            self._source_drain.close(bootstrap_room)
+            return super().update_status(bootstrap_room, status)
+        with self._source_drain.lock:
+            super().update_status(bootstrap_room, status)
+            if status == KVPoll.Failed:
+                self._source_drain.poison(bootstrap_room)
+            elif status == KVPoll.Success:
+                self._source_drain.close(bootstrap_room)
 
     def source_transfers_drained(self, room, generation=None):
         if self.request_status.get(room) == KVPoll.Success:
@@ -4802,17 +4908,31 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         bootstrap_pair_key: Optional[str] = None,
     ):
         self._source_generation = mgr._open_source_room(bootstrap_room, bootstrap_pair_key)
+        self._cancelled_before_admission = self._source_generation is None
         super().__init__(
             mgr,
             bootstrap_addr,
             bootstrap_room,
             req_has_disagg_prefill_dp_rank,
+            initially_failed=self._cancelled_before_admission,
         )
-        self._source_transfers_forgotten = False
+        self._source_transfers_forgotten = self._cancelled_before_admission
+        self.conclude_state = (
+            KVPoll.Failed if self._cancelled_before_admission else None
+        )
         self.init_time = time.time()
         self._source_event = None
         self._pd_hidden_chunk_meta = None
         self._init_trace_ctx()
+
+    def failure_exception(self):
+        if self._cancelled_before_admission:
+            # No manager state was acquired: do not pop another lifecycle's
+            # failure record or clear its metadata through the shared mixin.
+            raise KVTransferError(
+                self.bootstrap_room, "P/D lifecycle cancelled before source admission"
+            )
+        return super().failure_exception()
 
     def set_source_event(self, source_event) -> None:
         self._source_event = source_event
@@ -4838,6 +4958,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
+        if self._cancelled_before_admission:
+            return
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )

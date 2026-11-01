@@ -225,6 +225,7 @@ class AbortNotification(msgspec.Struct, frozen=True):
     decode_ip: Optional[str] = None
     decode_port: Optional[int] = None
     generation: Optional[int] = None
+    bootstrap_pair_key: Optional[str] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]) -> Optional[AbortNotification]:
@@ -254,11 +255,22 @@ class AbortNotification(msgspec.Struct, frozen=True):
                 generation = int(msg[4].decode("ascii"))
             except (ValueError, UnicodeDecodeError):
                 logger.warning("Malformed ABORT message: invalid generation")
+        pair_key = None
+        if len(msg) >= 6:
+            try:
+                pair_key = msg[5].decode("ascii")
+                if not 0 < len(pair_key) <= 128 or generation is None:
+                    raise ValueError("invalid paired cancellation")
+            except (ValueError, UnicodeDecodeError):
+                # Never downgrade a malformed paired cancellation to room-only.
+                logger.warning("Malformed ABORT message: invalid shared lifecycle")
+                return None
         return cls(
             room=room,
             decode_ip=decode_ip,
             decode_port=decode_port,
             generation=generation,
+            bootstrap_pair_key=pair_key,
         )
 
     def to_zmq(self) -> List[bytes]:
@@ -272,6 +284,8 @@ class AbortNotification(msgspec.Struct, frozen=True):
             )
             if self.generation is not None:
                 frames.append(str(self.generation).encode("ascii"))
+                if self.bootstrap_pair_key is not None:
+                    frames.append(self.bootstrap_pair_key.encode("ascii"))
         return frames
 
     def deferred_ack_target(self) -> Optional[AckTarget]:
@@ -2519,6 +2533,8 @@ class CommonKVSender(BaseKVSender):
         bootstrap_addr: str,
         bootstrap_room: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        *,
+        initially_failed: bool = False,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
@@ -2533,6 +2549,13 @@ class CommonKVSender(BaseKVSender):
         self.init_time: Optional[float] = None
         self._prefill_complete_time: Optional[float] = None
         self._owns_bootstrap_room = True
+        if initially_failed:
+            # A cancelled source admission still participates in bootstrap
+            # consensus, but owns no manager state (the room may be reused).
+            # clear()/abort() and the timeout path still read the two fields
+            # above, so they are initialized before this return.
+            self.conclude_state = KVPoll.Failed
+            return
         if mgr.deferred_bootstrap is not None:
             room_state = mgr.deferred_bootstrap.open(bootstrap_room, self)
             self._owns_bootstrap_room = room_state is not None
@@ -3217,6 +3240,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             decode_ip=self.kv_mgr.local_ip,
                             decode_port=self.kv_mgr.rank_port,
                             generation=self._abort_generation,
+                            bootstrap_pair_key=getattr(self, "_bootstrap_pair_key", None),
                         ).to_zmq(),
                         flags=zmq.DONTWAIT,
                     )

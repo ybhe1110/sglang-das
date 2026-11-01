@@ -1090,7 +1090,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     e,
                 )
         logger.warning(
-            "Abort decode prealloc marked Failed; KV released after PP consensus. rids=%s",
+            "Abort decode prealloc marked Failed; KV release requires consensus and transfer drain. rids=%s",
             rids,
         )
         return rids
@@ -3363,7 +3363,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.req.bootstrap_room
                 )
         logger.warning(
-            "Abort decode transfer marked Failed; KV released after PP consensus. rids=%s tp_rank=%s",
+            "Abort decode transfer marked Failed; KV release requires consensus and transfer drain. rids=%s tp_rank=%s",
             rids,
             self.tp_rank,
         )
