@@ -105,6 +105,7 @@ impl Drop for Runtime {
 /// Boot the whole frontend. Returns once threads are spawned (non-blocking).
 /// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
+    cfg.server_args.validate_ingress()?;
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
@@ -283,6 +284,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let http_addr = cfg.rust_server_args.http_addr;
         let listener = bind_tcp_listener(http_addr)
             .map_err(|e| format!("binding API listener on {} failed: {e}", http_addr))?;
+        let bootstrap = bind_bootstrap_listener(&cfg)?;
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
@@ -302,6 +304,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(api_server::app::serve(
                     listener,
+                    bootstrap,
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),
@@ -324,6 +327,22 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })
+}
+
+fn bind_bootstrap_listener(cfg: &RuntimeConfig) -> Result<api_server::app::BootstrapListener, String> {
+    use api_server::app::BootstrapListener;
+    if !cfg.server_args.enable_pd_bootstrap() || !cfg.rust_server_args.serve_pd_bootstrap {
+        return Ok(BootstrapListener::Disabled);
+    }
+    let api = cfg.rust_server_args.http_addr;
+    let addr = cfg.rust_server_args.bootstrap_addr.unwrap_or(api);
+    if addr == api {
+        Ok(BootstrapListener::Api)
+    } else {
+        bind_tcp_listener(addr)
+            .map(BootstrapListener::Dedicated)
+            .map_err(|e| format!("binding PD bootstrap listener on {addr} failed: {e}"))
+    }
 }
 
 #[cfg(test)]

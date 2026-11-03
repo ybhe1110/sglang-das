@@ -219,6 +219,11 @@ async fn generate(
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
     // and every downstream stage are still ahead of us.
+    for payload in &payloads {
+        if let Err(message) = state.server_args.validate_routed_dp_rank(payload.routed_dp_rank) {
+            return native_error(StatusCode::BAD_REQUEST, &message, stream);
+        }
+    }
     let timing = RequestTiming::new();
     // Media I/O (URL downloads, file reads) happens here, on the API runtime
     // — never on the MM worker pool (see `prefetch`).
@@ -553,6 +558,34 @@ mod tests {
             abort_tx: flume::unbounded().0,
             tokenizer_tx: flume::unbounded().0,
             detokenizer_tx: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_ingress_rejected_before_batch_submission() {
+        for (ids, field) in [
+            (serde_json::json!([1]), "routed_dp_rank"),
+            (serde_json::json!([[1], [2]]), "routed_dp_rank"),
+            (serde_json::json!([1]), "data_parallel_rank"),
+        ] {
+            let (tx, rx) = flume::unbounded();
+            let mut channels = senders();
+            channels.tok_manager_tx = tx;
+            let state = Arc::new(AppState {
+                senders: channels, response_buf: 8,
+                server_args: Arc::new(crate::message::config::ServerArgs {
+                    global_dp_rank: 9, global_dp_size: 16, ..Default::default()
+                }),
+                chat_formatter: None, response_activity: Default::default(),
+            });
+            let body = serde_json::from_value(serde_json::json!({
+                "input_ids": ids, (field): 8
+            })).unwrap();
+            let response = generate(State(state), Ok(Json(body))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains("global_dp_rank=9"));
+            assert!(rx.try_recv().is_err());
         }
     }
 

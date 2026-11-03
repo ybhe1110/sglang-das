@@ -486,18 +486,17 @@ impl Intake {
             .detok_for(&rid)
             .send(DetokMsg::Deregister { rid: rid.clone() });
 
-        // The ring is BOUNDED and drops pushes under exactly the load this matters
-        // for, so report the miss rather than assuming the scheduler was told.
+        // Backpressure pauses intake until the scheduler drains; cancellation
+        // must not be dropped just because generation filled the data ring.
         match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
             Ok(header) => {
-                if !self.to_scheduler_tx.try_push(SchedulerRequest {
+                if !self.to_scheduler_tx.push_control(SchedulerRequest {
                     header,
                     ids: Bytes::new(),
-                }) {
-                    tracing::error!(
+                }, &self.shutdown) {
+                    tracing::debug!(
                         rid = %rid,
-                        "abort dropped: to_scheduler channel is full; the scheduler keeps generating \
-                         for this request until it finishes on its own"
+                        "scheduler channel or runtime closed while delivering abort"
                     );
                 }
             }
@@ -1158,17 +1157,11 @@ mod tests {
         assert!(consumer.drain(16).headers.is_empty());
     }
 
-    /// A dropped ring push is survivable, and this pins WHY. The ring is bounded,
-    /// so under load the scheduler never learns to stop and keeps generating; its
-    /// chunks then arrive for a rid the detok table no longer holds and are
-    /// dropped. That wastes GPU work but cannot MISDELIVER, because
-    /// `Rid::from_client` guarantees no later request ever answers to that rid.
-    /// The detok entry is dropped either way — that is the half that must not
-    /// depend on the ring.
-    ///
-    /// Ring capacity 1: the first abort pushes, the second finds it full.
+    /// Ring capacity 1: the second cancellation must wait for the consumer,
+    /// retain its identity and be delivered exactly once. Runtime shutdown
+    /// interrupts this backpressure even when the consumer has stopped.
     #[test]
-    fn abort_deregisters_even_when_the_ring_push_is_dropped() {
+    fn abort_survives_full_ring_and_shutdown_interrupts_backpressure() {
         let (tok_tx, _tok_rx) = flume::unbounded();
         let (detok_tx, detok_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
@@ -1178,10 +1171,9 @@ mod tests {
             tokenizer_tx: tok_tx,
             detokenizer_tx: vec![detok_tx],
         };
-        let (producer, _consumer) = to_scheduler(1);
+        let (producer, consumer) = to_scheduler(1);
         let (_tm_tx, tm_rx) = flume::unbounded();
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
-        std::mem::forget(sd_tx);
         let mut intake = Intake::new(
             tm_rx,
             abort_rx,
@@ -1193,15 +1185,42 @@ mod tests {
         );
 
         intake.on_abort(AbortSource::Guard("pushed".into()));
-        intake.on_abort(AbortSource::Guard("dropped".into()));
-
-        // Both deregisters land regardless of whether the ring accepted the push.
-        for expected in ["pushed", "dropped"] {
-            assert!(
-                matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == expected),
-                "{expected}: the detok entry must be dropped even when the ring is full",
-            );
+        let (done_tx, done_rx) = flume::bounded(1);
+        let worker = std::thread::spawn(move || {
+            intake.on_abort(AbortSource::Guard("retried".into()));
+            done_tx.send(()).unwrap();
+            intake
+        });
+        // Deregistration happens before the ring push. Wait until the second
+        // abort has reached that point while the first still occupies the ring.
+        for expected in ["pushed", "retried"] {
+            assert!(matches!(
+                detok_rx.recv_timeout(std::time::Duration::from_secs(5)),
+                Ok(DetokMsg::Deregister { rid }) if rid.as_str() == expected
+            ));
         }
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(flume::RecvTimeoutError::Timeout)
+        ), "the full ring cannot drop the abort");
+        let first = consumer.drain(1);
+        assert_eq!(first.headers.len(), 1);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut intake = worker.join().unwrap();
+        let second = consumer.drain(1);
+        assert_eq!(second.headers.len(), 1, "second cancellation was retained");
+        let wire = rmpv::decode::read_value(&mut &second.headers[0][..]).unwrap();
+        assert_eq!(wire.as_array().unwrap()[1].as_str(), Some("retried"));
+        assert!(
+            consumer.drain(1).headers.is_empty(),
+            "no duplicate cancellation"
+        );
+        intake.on_abort(AbortSource::Guard("fill".into()));
+        drop(sd_tx);
+        // A full ring cannot keep the intake alive after runtime shutdown.
+        intake.on_abort(AbortSource::Guard("shutdown".into()));
     }
 
     /// The rid keys the detok table and rides on every chunk of every decode step,

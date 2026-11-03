@@ -189,6 +189,8 @@ async fn loads(State(state): State<Arc<AppState>>, Query(query): Query<LoadsQuer
             .into_response();
     }
     let mut body = Map::new();
+    body.insert("global_dp_rank".into(), Value::from(args.global_dp_rank));
+    body.insert("global_dp_size".into(), Value::from(args.global_dp_size));
     body.insert("timestamp".into(), Value::from(utc_now_isoformat()));
     body.insert("version".into(), Value::from(args.version.as_str()));
     body.insert("accelerator".into(), args.accelerator.clone().into());
@@ -492,6 +494,8 @@ mod tests {
             load_snapshot_path: Some(path.display().to_string()),
             load_snapshot_dp_size: dp_size,
             load_snapshot_dp_rank: dp_rank,
+            global_dp_rank: dp_rank,
+            global_dp_size: dp_size,
             version: "1.2.3".into(),
             accelerator: Some("GPU".into()),
             num_accelerators: 4,
@@ -507,6 +511,8 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "global_dp_rank",
+                "global_dp_size",
                 "timestamp",
                 "version",
                 "accelerator",
@@ -528,6 +534,8 @@ mod tests {
 
         // The rank-1 listener reports the rank-1 slot, renumbered to 0.
         let (_, body) = get(args(&file.0, 2, 1), "dp_rank=0").await;
+        assert_eq!(json(&body)["global_dp_rank"], 1);
+        assert_eq!(json(&body)["global_dp_size"], 2);
         let mut rank1 = expected["to_dict"]["all"][1].clone();
         rank1["dp_rank"] = json!(0);
         assert_eq!(json(&body)["loads"], json!([rank1]));
@@ -553,5 +561,45 @@ mod tests {
 
         let (status, _) = get(ServerArgs::default(), "").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn second_node_dp16_reads_local_rank9_without_remote_slots() {
+        let slot_size = 16 * 1024u32;
+        let mut bytes = Vec::from(&MAGIC[..]);
+        bytes.extend(VERSION.to_le_bytes());
+        bytes.extend(16u16.to_le_bytes());
+        bytes.extend(slot_size.to_le_bytes());
+        bytes.resize(HEADER_LEN as usize + 16 * slot_size as usize, 0);
+        let payload = rmp_serde::to_vec(&json!({
+            "timestamp": 100.0, "dp_rank": 9, "num_running_reqs": 7,
+        }))
+        .unwrap();
+        let offset = HEADER_LEN as usize + 9 * slot_size as usize;
+        bytes[offset..offset + 4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes[offset + 4..offset + 4 + payload.len()].copy_from_slice(&payload);
+        let file = SnapshotFile(std::env::temp_dir().join(format!(
+            "sglang-loads-local-dp16-{}",
+            uuid::Uuid::new_v4()
+        )));
+        std::fs::write(&file.0, bytes).unwrap();
+        let (status, body) = get(
+            ServerArgs {
+                load_snapshot_path: Some(file.0.display().to_string()),
+                load_snapshot_dp_size: 16,
+                load_snapshot_dp_rank: 9,
+                global_dp_rank: 9,
+                global_dp_size: 16,
+                ..Default::default()
+            },
+            "include=core",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["loads"].as_array().unwrap().len(), 1);
+        assert_eq!(body["loads"][0]["dp_rank"], 0);
+        assert_eq!(body["loads"][0]["num_running_reqs"], 7);
+        assert_eq!(body["loads"][0]["timestamp"], 100.0);
     }
 }

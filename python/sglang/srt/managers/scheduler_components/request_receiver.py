@@ -12,13 +12,15 @@ from typing import (
 )
 
 import zmq
-from torch.distributed import barrier
+from torch.distributed import all_gather_object, barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    GetInternalStateReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -151,6 +153,8 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
+        if envs.SGLANG_RUST_SERVER.get() and get_parallel().enable_dp_attention:
+            return self._broadcast_rust_reqs(recv_reqs)
         if get_parallel().enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
@@ -214,6 +218,51 @@ class SchedulerRequestReceiver:
                 src=self.tp_group.ranks[0],
             )
         return recv_reqs
+
+    def _broadcast_rust_reqs(self, recv_reqs: Optional[List]) -> List:
+        """Route per-listener requests locally; fan out global controls.
+
+        Rust listeners bypass DPC. A rank-0 broadcast of control messages
+        would therefore overwrite cancellations received by other DP ranks.
+        Every rank performs the same collectives, including on empty steps.
+        """
+        local_reqs = None
+        global_reqs = []
+        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            local_reqs, controls = self._split_work_and_control_reqs(recv_reqs)
+            for req in controls:
+                # Later PP stages receive the already fanned-out list from
+                # their own DP peer. Gathering again would multiply globals
+                # by dp_size at every pipeline stage.
+                if (
+                    self.ps.pp_rank > 0
+                    or isinstance(req, GetInternalStateReq)
+                    or (isinstance(req, AbortReq) and not req.abort_all)
+                ):
+                    local_reqs.append(req)
+                else:
+                    global_reqs.append(req)
+        if self.ps.attn_tp_size != 1:
+            local_reqs = broadcast_pyobj(
+                local_reqs,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
+            )
+        if self.ps.attn_cp_size != 1:
+            local_reqs = broadcast_pyobj(
+                local_reqs,
+                self.attn_cp_group.rank,
+                self.attn_cp_cpu_group,
+                src=self.attn_cp_group.ranks[0],
+            )
+        if self.ps.pp_rank == 0 and self.ps.tp_size != 1:
+            # Only group leaders contribute, so a global operation is applied
+            # once per target rank, even when an attention group has TP/CP > 1.
+            gathered = [None] * self.ps.tp_size
+            all_gather_object(gathered, global_reqs, group=self.tp_cpu_group)
+            global_reqs = [req for batch in gathered for req in batch]
+        return local_reqs + global_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
         if not recv_reqs:

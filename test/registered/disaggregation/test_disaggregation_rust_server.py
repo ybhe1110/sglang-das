@@ -5,10 +5,9 @@ mini_lb in front), but prefill and decode run with ``SGLANG_RUST_SERVER=1`` —
 covering the Rust `/generate` bootstrap-field intake (scalar form via the gsm8k
 eval's single-prompt requests, per-item list form via the batch test), the
 positional scheduler-wire PD block, the KV bootstrap registry served on the
-rust api listener, the PD warmup fan-out, and the fake-bootstrap health probe.
+configured bootstrap listener, the PD warmup fan-out, and the fake-bootstrap health probe.
 
-The Rust server has no OpenAI endpoints, so everything (including the gsm8k
-eval) goes through ``/generate``.
+These tests use the native ``/generate`` path through mini_lb.
 
 Usage:
 python3 -m unittest test_disaggregation_rust_server.TestDisaggregationRustServer
@@ -41,12 +40,8 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # Rust-server prefill serves the KV bootstrap registry on its api
-        # listener (a separate --disaggregation-bootstrap-port is a launch
-        # error there), so point both sides' bootstrap port at it: decode's
-        # flag is its fallback for requests without a bootstrap_port field,
-        # which is what mini_lb sends when --prefill carries no port.
-        cls.bootstrap_port = cls.prefill_port
+        # Preserve the fixture's independent bootstrap port on P and D.
+        # Enabling Rust must not require a router port rewrite.
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         # launch_all already exercises the PD-specific plumbing: the rust PD
         # warmup fan-out and the fake-bootstrap /health probe on both sides.
@@ -56,7 +51,7 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         args = SimpleNamespace(
             base_url=self.lb_url,
             eval_name="gsm8k",
-            api="generate",  # the Rust server has no /v1/completions
+            api="generate",
             max_tokens=512,
             num_examples=64,
             num_threads=32,

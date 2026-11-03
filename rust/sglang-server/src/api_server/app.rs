@@ -28,8 +28,16 @@ pub(super) struct AppState {
     pub(super) response_activity: ActivityCounter,
 }
 
-pub async fn serve(
+pub(crate) enum BootstrapListener {
+    Disabled,
+    Api,
+    Dedicated(std::net::TcpListener),
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve(
     listener: std::net::TcpListener,
+    bootstrap: BootstrapListener,
     senders: Senders,
     response_buf: usize,
     server_args: Arc<ServerArgs>,
@@ -68,11 +76,21 @@ pub async fn serve(
     // router carries its own Arc<Registry> state, so it cannot merge into the
     // Router<Arc<AppState>> above — and before `log::apply`, so bootstrap traffic
     // shows in the access log.
-    if server_args.enable_pd_bootstrap() {
+    let mut bootstrap_server = None;
+    if !matches!(&bootstrap, BootstrapListener::Disabled) {
         let (routes, sweeper) = pd_bootstrap::router_and_sweeper();
         tokio::spawn(sweeper); // cancelled with the runtime on shutdown
-        app = app.merge(routes);
-        tracing::info!("PD KV bootstrap registry mounted on the api listener");
+        match bootstrap {
+            BootstrapListener::Api => {
+                app = app.merge(routes);
+                tracing::info!("PD KV bootstrap registry mounted on the api listener");
+            }
+            BootstrapListener::Dedicated(listener) => {
+                tracing::info!(addr = ?listener.local_addr(), "PD KV bootstrap registry on dedicated listener");
+                bootstrap_server = Some((listener, log::apply(routes, &server_args)));
+            }
+            BootstrapListener::Disabled => unreachable!(),
+        }
     }
 
     // Apply logging and access log middleware.
@@ -96,6 +114,22 @@ pub async fn serve(
         r = serve => {
             if let Err(e) = r {
                 tracing::error!(error = %e, "axum serve exited");
+            }
+        }
+        r = async move {
+            match bootstrap_server {
+                Some((listener, routes)) => {
+                    let listener = tokio::net::TcpListener::from_std(listener)?;
+                    axum::serve(
+                        listener,
+                        routes.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    ).await
+                }
+                None => std::future::pending::<std::io::Result<()>>().await,
+            }
+        } => {
+            if let Err(e) = r {
+                tracing::error!(error = %e, "PD bootstrap server exited");
             }
         }
         _ = shutdown.recv_async() => {

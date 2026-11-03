@@ -42,7 +42,8 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import MmSpec, Server, ServerArgs
+    from sglang.srt.rust_extensions._server import MmSpec, Server
+    from sglang.srt.rust_extensions._server import ServerArgs as RustServerArgs
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -399,7 +400,8 @@ class RustServer:
 
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
         # so the rank is not conflated with rank 0 of a one-rank group.
-        dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
+        ingress_rank, ingress_size = cls._ingress_identity(scheduler)
+        dp_rank = ingress_rank if ingress_size > 1 else None
         if dp_rank is not None:
             http_addr = f"{server_args.host}:{server_args.port + dp_rank}"
 
@@ -416,6 +418,7 @@ class RustServer:
             # None -> run unpinned; the list carries the pinning decision.
             cores=server_cores,
             http_addr=http_addr,
+            **cls._bootstrap_listener_args(scheduler),
         )
 
         # Multimodal models must have a native Rust pipeline — there is no Python
@@ -478,6 +481,28 @@ class RustServer:
         elapses.
         """
         self.server.wait_request(timeout_ms)
+
+    @staticmethod
+    def _bootstrap_listener_args(scheduler):
+        # One registry for all P attention ranks, on the existing configured
+        # bootstrap port. D and Aigate need no port rewrite when enabling Rust.
+        from sglang.srt.runtime_context import get_disagg
+
+        owner = (
+            scheduler.server_args.disaggregation_mode == "prefill"
+            and scheduler.ps.attn_dp_rank == 0
+        )
+        host = scheduler.server_args.host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return dict(
+            serve_pd_bootstrap=owner,
+            bootstrap_addr=(
+                f"{host}:{get_disagg().disaggregation_bootstrap_port}"
+                if owner
+                else None
+            ),
+        )
 
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded
@@ -548,9 +573,9 @@ class RustServer:
 
         # Invariant: control requests always carry a rust-minted rid; without
         # one the response is unroutable, so fail loudly rather than drop it.
-        assert (
-            recv_req.rid is not None
-        ), f"control response without rid: {type(output).__name__}"
+        assert recv_req.rid is not None, (
+            f"control response without rid: {type(output).__name__}"
+        )
         # No local try/except: a failed push propagates to run_scheduler_process's
         # outer handler, which logs the full traceback (scheduler-fatal either way).
         payload = (
@@ -677,7 +702,9 @@ class RustServer:
                     assert len(col) in (
                         0,
                         batch_size,
-                    ), f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    ), (
+                        f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    )
                     populated |= len(col) > 0
                 if populated:
                     active.append(extra)
@@ -742,7 +769,18 @@ class RustServer:
         )
 
     @staticmethod
-    def _build_server_args(scheduler: Scheduler) -> ServerArgs:
+    def _ingress_identity(scheduler):
+        ps = scheduler.ps
+        if scheduler.server_args.enable_dp_attention:
+            rank, size = ps.attn_dp_rank, ps.attn_dp_size
+        else:
+            rank, size = ps.dp_rank if ps.dp_rank is not None else 0, ps.dp_size
+        if size < 1 or not 0 <= rank < size:
+            raise ValueError(f"invalid Rust ingress identity: rank={rank}, size={size}")
+        return rank, size
+
+    @staticmethod
+    def _build_server_args(scheduler: Scheduler) -> RustServerArgs:
         """The typed launch handoff for the scheduler's embedded Rust server:
         the ``server_args`` fields it reads, the already-resolved
         ``model_config``, and launch-time facts — as the Rust extension's own
@@ -762,9 +800,14 @@ class RustServer:
         )
         from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 
+        global_dp_rank, global_dp_size = RustServer._ingress_identity(scheduler)
         shm_writer = scheduler.load_snapshot_writer
         if not isinstance(shm_writer, ShmLoadSnapshotWriter):
             shm_writer = None
+        if shm_writer is not None and (
+            shm_writer.dp_rank != global_dp_rank or shm_writer.dp_size != global_dp_size
+        ):
+            raise ValueError("load snapshot slot does not match Rust ingress identity")
         disaggregation_mode = {
             "null": ext.DisaggregationMode.Null,
             "prefill": ext.DisaggregationMode.Prefill,
@@ -820,6 +863,8 @@ class RustServer:
             # can serve them statically (no scheduler round-trip).
             version=__version__,
             max_total_num_tokens=scheduler.max_total_num_tokens,
+            global_dp_rank=global_dp_rank,
+            global_dp_size=global_dp_size,
             load_snapshot_path=shm_writer.path if shm_writer else None,
             load_snapshot_dp_size=shm_writer.dp_size if shm_writer else 0,
             load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,

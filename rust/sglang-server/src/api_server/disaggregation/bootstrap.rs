@@ -1,7 +1,8 @@
 //! PD KV bootstrap registry — rust port of Python `CommonKVBootstrapServer` (shared by all
 //! transfer backends): prefill ranks PUT `/route`, decode ranks GET routes and the `-1`-sentinel
 //! topology, the PD router tracks per-room dp ranks; the wire format is Python-owned parity.
-//! Mounted on the prefill api listener (bootstrap port = api port) before `init_disaggregation`.
+//! Served on the configured prefill bootstrap port before `init_disaggregation`.
+//! An explicitly shared API/bootstrap port uses the same listener.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -449,6 +450,62 @@ mod tests {
             server_args: Arc::new(server_args),
         };
         (crate::runtime::start(cfg).expect("start runtime"), addr)
+    }
+
+    #[test]
+    fn dedicated_bootstrap_port_registers_cp8_and_closes_on_shutdown() {
+        let api_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bootstrap_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = api_probe.local_addr().unwrap();
+        let bootstrap = bootstrap_probe.local_addr().unwrap();
+        drop((api_probe, bootstrap_probe));
+        let rt = crate::runtime::start(RuntimeConfig {
+            rust_server_args: RustServerServerArgs {
+                http_addr: api,
+                bootstrap_addr: Some(bootstrap),
+                http_api_worker_num: 1,
+                ..Default::default()
+            },
+            server_args: Arc::new(test_server_args(DisaggregationMode::Prefill)),
+        })
+        .unwrap();
+        assert_eq!(request(api, "GET", SENTINEL, None).0, 404);
+        for rank in 0..8 {
+            assert_eq!(request(bootstrap, "GET", SENTINEL, None).0, 503);
+            let body = put_route(serde_json::json!({"attn_cp_size": 8, "attn_cp_rank": rank}));
+            assert_eq!(request(bootstrap, "PUT", "/route", Some(&body)).0, 200);
+        }
+        let (status, body) = request(bootstrap, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["attn_cp_size"],
+            8
+        );
+        rt.request_shutdown();
+        // Both sockets must be released by runtime teardown.
+        let _api = crate::utils::sock::bind_tcp_listener(api).unwrap();
+        let _bootstrap = crate::utils::sock::bind_tcp_listener(bootstrap).unwrap();
+    }
+
+    #[test]
+    fn occupied_bootstrap_port_fails_start_and_nonowner_does_not_bind() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = RuntimeConfig {
+            rust_server_args: RustServerServerArgs {
+                http_addr: "127.0.0.1:0".parse().unwrap(),
+                bootstrap_addr: Some(occupied.local_addr().unwrap()),
+                http_api_worker_num: 1,
+                ..Default::default()
+            },
+            server_args: Arc::new(test_server_args(DisaggregationMode::Prefill)),
+        };
+        let err = match crate::runtime::start(cfg.clone()) {
+            Ok(_) => panic!("occupied bootstrap port must fail startup"),
+            Err(err) => err,
+        };
+        assert!(err.contains("binding PD bootstrap listener"), "{err}");
+        cfg.rust_server_args.serve_pd_bootstrap = false;
+        crate::runtime::start(cfg).unwrap().request_shutdown();
     }
 
     /// The full wire contract the Python decode side / PD router depends on:

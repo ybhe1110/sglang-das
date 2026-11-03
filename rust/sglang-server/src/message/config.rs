@@ -26,6 +26,10 @@ use serde::Serialize;
 #[derive(Clone, Debug)]
 pub struct RustServerServerArgs {
     pub http_addr: SocketAddr,
+    /// None uses the API listener; Python passes the configured bootstrap port.
+    pub bootstrap_addr: Option<SocketAddr>,
+    /// Only the P DP0 listener owns the shared registry.
+    pub serve_pd_bootstrap: bool,
     pub http_api_worker_num: usize,
     pub to_scheduler_cap: usize,
     pub from_scheduler_cap: usize,
@@ -39,6 +43,8 @@ impl Default for RustServerServerArgs {
     fn default() -> Self {
         Self {
             http_addr: "127.0.0.1:30000".parse().unwrap(),
+            bootstrap_addr: None,
+            serve_pd_bootstrap: true,
             http_api_worker_num: 2,
             to_scheduler_cap: 8192,
             from_scheduler_cap: 8192,
@@ -121,8 +127,8 @@ pub struct ServerArgs {
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
-    /// PD-disaggregation role. (On prefill, the KV bootstrap registry is mounted
-    /// on the api router — see [`Self::enable_pd_bootstrap`].)
+    /// PD-disaggregation role. On the prefill owner, the KV bootstrap registry
+    /// uses the runtime's configured listener — see [`Self::enable_pd_bootstrap`].
     pub disaggregation_mode: DisaggregationMode,
     /// The resolved Python `ModelConfig`, attached at handoff time.
     pub model_config: ModelConfig,
@@ -145,6 +151,9 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// Identity of this ingress, independent of the physical snapshot slot.
+    pub global_dp_rank: usize,
+    pub global_dp_size: usize,
     /// The scheduler's shared-memory load snapshot file, its DP rank count and
     /// this listener's own slot, which `/v1/loads` reads (`None` when snapshots
     /// go over ZMQ instead), plus the accelerator name and per-rank count that
@@ -188,6 +197,8 @@ impl ServerArgs {
         num_reserved_tokens,
         version,
         max_total_num_tokens,
+        global_dp_rank,
+        global_dp_size,
         load_snapshot_path,
         load_snapshot_dp_size,
         load_snapshot_dp_rank,
@@ -224,6 +235,8 @@ impl ServerArgs {
         num_reserved_tokens: u64,
         version: String,
         max_total_num_tokens: u64,
+        global_dp_rank: usize,
+        global_dp_size: usize,
         load_snapshot_path: Option<String>,
         load_snapshot_dp_size: usize,
         load_snapshot_dp_rank: usize,
@@ -258,6 +271,8 @@ impl ServerArgs {
             num_reserved_tokens,
             version,
             max_total_num_tokens,
+            global_dp_rank,
+            global_dp_size,
             load_snapshot_path,
             load_snapshot_dp_size,
             load_snapshot_dp_rank,
@@ -300,6 +315,8 @@ impl Default for ServerArgs {
             num_reserved_tokens: 0,
             version: String::new(),
             max_total_num_tokens: 0,
+            global_dp_rank: 0,
+            global_dp_size: 1,
             load_snapshot_path: None,
             load_snapshot_dp_size: 0,
             load_snapshot_dp_rank: 0,
@@ -560,8 +577,36 @@ fn join_host_port(host: &str, port: u16) -> String {
 impl ServerArgs {
     /// Fail fast at startup on values the types cannot express.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_ingress()?;
         if self.served_model_name.is_empty() {
             return Err("empty 'served_model_name' in server_args".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_ingress(&self) -> Result<(), String> {
+        if self.global_dp_size == 0 || self.global_dp_rank >= self.global_dp_size {
+            return Err("invalid global DP ingress identity".into());
+        }
+        if self.load_snapshot_path.is_some()
+            && (self.load_snapshot_dp_rank != self.global_dp_rank
+                || self.load_snapshot_dp_size != self.global_dp_size)
+        {
+            return Err("load snapshot slot does not match DP ingress identity".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_routed_dp_rank(&self, routed: Option<i64>) -> Result<(), String> {
+        if let Some(rank) = routed {
+            if usize::try_from(rank).ok() != Some(self.global_dp_rank)
+                || usize::try_from(rank).is_ok_and(|r| r >= self.global_dp_size)
+            {
+                return Err(format!(
+                    "routed_dp_rank={rank} does not match this listener's global_dp_rank={} (global_dp_size={}); send to the correct ingress",
+                    self.global_dp_rank, self.global_dp_size
+                ));
+            }
         }
         Ok(())
     }
@@ -571,12 +616,9 @@ impl ServerArgs {
         self.disaggregation_mode != DisaggregationMode::Null
     }
 
-    /// Serve the PD KV bootstrap registry on the api listener: every prefill
-    /// rust server hosts it, unconditionally — no extra topology gating. KV
-    /// managers and decode nodes reach the registry at the resolved
-    /// `disaggregation_bootstrap_port`, which rust-server mode aliases to the
-    /// api port, so whichever prefill server that port names is the one that
-    /// receives the registrations.
+    /// Whether this role can host a PD bootstrap registry. The runtime also
+    /// checks `serve_pd_bootstrap` (Python selects P DP0) and binds the
+    /// configured bootstrap address; it may share the API listener explicitly.
     pub fn enable_pd_bootstrap(&self) -> bool {
         self.disaggregation_mode == DisaggregationMode::Prefill
     }
@@ -669,5 +711,42 @@ mod tests {
         sa.log_level_http = Some(String::new());
         sa.log_level = "error".into();
         assert!(!sa.http_access_log_enabled());
+    }
+}
+
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::ServerArgs;
+
+    #[test]
+    fn routing_checks_every_rank_and_single_rank_bounds() {
+        for rank in 0..16 {
+            let args = ServerArgs { global_dp_rank: rank, global_dp_size: 16, ..Default::default() };
+            assert!(args.validate_ingress().is_ok());
+            assert!(args.validate_routed_dp_rank(None).is_ok());
+            for routed in -1..=16 {
+                assert_eq!(args.validate_routed_dp_rank(Some(routed)).is_ok(), routed == rank as i64);
+            }
+        }
+        let args = ServerArgs::default();
+        assert!(args.validate_routed_dp_rank(Some(0)).is_ok());
+        assert!(args.validate_routed_dp_rank(Some(1)).is_err());
+        assert!(args.validate_routed_dp_rank(Some(-1)).is_err());
+    }
+
+    #[test]
+    fn snapshot_identity_must_match_ingress() {
+        let mut args = ServerArgs { global_dp_rank: 9, global_dp_size: 16,
+            load_snapshot_path: Some("local-rank9".into()), load_snapshot_dp_rank: 9,
+            load_snapshot_dp_size: 16, ..Default::default() };
+        assert!(args.validate_ingress().is_ok());
+        args.load_snapshot_dp_rank = 0;
+        assert!(args.validate_ingress().is_err());
+        args.load_snapshot_dp_rank = 9;
+        args.load_snapshot_dp_size = 8;
+        assert!(args.validate_ingress().is_err());
+        args.global_dp_size = 0;
+        assert!(args.validate_ingress().is_err());
     }
 }

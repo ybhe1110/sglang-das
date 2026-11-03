@@ -13,6 +13,7 @@ from sglang.srt.managers.load_snapshot import (
     LoadSnapshot,
     LoRAMetrics,
     MemoryMetrics,
+    MirroredLoadSnapshotWriter,
     QueueMetrics,
     ShmLoadSnapshotReader,
     ShmLoadSnapshotWriter,
@@ -275,6 +276,42 @@ class TestFactoryFunctions(CustomTestCase):
         self._publish(enable_dp_attention=True, nnodes=2, dp_size=2)
         self.assertTrue(should_use_zmq())
 
+    def test_rust_node1_dp16_reads_local_mirror_without_remote_collector(self):
+        self._publish(enable_dp_attention=True, nnodes=2, dp_size=16, node_rank=1)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(os.environ, {"SGLANG_RUST_SERVER": "1"}),
+            mock.patch(
+                "sglang.srt.managers.load_snapshot.shm_path_for",
+                return_value=os.path.join(directory, "snapshot"),
+            ),
+        ):
+            port_args = SimpleNamespace(
+                instance_id="dp16", load_collector_ipc_name=_ipc_addr()
+            )
+            writers, readers = [], []
+            try:
+                for rank in range(8, 16):
+                    writer = create_load_snapshot_writer(port_args, 16, rank)
+                    writers.append(writer)
+                    self.assertIsInstance(writer, MirroredLoadSnapshotWriter)
+                    reader = ShmLoadSnapshotReader(writer.path, 16)
+                    readers.append(reader)
+                    writer.write(
+                        LoadSnapshot(dp_rank=rank, timestamp=1.0, num_running_reqs=rank)
+                    )
+                    self.assertEqual(reader.read(rank).num_running_reqs, rank)
+                    writer.write(
+                        LoadSnapshot(dp_rank=rank, timestamp=2.0, num_running_reqs=0)
+                    )
+                    self.assertEqual(reader.read(rank).timestamp, 2.0)
+                    self.assertEqual(reader.read(rank).num_running_reqs, 0)
+            finally:
+                for reader in readers:
+                    reader.close()
+                for writer in writers:
+                    writer.close()
+
 
 class TestZmqReaderOwner(CustomTestCase):
     """At most one process binds the zmq PULL socket across all callers."""
@@ -355,8 +392,9 @@ class TestZmqReaderOwner(CustomTestCase):
         override = get_context().override_server_args(**fields)
         override.install()
         self.addCleanup(override.restore)
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"), mock.patch.object(
-            rc._CONTEXT, "_publish_role", "dp_controller"
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"),
+            mock.patch.object(rc._CONTEXT, "_publish_role", "dp_controller"),
         ):
             self.assertTrue(zmq_reader_owner("DataParallelController"))
 

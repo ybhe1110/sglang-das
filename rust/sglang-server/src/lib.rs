@@ -95,6 +95,8 @@ impl Server {
         from_scheduler_cap = 8192,
         channel_cap = 8192,
         cores = None,
+        bootstrap_addr = None,
+        serve_pd_bootstrap = true,
     ))]
     // pyo3 `#[new]` constructor: the wide arg list is the Python-facing boot
     // surface (all optional overrides), not a call-site ergonomics problem.
@@ -106,6 +108,8 @@ impl Server {
         from_scheduler_cap: usize,
         channel_cap: usize,
         cores: Option<Vec<usize>>,
+        bootstrap_addr: Option<String>,
+        serve_pd_bootstrap: bool,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
         // mistyped field when Python constructed it); only value checks remain.
@@ -124,6 +128,11 @@ impl Server {
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr,
+                bootstrap_addr: bootstrap_addr
+                    .map(|addr| addr.parse())
+                    .transpose()
+                    .map_err(|e| value_error("bad bootstrap_addr", e))?,
+                serve_pd_bootstrap,
                 http_api_worker_num: server_args.http_api_worker_num(),
                 to_scheduler_cap,
                 from_scheduler_cap,

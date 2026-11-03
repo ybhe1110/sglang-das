@@ -24,6 +24,7 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
@@ -48,9 +49,88 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
+/// Keep PD fields outside Dynamo's OpenAI schema, which otherwise discards
+/// them. Named fields are consumed before the flattened standard request.
+#[derive(Deserialize)]
+struct ChatCompletionBody {
+    #[serde(flatten)]
+    request: CreateChatCompletionRequest,
+    #[serde(default, alias = "request_id")]
+    rid: Option<String>,
+    #[serde(default)]
+    bootstrap_host: Option<String>,
+    #[serde(default)]
+    bootstrap_port: Option<i64>,
+    #[serde(default)]
+    bootstrap_room: Option<i64>,
+    #[serde(default)]
+    bootstrap_pair_key: Option<String>,
+    #[serde(default)]
+    decode_tp_size: Option<i64>,
+    #[serde(default, alias = "data_parallel_rank")]
+    routed_dp_rank: Option<i64>,
+    #[serde(default)]
+    disagg_prefill_dp_rank: Option<i64>,
+}
+
+impl ChatCompletionBody {
+    fn validate_pd(&self, required: bool) -> Result<(), String> {
+        let pd = required
+            || self.bootstrap_host.is_some()
+            || self.bootstrap_room.is_some()
+            || self.bootstrap_pair_key.is_some()
+            || self.bootstrap_port.is_some();
+        if pd {
+            if self.request.n.unwrap_or(1) != 1 {
+                return Err("PD chat requests require n=1; route each choice with its own room and pair key".into());
+            }
+            if self
+                .bootstrap_host
+                .as_ref()
+                .is_none_or(|s| s.trim().is_empty())
+                || self.bootstrap_room.is_none_or(|room| room < 0)
+            {
+                return Err("PD chat requires bootstrap_host and nonnegative bootstrap_room".into());
+            }
+        }
+        // Requiring a pair key is backend-specific (Mooncake enforces it on
+        // the scheduler side). Preserve other backends' existing wire contract.
+        if self
+            .bootstrap_pair_key
+            .as_ref()
+            .is_some_and(|key| key.is_empty() || key.len() > 128 || !key.is_ascii())
+        {
+            return Err("bootstrap_pair_key must contain 1..128 ASCII bytes".into());
+        }
+        if self.bootstrap_port.is_some_and(|p| !(1..=65535).contains(&p))
+            || self.decode_tp_size.is_some_and(|n| n <= 0)
+            || self.routed_dp_rank.is_some_and(|r| r < 0)
+            || self.disagg_prefill_dp_rank.is_some_and(|r| r < 0)
+        {
+            return Err("invalid PD port, TP size or DP rank".into());
+        }
+        Ok(())
+    }
+
+    fn into_parts(self) -> (CreateChatCompletionRequest, GenerateRequest) {
+        let routing = GenerateRequest {
+            rid: self.rid.as_deref().map(Rid::from_client).unwrap_or_default(),
+            bootstrap_host: self.bootstrap_host,
+            bootstrap_port: self.bootstrap_port,
+            bootstrap_room: self.bootstrap_room,
+            bootstrap_pair_key: self.bootstrap_pair_key,
+            decode_tp_size: self.decode_tp_size,
+            routed_dp_rank: self.routed_dp_rank,
+            disagg_prefill_dp_rank: self.disagg_prefill_dp_rank,
+            ..Default::default()
+        };
+        (self.request, routing)
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<ChatCompletionBody>, JsonRejection>,
 ) -> Response {
     let request = match body {
         Ok(Json(request)) => request,
@@ -58,6 +138,14 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    if let Err(message) = request.validate_pd(state.server_args.is_disaggregation()) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
+    }
+    if let Err(message) = state.server_args.validate_routed_dp_rank(request.routed_dp_rank) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
+    }
+    let supplied_rid = request.rid.clone();
+    let (request, pd_routing) = request.into_parts();
     if request.model != state.server_args.served_model_name {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -180,7 +268,11 @@ async fn chat_completions(
 
     let mut prompt = Some(prompt);
     for index in 0..n {
-        let rid = Rid::from_client(&format!("{response_id}-{index}"));
+        let rid = Rid::from_client(&match &supplied_rid {
+            Some(rid) if n == 1 => rid.clone(),
+            Some(rid) => format!("{rid}_{index}"),
+            None => format!("{response_id}-{index}"),
+        });
         let choice_prompt = if index + 1 == n {
             prompt.take().expect("last chat choice owns the prompt")
         } else {
@@ -201,6 +293,13 @@ async fn chat_completions(
             logprob_start_len: -1,
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
+            bootstrap_host: pd_routing.bootstrap_host.clone(),
+            bootstrap_port: pd_routing.bootstrap_port,
+            bootstrap_room: pd_routing.bootstrap_room,
+            bootstrap_pair_key: pd_routing.bootstrap_pair_key.clone(),
+            decode_tp_size: pd_routing.decode_tp_size,
+            routed_dp_rank: pd_routing.routed_dp_rank,
+            disagg_prefill_dp_rank: pd_routing.disagg_prefill_dp_rank,
             ..Default::default()
         };
         let rx = match submit_generation(&state, native, stream, &mut guard).await {
@@ -870,6 +969,83 @@ mod tests {
         .unwrap()
     }
 
+    fn pd_body() -> serde_json::Value {
+        serde_json::json!({
+            "model": "test", "messages": [{"role": "user", "content": "hi"}],
+            "stream": true, "max_completion_tokens": 32, "rid": "aigate-rid",
+            "bootstrap_host": "10.0.0.7", "bootstrap_port": 8998,
+            "bootstrap_room": 12345, "bootstrap_pair_key": "shared-pair",
+            "decode_tp_size": 16, "routed_dp_rank": 9, "disagg_prefill_dp_rank": 0
+        })
+    }
+
+    #[test]
+    fn pd_chat_fields_reach_scheduler_wire() {
+        let body: super::ChatCompletionBody = serde_json::from_value(pd_body()).unwrap();
+        body.validate_pd(true).unwrap();
+        let (request, native) = body.into_parts();
+        assert_eq!(request.stream, Some(true));
+        assert_eq!(request.max_completion_tokens, Some(32));
+        assert_eq!(native.rid.client_facing(), "aigate-rid");
+        let header = native.encode_header().unwrap();
+        let wire = rmpv::decode::read_value(&mut &header[..]).unwrap();
+        let fields = wire.as_array().unwrap();
+        assert_eq!(fields[25].as_str(), Some("10.0.0.7"));
+        assert_eq!(fields[26].as_i64(), Some(8998));
+        assert_eq!(fields[27].as_i64(), Some(12345));
+        assert_eq!(fields[28].as_str(), Some("shared-pair"));
+        assert_eq!(fields[29].as_i64(), Some(16));
+        assert_eq!(fields[30].as_i64(), Some(9));
+        assert_eq!(fields[31].as_i64(), Some(0));
+    }
+
+    #[test]
+    fn pd_chat_rejects_missing_identity_and_ambiguous_choices() {
+        for key in ["bootstrap_host", "bootstrap_room"] {
+            let mut json = pd_body();
+            json.as_object_mut().unwrap().remove(key);
+            let body: super::ChatCompletionBody = serde_json::from_value(json).unwrap();
+            assert!(body.validate_pd(true).is_err(), "{key}");
+        }
+        for (key, value) in [
+            ("n", 2),
+            ("bootstrap_room", -1),
+            ("bootstrap_port", 65536),
+            ("routed_dp_rank", -1),
+        ] {
+            let mut json = pd_body();
+            json[key] = serde_json::json!(value);
+            let body: super::ChatCompletionBody = serde_json::from_value(json).unwrap();
+            assert!(body.validate_pd(true).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn ordinary_chat_and_pd_default_bootstrap_port_remain_supported() {
+        let ordinary: super::ChatCompletionBody = serde_json::from_value(serde_json::json!({
+            "model": "test", "messages": [{"role": "user", "content": "hi"}], "n": 2
+        }))
+        .unwrap();
+        ordinary.validate_pd(false).unwrap();
+        assert!(ordinary.validate_pd(true).is_err());
+        let mut json = pd_body();
+        json["bootstrap_port"] = serde_json::Value::Null;
+        let body: super::ChatCompletionBody = serde_json::from_value(json).unwrap();
+        body.validate_pd(true).unwrap();
+        assert_eq!(body.into_parts().1.bootstrap_port, None);
+        let mut json = pd_body();
+        json.as_object_mut().unwrap().remove("bootstrap_pair_key");
+        let body: super::ChatCompletionBody = serde_json::from_value(json).unwrap();
+        body.validate_pd(true).unwrap(); // non-Mooncake backends need no pair key
+        assert_eq!(body.into_parts().1.bootstrap_pair_key, None);
+        for key in [String::new(), "x".repeat(129), "非ASCII".into()] {
+            let mut json = pd_body();
+            json["bootstrap_pair_key"] = serde_json::json!(key);
+            let body: super::ChatCompletionBody = serde_json::from_value(json).unwrap();
+            assert!(body.validate_pd(true).is_err());
+        }
+    }
+
     /// Python `to_sampling_params` priority: user value > model generation
     /// config (`--sampling-defaults model`) > OpenAI terminal default.
     #[test]
@@ -1188,5 +1364,34 @@ mod tests {
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(usage["usage"]["completion_tokens"], 2);
         assert_eq!(frames[4], "[DONE]");
+    }
+}
+
+
+#[cfg(test)]
+mod ingress_http_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chat_wrong_rank_rejected_before_submission() {
+        let (tx, rx) = flume::unbounded();
+        let mut senders = super::super::test_utils::senders();
+        senders.tok_manager_tx = tx;
+        let state = Arc::new(AppState {
+            senders, response_buf: 8,
+            server_args: Arc::new(ServerArgs {
+                global_dp_rank: 9, global_dp_size: 16, ..Default::default()
+            }),
+            chat_formatter: None, response_activity: Default::default(),
+        });
+        let body = serde_json::from_value(serde_json::json!({
+            "model": "model", "messages": [{"role": "user", "content": "hi"}],
+            "data_parallel_rank": 8
+        })).unwrap();
+        let response = chat_completions(State(state), Ok(Json(body))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("global_dp_rank=9"));
+        assert!(rx.try_recv().is_err());
     }
 }

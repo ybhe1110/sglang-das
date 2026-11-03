@@ -71,6 +71,15 @@ impl ToSchedulerTx {
     pub fn try_push(&self, msg: SchedulerRequest) -> bool {
         self.tx.try_send(msg).is_ok()
     }
+
+    /// Cancellation must survive data-ring backpressure. Only the Rust intake
+    /// thread waits here, never the scheduler; shutdown interrupts the wait.
+    pub fn push_control(&self, msg: SchedulerRequest, shutdown: &flume::Receiver<()>) -> bool {
+        flume::Selector::new()
+            .send(&self.tx, msg, |r| r.is_ok())
+            .recv(shutdown, |_| false)
+            .wait()
+    }
 }
 
 impl ToSchedulerRx {

@@ -102,7 +102,7 @@ pub struct GenerateBody {
     #[serde(default)]
     pub decode_tp_size: Option<OneOrMany<Option<i64>>>,
     /// DP routing hints — per-request scalars even for batches, as in Python.
-    #[serde(default)]
+    #[serde(default, alias = "data_parallel_rank")]
     pub routed_dp_rank: Option<i64>,
     #[serde(default)]
     pub disagg_prefill_dp_rank: Option<i64>,

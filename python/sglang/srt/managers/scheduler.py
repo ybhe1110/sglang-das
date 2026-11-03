@@ -626,8 +626,8 @@ class Scheduler(
         self.init_profiler()
 
         # Start the embedded Rust frontend (rank 0). Must precede
-        # init_disaggregation: on PD prefill the rust api listener also serves
-        # the KV bootstrap registry, and the KVManagers built there register to
+        # init_disaggregation: on PD prefill Rust also serves the configured
+        # KV bootstrap port, and the KVManagers built there register to
         # it synchronously. (The listener is bound synchronously inside launch,
         # so the registry is accepting once this returns.) Must also precede
         # the request receiver, which reads self.recv_from_tokenizer to pick
@@ -819,6 +819,8 @@ class Scheduler(
                 publish_interval=get_observability().load_snapshot_publish_interval,
             )
         except Exception as e:
+            if envs.SGLANG_RUST_SERVER.get():
+                raise RuntimeError("Rust ingress requires a valid local load snapshot writer") from e
             logger.warning("load snapshot writer init failed: %s", e)
 
     def init_idle_sleeper(self) -> None:
@@ -1447,7 +1449,7 @@ class Scheduler(
                 )
 
         # In rust-server mode the KV bootstrap registry is already serving on
-        # the rust api listener (maybe_init_rust_server runs before this
+        # the configured bootstrap listener (maybe_init_rust_server runs before this
         # method — the PrefillBootstrapQueue's KVManager below registers to it
         # synchronously, and a failed registration only retries ~60s then logs,
         # leaving every PD request unroutable). Only the ascend config store,
