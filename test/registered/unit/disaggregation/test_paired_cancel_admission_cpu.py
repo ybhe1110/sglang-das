@@ -411,9 +411,10 @@ class TestPairedCancellation(unittest.TestCase):
                 handle_bootstrap_failure=Mock(),
             )
             q._check_if_req_exceed_kv_capacity = lambda req: False
-            q._get_consensus_bootstrap_resource_ready = lambda polls: [True] * len(
-                polls
-            )
+            q._aligned_bootstrap_requests = lambda q=q: q.queue
+            q._get_consensus_bootstrap_resource_ready = lambda requests, polls: [
+                True
+            ] * len(polls)
             req = SimpleNamespace(
                 rid="same-request",
                 bootstrap_host="prefill",
