@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import time
@@ -55,6 +56,7 @@ from sglang.srt.disaggregation.hidden_state import (
 from sglang.srt.disaggregation.utils import (
     EXTERNAL_KV_LOAD_ERR_TYPE,
     FAKE_BOOTSTRAP_HOST,
+    DisaggregationCollectiveError,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
@@ -801,8 +803,58 @@ class PrefillBootstrapQueue:
         required_rows = 0 if streaming_hidden else min(hidden_len, window_rows)
         return required_rows <= pool.size and required_rows > hidden_row_credits
 
+    def _aligned_bootstrap_requests(self) -> List[Req]:
+        """Exact RID intersection for PP=1, in the attention root's FIFO order."""
+        dist = torch.distributed
+        groups = [
+            g
+            for g in (
+                self.scheduler.attn_tp_cpu_group,
+                self.scheduler.attn_cp_cpu_group,
+            )
+            if g is not None and dist.get_world_size(g) > 1
+        ]
+        if not groups:
+            return self.queue
+
+        by_rid = {req.rid: req for req in self.queue}
+        # TP and CP are the two axes of one attention shard. Only its (0,0)
+        # rank contributes bytes. MAX over TP then CP copies its candidate
+        # list to the shard using the same deadline as the poll reductions.
+        root = all(dist.get_rank(g) == 0 for g in groups)
+        payload = json.dumps(list(by_rid)).encode("ascii") if root and by_rid else b""
+        header = torch.tensor(
+            [len(payload), int(not by_rid), int(len(by_rid) != len(self.queue))],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        for group in groups:
+            all_reduce_with_timeout(header, op=dist.ReduceOp.MAX, group=group)
+        size, any_empty, duplicate = header.tolist()
+        if duplicate:
+            raise DisaggregationCollectiveError(
+                "Duplicate RID in prefill bootstrap queue"
+            )
+        if any_empty:
+            return []
+
+        wire = (
+            torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+            if root
+            else torch.zeros(size, dtype=torch.uint8, device="cpu")
+        )
+        for group in groups:
+            all_reduce_with_timeout(wire, op=dist.ReduceOp.MAX, group=group)
+        candidates = json.loads(wire.numpy().tobytes())
+        present = torch.tensor(
+            [rid in by_rid for rid in candidates], dtype=torch.uint8, device="cpu"
+        )
+        for group in groups:
+            all_reduce_with_timeout(present, op=dist.ReduceOp.MIN, group=group)
+        return [by_rid[rid] for rid, keep in zip(candidates, present.tolist()) if keep]
+
     def _get_consensus_bootstrap_resource_ready(
-        self, polls: List[KVPoll]
+        self, requests: List[Req], polls: List[KVPoll]
     ) -> List[bool]:
         """Agree on bootstrap resource admission across attention TP/CP ranks.
 
@@ -814,29 +866,37 @@ class PrefillBootstrapQueue:
         collective then fails.  Probe resources without side effects and admit
         only the common FIFO prefix before performing any allocation.
         """
-        ready = [True] * len(self.queue)
+        ready = [True] * len(requests)
         metadata_credits = self.req_to_metadata_buffer_idx_allocator.available_size()
         pool = getattr(getattr(self, "metadata_buffers", None), "pd_hidden_pool", None)
         hidden_row_credits = pool.available_size() if pool is not None else 0
 
         resource_blocked = False
-        for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if (
-                resource_blocked
-                or poll != KVPoll.WaitingForInput
-                or not req.pending_bootstrap
-                or should_force_retry(req)
-            ):
-                if resource_blocked and poll == KVPoll.WaitingForInput:
-                    ready[i] = False
+        for i, (req, poll) in enumerate(zip(requests, polls)):
+            if poll not in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
                 continue
-
-            costs, error = self._probe_bootstrap_ready(
-                req, metadata_credits, hidden_row_credits
-            )
-            # Invalid request metadata is deterministic and must reach
-            # finalize_bootstrap on every rank so the request is failed cleanly.
-            if error is not None:
+            if resource_blocked:
+                ready[i] = False
+                continue
+            if poll == KVPoll.Bootstrapping and (
+                self._requires_pd_hidden_transfer(req)
+                or req.prefill_attempt_count >= get_disagg().optimistic_prefill_attempts
+                or req.is_retracted
+            ):
+                ready[i] = False
+                continue
+            if poll == KVPoll.Bootstrapping or should_force_retry(req):
+                # Optimistic and forced-retry admission also reserve metadata.
+                cost = int(req.metadata_buffer_index < 0)
+                costs = (cost, 0) if cost <= metadata_credits else None
+            elif req.pending_bootstrap:
+                costs, error = self._probe_bootstrap_ready(
+                    req, metadata_credits, hidden_row_credits
+                )
+                # Invalid metadata is handled by finalize_bootstrap.
+                if error is not None:
+                    continue
+            else:
                 continue
             if costs is None:
                 ready[i] = False
@@ -871,7 +931,7 @@ class PrefillBootstrapQueue:
                     self.kv_manager.req_to_decode_prefix_len.get(req.bootstrap_room, 0)
                     or 0
                 )
-                for req in self.queue
+                for req in requests
             ],
             dtype=torch.int64,
             device="cpu",
@@ -886,7 +946,7 @@ class PrefillBootstrapQueue:
             op=torch.distributed.ReduceOp.MAX,
             group=self.scheduler.attn_cp_cpu_group,
         )
-        for req, value in zip(self.queue, prefix_tensor.tolist()):
+        for req, value in zip(requests, prefix_tensor.tolist()):
             if value > 0:
                 self.kv_manager.req_to_decode_prefix_len[req.bootstrap_room] = int(
                     value
@@ -1055,7 +1115,9 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_tp_cpu_group,
             )
 
-        resource_ready = self._get_consensus_bootstrap_resource_ready(polls)
+        resource_ready = self._get_consensus_bootstrap_resource_ready(
+            self.queue, polls
+        )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
@@ -1117,9 +1179,9 @@ class PrefillBootstrapQueue:
 
         bootstrapped_reqs = []
         failed_reqs = []
-        indices_to_remove = set()
 
-        if len(self.queue) == 0:
+        requests = self.queue if self.pp_size > 1 else self._aligned_bootstrap_requests()
+        if not requests:
             if return_failed_reqs is False:
                 return []
             else:
@@ -1144,33 +1206,28 @@ class PrefillBootstrapQueue:
                         polls[i] = KVPoll.Failed
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
-                [req.disagg_kv_sender for req in self.queue],
+                [req.disagg_kv_sender for req in requests],
                 self.scheduler.attn_cp_cpu_group,
                 self.scheduler.attn_tp_cpu_group,
             )
 
-        resource_ready = self._get_consensus_bootstrap_resource_ready(polls)
+        resource_ready = self._get_consensus_bootstrap_resource_ready(requests, polls)
 
-        for i, (req, poll) in enumerate(zip(self.queue, polls)):
+        for i, (req, poll) in enumerate(zip(requests, polls)):
             if poll is None:
                 continue
 
             if poll == KVPoll.Failed:
                 self.scheduler.handle_bootstrap_failure(req)
-                indices_to_remove.add(i)
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
-                if self._requires_pd_hidden_transfer(req):
-                    # PD hidden must be captured for every prefill chunk.
-                    # Do not run optimistic forward before hidden rows and
-                    # capture metadata are materialized.
+                if not resource_ready[i]:
                     continue
                 if not req.is_retracted and self.can_prefill_before_bootstrap(req):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
                     bootstrapped_reqs.append(req)
-                    indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
                     req.arrival_processed_tokens = (
                         self.scheduler.processed_tokens_counter
@@ -1185,7 +1242,6 @@ class PrefillBootstrapQueue:
                 elif req.pending_bootstrap and not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
-                indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
                 req.arrival_processed_tokens = self.scheduler.processed_tokens_counter
             else:
@@ -1193,9 +1249,9 @@ class PrefillBootstrapQueue:
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
                 )
 
-        self.queue = [
-            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
-        ]
+        if bootstrapped_reqs or failed_reqs:
+            removed = {id(req) for req in bootstrapped_reqs + failed_reqs}
+            self.queue = [req for req in self.queue if id(req) not in removed]
 
         if return_failed_reqs is False:
             return bootstrapped_reqs
