@@ -405,6 +405,7 @@ impl GenerateBody {
                 // Native text prompts keep the post-processor specials; the
                 // chat flow sets this explicitly.
                 skip_special_tokens: false,
+                assistant_prefix: None,
                 sampling_params,
                 stream,
                 // Python `GenerateReqInput` defaults.
@@ -617,6 +618,9 @@ pub struct GenerateRequest {
     /// chat-template encode site (`serving_chat._encode_messages`). Consumed
     /// by the pool before the header is built; never reaches the scheduler wire.
     pub skip_special_tokens: bool,
+    /// DSV4 continuation is tokenized separately; strip its leading BOS only.
+    /// Internal metadata, never serialized on the scheduler wire.
+    pub assistant_prefix: Option<(String, Option<i32>)>,
     /// Sampling params (defaults when the client sent none, as in Python);
     /// normalized + verified, then serialized into the header.
     pub sampling_params: SamplingParams,

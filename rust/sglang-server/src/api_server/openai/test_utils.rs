@@ -309,3 +309,72 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
     assert_eq!(frame["error"]["code"], 503);
     assert!(text.contains("[DONE]"));
 }
+
+/// Exercise the real HTTP extractor, formatter and PD handoff without a GPU.
+#[tokio::test]
+async fn dsv4_chat_http_preserves_pd_routing_and_prefilled_reasoning() {
+    use crate::message::request::RequestKind;
+    use crate::tokenizer_manager::wiring::TmEvent;
+    for stream in [false, true] {
+        let (tx, rx) = flume::unbounded();
+        let mut channels = senders();
+        channels.tok_manager_tx = tx;
+        let mut state = Arc::try_unwrap(app_state(channels)).ok().unwrap();
+        let mut args = (*state.server_args).clone();
+        args.tokenizer_path = "/models/no-template".into();
+        args.model_config.dsv4_reasoning_effort_profile = Some("official".into());
+        args.reasoning_parser = Some("deepseek-v4".into());
+        args.global_dp_size = 16;
+        args.global_dp_rank = 9;
+        args.disaggregation_mode = crate::message::config::DisaggregationMode::Decode;
+        state.chat_formatter = super::load_chat_support(&args);
+        state.server_args = Arc::new(args);
+        let app = routes().with_state(Arc::new(state));
+        let body = json!({
+            "model":"model", "messages":[{"role":"user","content":"Hi"}],
+            "chat_template_kwargs":{"thinking":true}, "stream":stream,
+            "rid":"chat-pd", "bootstrap_host":"10.0.0.7", "bootstrap_port":8998,
+            "bootstrap_room":123, "bootstrap_pair_key":"pair", "routed_dp_rank":9,
+            "disagg_prefill_dp_rank":0
+        });
+        let client = post_json(app, "/v1/chat/completions", body);
+        let backend = async {
+            let TmEvent::Intake(request) = rx.recv_async().await.unwrap() else {
+                panic!("intake expected")
+            };
+            let RequestKind::Generate(g) = &request.kind else {
+                panic!("generate expected")
+            };
+            assert_eq!(
+                g.text.as_deref(),
+                Some("<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜><think>")
+            );
+            assert!(!g.skip_special_tokens);
+            assert_eq!(g.routed_dp_rank, Some(9));
+            assert_eq!(g.disagg_prefill_dp_rank, Some(0));
+            assert_eq!(g.bootstrap_room, Some(123));
+            assert_eq!(g.bootstrap_pair_key.as_deref(), Some("pair"));
+            request
+                .sink
+                .try_send(chunk("chat-pd", "reason", true))
+                .unwrap();
+        };
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(client, backend)
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        if stream {
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(body.contains("\"reasoning_content\":\"reason\""), "{body}");
+            assert!(body.contains("[DONE]"));
+        } else {
+            let body = body_json(response).await;
+            assert_eq!(body["choices"][0]["message"]["reasoning_content"], "reason");
+        }
+    }
+}

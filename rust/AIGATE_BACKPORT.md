@@ -83,8 +83,8 @@ through Aigate with identical P/D room/key fields. Observe source-drain,
 quarantine and pool accounting after drain, and compare TTFT/throughput against
 the Python frontend. Do not infer end-to-end safety from these CPU tests.
 
-The backport has not been compiled on Linux or tested on GPU hardware.
-Do not treat this branch as production-qualified until those checks pass.
+Production qualification still requires the GPU/HCU acceptance checks below.
+The isolated Linux build and CPU checks for the chat fix are recorded separately.
 It is a scoped loads backport and PD integration fix, not a wholesale merge of
 latest upstream.
 
@@ -184,7 +184,69 @@ rejected). This covers the bundled gateway's older request field, but does
 not change its base_url addressing: each registered worker still needs the
 actual selected ingress URL, not a shared node base port.
 
-Local validation for this change: 16 dependency-light CPU regressions and the
+Initial DP ingress validation: 16 dependency-light CPU regressions and the
 snapshot fixture/schema check passed; Python compilation and diff whitespace
-checks passed. Rust tests and real Gloo/GPU/HCU runs remain unexecuted on the
-Windows editing host (no Rust toolchain, PyTorch or configured WSL).
+checks passed. Real Gloo/GPU/HCU acceptance remains separate from CPU checks.
+
+## DeepSeek V4 Chat without a tokenizer template
+
+This backports the missing-template fallback from upstream PR #38939
+(`07e1918924`) and adapts the DSV4 request normalization from PR #42664
+(`45abea0269`). `dynamo-renderer` is pinned to 5.1.2 with the corresponding lock
+updates. The existing loads implementation also now declares its missing
+`rustix` dependency explicitly.
+
+Python resolves the DSV4 encoder and checkpoint reasoning-effort profile using
+the same helpers as `OpenAIServingChat`. It passes those values, HF model type,
+BOS id, default template kwargs and the existing thinking/effort environment
+defaults to Rust through `ModelConfig`. Update Python and rebuild the Rust
+extension together. There is no new environment variable: keep
+`SGLANG_RUST_SERVER=1`. DSV4 needs no fabricated `chat_template` in the model
+directory and no `--chat-template`; its native encoder takes precedence as it
+does in Python. Startup reports `loaded native DeepSeek V4 chat encoder`.
+
+The Chat endpoint keeps the complete body for native rendering, including
+`chat_template_kwargs`, `reasoning`, `task`, continuation and message-level
+tools. SGLang's thinking/effort precedence, tool serialization and final
+assistant handling are preserved. A continuation is tokenized separately and
+loses at most one leading BOS. The reasoning parser receives the prompt's
+initial state for both streaming and unary responses. PD room/pair/rank fields
+continue through the existing validated routing path.
+
+Aigate needs no template code if it forwards Chat JSON. It must preserve these
+fields and send matching messages/tools/thinking/effort to P and D. Keep both
+sides on the same Python/Rust build, checkpoint, profile and default kwargs.
+The existing per-rank discovery and PD pairing requirements still apply.
+The private Aigate code has not been audited here.
+
+Validation commands (Linux, from the repository root):
+
+```bash
+cd rust
+cargo test --locked -p sglang-server --lib
+cargo build --locked -p sglang-server
+cd sglang-server
+PYTHONPATH=../../python python tests/scripts/generate_dsv4_parity.py \
+  tests/fixtures/parity/deepseek-v4-flash-0731.json \
+  --model-path /work/models --reasoning-effort-profile official \
+  --output tests/fixtures/parity/deployment.json
+cargo test --locked -p sglang-server dsv4_deployment_token_parity -- --ignored --nocapture
+```
+
+The fixture generator calls the actual Python serving method and tokenizer; it
+does not use Rust output as its oracle. Use the deployment's actual profile
+override, or omit the flag to detect it from the checkpoint. The deployment
+fixture is ignored by Git and is required by the explicitly ignored token test.
+
+Validation on 2026-11-05 used an isolated temporary build directory in the
+existing Linux image, Rust 1.99.1 and the deployment's `/work/models` tokenizer
+(resolved profile `official`). The server suite passed 266 tests; the separate
+token test checked 41 cases: 36 successful requests matched prompt text and
+token IDs, 3 matched Python rejection, and 2 retained upstream `known_gap`
+markers. Those two cases serialize floating-point JSON in tool schemas/history
+differently (`1e-6` versus Python's `1e-06`); they are not claimed as exact
+parity. The test fails if an unmarked case diverges or a marked gap disappears.
+HTTP tests cover PD rank 9, preserved bootstrap identities, and both streaming
+and non-streaming reasoning. No live service was restarted or replaced by
+these checks; an image rollout and real Aigate-to-PD generation test remain
+deployment acceptance steps.

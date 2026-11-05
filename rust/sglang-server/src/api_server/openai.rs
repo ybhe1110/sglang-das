@@ -11,12 +11,13 @@ use tokio::sync::mpsc;
 
 mod chat;
 mod completions;
+mod deepseek_v4;
 mod models;
 mod reasoning;
 mod template;
 mod tools;
 
-pub(super) use template::ChatFormatter;
+pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
@@ -50,15 +51,34 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
     }
+    // Python's DSV4 encoder takes precedence over Jinja (including explicit
+    // templates). Keep this separate from the generic missing-template fallback.
+    if let Some(profile) = server_args
+        .model_config
+        .dsv4_reasoning_effort_profile
+        .as_deref()
+    {
+        let profile = match profile {
+            "preview" => deepseek_v4::DeepSeekV4Profile::Preview,
+            "official" => deepseek_v4::DeepSeekV4Profile::Official,
+            other => {
+                tracing::error!(%other, "invalid DeepSeek V4 reasoning effort profile");
+                return None;
+            }
+        };
+        tracing::info!(?profile, "loaded native DeepSeek V4 chat encoder");
+        return Some(ChatFormatter::DeepSeekV4(profile));
+    }
     let config_file = tokenizer::resolve_model_file(
         &server_args.tokenizer_path,
         server_args.revision.as_deref(),
         "tokenizer_config.json",
     );
 
-    match template::load_chat_formatter(
+    match template::load_chat_formatter_for_model(
         config_file.as_deref(),
         (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
+        server_args.model_config.model_type.as_deref(),
         server_args.chat_template.as_deref(),
     ) {
         Ok(formatter) => {

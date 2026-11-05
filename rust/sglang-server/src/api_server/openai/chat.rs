@@ -35,8 +35,8 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_decode_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
+    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
@@ -90,7 +90,9 @@ impl ChatCompletionBody {
                 .is_none_or(|s| s.trim().is_empty())
                 || self.bootstrap_room.is_none_or(|room| room < 0)
             {
-                return Err("PD chat requires bootstrap_host and nonnegative bootstrap_room".into());
+                return Err(
+                    "PD chat requires bootstrap_host and nonnegative bootstrap_room".into(),
+                );
             }
         }
         // Requiring a pair key is backend-specific (Mooncake enforces it on
@@ -102,7 +104,9 @@ impl ChatCompletionBody {
         {
             return Err("bootstrap_pair_key must contain 1..128 ASCII bytes".into());
         }
-        if self.bootstrap_port.is_some_and(|p| !(1..=65535).contains(&p))
+        if self
+            .bootstrap_port
+            .is_some_and(|p| !(1..=65535).contains(&p))
             || self.decode_tp_size.is_some_and(|n| n <= 0)
             || self.routed_dp_rank.is_some_and(|r| r < 0)
             || self.disagg_prefill_dp_rank.is_some_and(|r| r < 0)
@@ -114,7 +118,11 @@ impl ChatCompletionBody {
 
     fn into_parts(self) -> (CreateChatCompletionRequest, GenerateRequest) {
         let routing = GenerateRequest {
-            rid: self.rid.as_deref().map(Rid::from_client).unwrap_or_default(),
+            rid: self
+                .rid
+                .as_deref()
+                .map(Rid::from_client)
+                .unwrap_or_default(),
             bootstrap_host: self.bootstrap_host,
             bootstrap_port: self.bootstrap_port,
             bootstrap_room: self.bootstrap_room,
@@ -130,18 +138,35 @@ impl ChatCompletionBody {
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<ChatCompletionBody>, JsonRejection>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let raw_request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    // Keep the complete SGLang body for native encoders. The typed OpenAI
+    // request drops task, reasoning, continuation and message-level tools.
+    let typed_request = if matches!(state.chat_formatter, Some(ChatFormatter::DeepSeekV4(_))) {
+        match super::deepseek_v4::openai_request(&raw_request) {
+            Ok(request) => request,
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+        }
+    } else {
+        raw_request.clone()
+    };
+    let request: ChatCompletionBody = match serde_json::from_value(typed_request) {
+        Ok(request) => request,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+    };
     if let Err(message) = request.validate_pd(state.server_args.is_disaggregation()) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
-    if let Err(message) = state.server_args.validate_routed_dp_rank(request.routed_dp_rank) {
+    if let Err(message) = state
+        .server_args
+        .validate_routed_dp_rank(request.routed_dp_rank)
+    {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     let supplied_rid = request.rid.clone();
@@ -229,7 +254,7 @@ async fn chat_completions(
     });
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) = match prepare_chat_request(&state, request).await {
+    let (request, prompt) = match prepare_chat_request(&state, request, raw_request).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
@@ -266,6 +291,21 @@ async fn chat_completions(
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(n);
 
+    let starts_in_reasoning = matches!(
+        reasoning_parser.as_deref(),
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4")
+    ) && {
+        let rendered = format!(
+            "{}{}",
+            prompt.text,
+            prompt
+                .assistant_prefix
+                .as_ref()
+                .map(|(text, _)| text.as_str())
+                .unwrap_or("")
+        );
+        rendered.rfind("<think>") > rendered.rfind("</think>")
+    };
     let mut prompt = Some(prompt);
     for index in 0..n {
         let rid = Rid::from_client(&match &supplied_rid {
@@ -283,10 +323,10 @@ async fn chat_completions(
         };
         let native = GenerateRequest {
             rid: rid.clone(),
-            text: Some(choice_prompt),
-            // Rendered templates own their special tokens — the pool must not
-            // add another BOS/EOS (Python's `add_special_tokens=False`).
-            skip_special_tokens: true,
+            text: Some(choice_prompt.text),
+            assistant_prefix: choice_prompt.assistant_prefix,
+            // Jinja uses add_special_tokens=False; DSV4 uses tokenizer.encode.
+            skip_special_tokens: choice_prompt.skip_special_tokens,
             sampling_params: sampling.clone(),
             stream,
             return_logprob: want_logprobs,
@@ -320,6 +360,7 @@ async fn chat_completions(
             include_usage,
             parser,
             reasoning_parser,
+            starts_in_reasoning,
             tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
@@ -338,6 +379,7 @@ async fn chat_completions(
             want_logprobs,
             parser,
             reasoning_parser,
+            starts_in_reasoning,
             tools,
             parallel_tool_calls,
             service_tier,
@@ -350,10 +392,18 @@ async fn chat_completions(
 /// formatter or a render failure to the standard 400. The rendered prompt is
 /// submitted as text — the tokenizer pool encodes it (with
 /// `skip_special_tokens`, since the template owns its special tokens).
+#[derive(Clone)]
+pub(super) struct ChatPrompt {
+    text: String,
+    assistant_prefix: Option<(String, Option<i32>)>,
+    skip_special_tokens: bool,
+}
+
 pub(super) async fn prepare_chat_request(
     state: &AppState,
     mut request: CreateChatCompletionRequest,
-) -> Result<(CreateChatCompletionRequest, String), Response> {
+    mut raw_request: serde_json::Value,
+) -> Result<(CreateChatCompletionRequest, ChatPrompt), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
@@ -366,7 +416,58 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request).map_err(|error| {
+    let model = &state.server_args.model_config;
+    let defaults: ChatTemplateKwargs = serde_json::from_str(&model.default_chat_template_kwargs)
+        .map_err(|error| {
+            openai_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), false)
+        })?;
+    let mut kwargs: ChatTemplateKwargs = match raw_request.get("chat_template_kwargs") {
+        None | Some(serde_json::Value::Null) => ChatTemplateKwargs::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| openai_error(StatusCode::BAD_REQUEST, error.to_string(), false))?,
+    };
+    // protocol.normalize_reasoning_inputs precedes the server-default merge.
+    if let Some(thinking) = super::deepseek_v4::requested_thinking(&raw_request) {
+        kwargs.entry("thinking".into()).or_insert(thinking.into());
+        kwargs
+            .entry("enable_thinking".into())
+            .or_insert(thinking.into());
+    }
+    // Request kwargs effort replaces request effort; a server default fills
+    // only a missing effort (serving_chat._convert_to_internal_request).
+    let request_effort = kwargs
+        .remove("reasoning_effort")
+        .filter(|v| !v.is_null())
+        .or_else(|| super::deepseek_v4::requested_effort(&raw_request).cloned());
+    for (key, value) in defaults {
+        kwargs.entry(key).or_insert(value);
+    }
+    if let Some(effort) = request_effort {
+        kwargs.insert("reasoning_effort".into(), effort);
+    }
+    raw_request["chat_template_kwargs"] = serde_json::to_value(&kwargs).unwrap();
+    let result = match formatter {
+        ChatFormatter::DeepSeekV4(profile) => super::deepseek_v4::render(
+            profile,
+            raw_request,
+            model.default_thinking,
+            model.default_reasoning_effort.clone(),
+        )
+        .map(|(text, prefix)| ChatPrompt {
+            text,
+            assistant_prefix: (!prefix.is_empty()).then_some((prefix, model.bos_token_id)),
+            skip_special_tokens: false,
+        }),
+        _ => formatter
+            .render_with_kwargs(&request, Some(&kwargs))
+            .map(|text| ChatPrompt {
+                text,
+                assistant_prefix: None,
+                skip_special_tokens: true,
+            })
+            .map_err(|error| error.to_string()),
+    };
+    let prompt = result.map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
@@ -530,6 +631,7 @@ pub(super) async fn unary_chat(
     want_logprobs: bool,
     parser: Option<String>,
     reasoning_parser: Option<String>,
+    starts_in_reasoning: bool,
     tools: Option<Vec<ToolDefinition>>,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
@@ -555,8 +657,12 @@ pub(super) async fn unary_chat(
         // Split reasoning markers out of the content first (Python splits
         // before tool-call parsing too), then parse tool calls on the clean
         // normal text.
-        let (reasoning_text, text) =
-            split_reasoning_unary(reasoning_parser.as_deref(), &output.text, &output.token_ids);
+        let (reasoning_text, text) = split_reasoning_unary(
+            reasoning_parser.as_deref(),
+            &output.text,
+            &output.token_ids,
+            starts_in_reasoning,
+        );
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
             parser.as_deref(),
@@ -615,6 +721,7 @@ pub(super) fn chat_event_stream(
     include_usage: bool,
     parser: Option<String>,
     reasoning_parser: Option<String>,
+    starts_in_reasoning: bool,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
@@ -633,7 +740,7 @@ pub(super) fn chat_event_stream(
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
             if reasoning_parser.is_some() {
                 (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref()))
+                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), starts_in_reasoning))
                     .collect()
             } else {
                 vec![]
@@ -1220,6 +1327,7 @@ mod tests {
             false,
             None,
             None,
+            false,
             None,
             true,
             None,
@@ -1257,6 +1365,7 @@ mod tests {
             false,
             None,
             Some("deepseek-r1".into()),
+            false,
             None,
             true,
             None,
@@ -1296,6 +1405,7 @@ mod tests {
             true,
             None,
             Some("deepseek-r1".into()),
+            false,
             None,
             None,
             false,
@@ -1342,6 +1452,7 @@ mod tests {
             true,
             None,
             None,
+            false,
             None,
             None,
             false,
@@ -1367,7 +1478,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod ingress_http_tests {
     use super::*;
@@ -1378,20 +1488,84 @@ mod ingress_http_tests {
         let mut senders = super::super::test_utils::senders();
         senders.tok_manager_tx = tx;
         let state = Arc::new(AppState {
-            senders, response_buf: 8,
+            senders,
+            response_buf: 8,
             server_args: Arc::new(ServerArgs {
-                global_dp_rank: 9, global_dp_size: 16, ..Default::default()
+                global_dp_rank: 9,
+                global_dp_size: 16,
+                ..Default::default()
             }),
-            chat_formatter: None, response_activity: Default::default(),
+            chat_formatter: None,
+            response_activity: Default::default(),
         });
         let body = serde_json::from_value(serde_json::json!({
             "model": "model", "messages": [{"role": "user", "content": "hi"}],
             "data_parallel_rank": 8
-        })).unwrap();
+        }))
+        .unwrap();
         let response = chat_completions(State(state), Ok(Json(body))).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("global_dp_rank=9"));
         assert!(rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn dsv4_chat_preparation_preserves_kwargs_defaults_and_continuation() {
+        use super::super::test_utils::{app_state, senders};
+        let mut state = std::sync::Arc::try_unwrap(app_state(senders()))
+            .ok()
+            .unwrap();
+        let mut args = (*state.server_args).clone();
+        args.tokenizer_path = "/models/no-template".into();
+        args.model_config.dsv4_reasoning_effort_profile = Some("official".into());
+        args.model_config.bos_token_id = Some(0);
+        args.model_config.default_chat_template_kwargs =
+            r#"{"thinking":false,"reasoning_effort":"max"}"#.into();
+        state.chat_formatter = super::super::load_chat_support(&args);
+        state.server_args = std::sync::Arc::new(args);
+        assert!(matches!(
+            state.chat_formatter,
+            Some(super::ChatFormatter::DeepSeekV4(_))
+        ));
+
+        let raw = serde_json::json!({"model":"model", "messages":[{"role":"user","content":"Hi"}], "reasoning_effort":"low"});
+        let req = serde_json::from_value(raw.clone()).unwrap();
+        let (_, prompt) = super::prepare_chat_request(&state, req, raw)
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(
+            prompt.text,
+            "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜><think>"
+        );
+        assert!(!prompt.skip_special_tokens);
+
+        let raw = serde_json::json!({"model":"model", "messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello"}], "continue_final_message":true, "chat_template_kwargs":{"thinking":false,"reasoning_effort":"low"}});
+        let req = serde_json::from_value(raw.clone()).unwrap();
+        let (_, prompt) = super::prepare_chat_request(&state, req, raw)
+            .await
+            .ok()
+            .unwrap();
+        assert!(prompt.text.ends_with("</think>"));
+        assert_eq!(prompt.assistant_prefix, Some(("Hello".into(), Some(0))));
+
+        let mut raw = serde_json::json!({"model":"model", "messages":[{"role":"user","content":"Hi"}], "chat_template_kwargs":{"thinking":true}});
+        let req = serde_json::from_value(raw.clone()).unwrap();
+        let (_, default_effort) = super::prepare_chat_request(&state, req, raw.clone())
+            .await
+            .ok()
+            .unwrap();
+        raw["chat_template_kwargs"]["reasoning_effort"] = serde_json::Value::Null;
+        let req = serde_json::from_value(raw.clone()).unwrap();
+        let (_, null_effort) = super::prepare_chat_request(&state, req, raw)
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(
+            null_effort.text, default_effort.text,
+            "null kwargs effort must still use the server default"
+        );
     }
 }

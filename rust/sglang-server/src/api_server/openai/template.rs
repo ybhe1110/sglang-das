@@ -6,6 +6,7 @@
 //! `Conversation.get_prompt()` so there is exactly one implementation of the
 //! per-style formatting logic (no Jinja translation to drift).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use dynamo_protocols::types::{
@@ -14,7 +15,10 @@ use dynamo_protocols::types::{
     ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestUserMessageContent,
     ChatCompletionRequestUserMessageContentPart, CreateChatCompletionRequest,
 };
-use dynamo_renderer::{ChatTemplate, ContextMixins, PromptContextMixin, PromptFormatter};
+use dynamo_renderer::{
+    ChatTemplate, ContextMixins, OAIChatLikeRequest, PromptContextMixin, PromptFormatter,
+    TextInput, native_formatter_for,
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -50,29 +54,43 @@ const SUPPORTED_STYLES: &[&str] = &[
     "UNLIMITED_OCR",
 ];
 
-/// A chat prompt formatter: either the model's HuggingFace Jinja template or a
-/// legacy SGLang conversation template.
+/// Extra variables for the chat template (`chat_template_kwargs`).
+pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
+
+/// A chat prompt formatter: either the model's HuggingFace Jinja template (or
+/// Dynamo's built-in encoder for models that ship none) or a legacy SGLang
+/// conversation template.
 #[derive(Clone)]
 pub enum ChatFormatter {
+    DeepSeekV4(super::deepseek_v4::DeepSeekV4Profile),
     HuggingFace(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
 }
 
 impl ChatFormatter {
-    /// Render the request's messages to a single prompt string.
+    #[cfg(test)]
     pub(super) fn render(
         &self,
         request: &CreateChatCompletionRequest,
     ) -> Result<String, TemplateError> {
+        self.render_with_kwargs(request, None)
+    }
+
+    /// Render the request's messages to a single prompt string.
+    pub(super) fn render_with_kwargs(
+        &self,
+        request: &CreateChatCompletionRequest,
+        kwargs: Option<&ChatTemplateKwargs>,
+    ) -> Result<String, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace(formatter) => {
-                let PromptFormatter::OAI(formatter) = formatter;
-                formatter
-                    .render(request)
-                    .map_err(|error| TemplateError::Renderer {
-                        message: error.to_string(),
-                    })
-            }
+            ChatFormatter::DeepSeekV4(_) => Err(TemplateError::Renderer {
+                message: "DeepSeek V4 requires the complete SGLang request body".into(),
+            }),
+            ChatFormatter::HuggingFace(PromptFormatter::OAI(formatter)) => formatter
+                .render(&TemplateRequest { request, kwargs })
+                .map_err(|error| TemplateError::Renderer {
+                    message: error.to_string(),
+                }),
             ChatFormatter::Legacy(formatter) => formatter.render(request),
         }
     }
@@ -83,9 +101,52 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_) => None,
+            ChatFormatter::HuggingFace(_) | ChatFormatter::DeepSeekV4(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
+    }
+}
+
+/// The wire request plus its `chat_template_kwargs`, which the protocol type
+/// does not carry.
+struct TemplateRequest<'a> {
+    request: &'a CreateChatCompletionRequest,
+    kwargs: Option<&'a ChatTemplateKwargs>,
+}
+
+impl OAIChatLikeRequest for TemplateRequest<'_> {
+    fn model(&self) -> String {
+        self.request.model()
+    }
+    fn messages(&self) -> minijinja::Value {
+        self.request.messages()
+    }
+    fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
+        self.request.typed_messages()
+    }
+    fn tools(&self) -> Option<minijinja::Value> {
+        self.request.tools()
+    }
+    fn tool_choice(&self) -> Option<minijinja::Value> {
+        self.request.tool_choice()
+    }
+    fn response_format(&self) -> Option<minijinja::Value> {
+        self.request.response_format()
+    }
+    fn reasoning_effort(&self) -> Option<minijinja::Value> {
+        self.request.reasoning_effort()
+    }
+    fn should_add_generation_prompt(&self) -> bool {
+        self.request.should_add_generation_prompt()
+    }
+    fn chat_template_args(&self) -> Option<&ChatTemplateKwargs> {
+        self.kwargs
+    }
+    fn extract_text(&self) -> Option<TextInput> {
+        self.request.extract_text()
+    }
+    fn mm_processor_kwargs(&self) -> Option<&serde_json::Value> {
+        self.request.mm_processor_kwargs()
     }
 }
 
@@ -752,9 +813,19 @@ pub(super) enum TemplateError {
     UnsupportedRole { role: &'static str },
 }
 
+#[cfg(test)]
 pub(super) fn load_chat_formatter(
     config_file: Option<&str>,
     model_path: Option<&str>,
+    chat_template_arg: Option<&str>,
+) -> Result<ChatFormatter, TemplateError> {
+    load_chat_formatter_for_model(config_file, model_path, None, chat_template_arg)
+}
+
+pub(super) fn load_chat_formatter_for_model(
+    config_file: Option<&str>,
+    model_path: Option<&str>,
+    model_type: Option<&str>,
     chat_template_arg: Option<&str>,
 ) -> Result<ChatFormatter, TemplateError> {
     // Python resolves registry names before looking at the filesystem — and
@@ -777,10 +848,21 @@ pub(super) fn load_chat_formatter(
         return Ok(ChatFormatter::Legacy(Box::new(LegacyFormatter { spec })));
     }
 
+    // Upstream #38939: model families without a Jinja template have native encoders.
+    // An explicit template error must remain visible to the operator.
+    let native_formatter = || match chat_template_arg {
+        None => native_formatter_for(
+            &model_type.map(str::to_lowercase),
+            &model_path.unwrap_or_default().to_lowercase(),
+        )
+        .map(ChatFormatter::HuggingFace),
+        Some(_) => None,
+    };
+
     // Every remaining source builds the HF renderer around the tokenizer
     // config (the template itself, or the argument injected into it).
     let Some(config_file) = config_file else {
-        return Err(TemplateError::MissingConfig);
+        return native_formatter().ok_or(TemplateError::MissingConfig);
     };
 
     let config_path = Path::new(config_file);
@@ -788,7 +870,10 @@ pub(super) fn load_chat_formatter(
     let mut config = parse_json(&config_text, config_path, "tokenizer config")?;
 
     let Some(argument) = chat_template_arg else {
-        return formatter_from_config(&config);
+        return match formatter_from_config(&config) {
+            Err(TemplateError::Missing) => native_formatter().ok_or(TemplateError::Missing),
+            result => result,
+        };
     };
 
     let path = Path::new(argument);
@@ -1862,6 +1947,74 @@ mod tests {
         assert!(infer_legacy_template_from_model_path("minicpm-v-4.6").is_none());
         assert!(matches!(
             load_chat_formatter(None, Some("minicpm-v-4.6"), None),
+            Err(TemplateError::MissingConfig)
+        ));
+    }
+    fn temp_config(contents: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sglang-template-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("tokenizer_config.json");
+        std::fs::write(&config, contents).unwrap();
+        config
+    }
+    #[test]
+    fn chat_template_kwargs_reach_the_template() {
+        let config = temp_config(r#"{"chat_template": "thinking={{ thinking }}"}"#);
+        let formatter =
+            super::load_chat_formatter_for_model(Some(config.to_str().unwrap()), None, None, None)
+                .unwrap();
+        let kwargs = super::HashMap::from([("thinking".into(), serde_json::json!(true))]);
+        assert_eq!(
+            formatter.render_with_kwargs(&request(), None).unwrap(),
+            "thinking="
+        );
+        assert_eq!(
+            formatter
+                .render_with_kwargs(&request(), Some(&kwargs))
+                .unwrap(),
+            "thinking=True"
+        );
+    }
+
+    #[test]
+    fn missing_template_falls_back_to_native_formatter() {
+        let config = temp_config("{}");
+        let config = config.to_str().unwrap();
+        let load = |config, model_type, arg| {
+            super::load_chat_formatter_for_model(config, Some("/models/x"), model_type, arg)
+        };
+
+        let formatter = load(Some(config), Some("deepseek_v4"), None).unwrap();
+        assert!(matches!(formatter, ChatFormatter::HuggingFace(_)));
+        let kwargs = super::HashMap::from([("thinking".into(), serde_json::json!(false))]);
+        assert_eq!(
+            formatter
+                .render_with_kwargs(&request(), Some(&kwargs))
+                .unwrap(),
+            "<｜begin▁of▁sentence｜>Be concise.<｜User｜>Hello<｜Assistant｜></think>"
+        );
+        assert!(matches!(
+            load(None, Some("deepseek_v4"), None),
+            Ok(ChatFormatter::HuggingFace(_))
+        ));
+
+        // A template, `--chat-template`, or an unknown architecture wins.
+        let templated = temp_config(r#"{"chat_template": "Hi"}"#);
+        let formatter = load(Some(templated.to_str().unwrap()), Some("deepseek_v4"), None).unwrap();
+        assert_eq!(
+            formatter.render_with_kwargs(&request(), None).unwrap(),
+            "Hi"
+        );
+        assert!(matches!(
+            load(Some(config), Some("deepseek_v4"), Some("chatml")),
+            Ok(ChatFormatter::Legacy(_))
+        ));
+        assert!(matches!(
+            load(Some(config), Some("llama"), None),
+            Err(TemplateError::Missing)
+        ));
+        assert!(matches!(
+            load(None, None, None),
             Err(TemplateError::MissingConfig)
         ));
     }

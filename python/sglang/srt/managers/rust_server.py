@@ -794,11 +794,34 @@ class RustServer:
 
         sa = scheduler.server_args
         mc = scheduler.model_config
+        from sglang.srt.entrypoints.openai.chat_encoding import (
+            resolve_chat_encoding_spec,
+            resolve_dsv4_reasoning_effort_profile,
+        )
         from sglang.srt.entrypoints.v1_loads import (
             _accelerator_name,
             _num_accelerators_per_dp_rank,
         )
         from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
+
+        hf = mc.hf_config
+        is_dsv4 = (
+            resolve_chat_encoding_spec(
+                hf_config=hf,
+                tokenizer=None,
+                tool_call_parser=get_serving().tool_call_parser,
+            )
+            == "dsv4"
+        )
+        dsv4_profile = (
+            resolve_dsv4_reasoning_effort_profile(
+                model_path=sa.model_path,
+                revision=sa.revision,
+                override=getattr(hf, "dsv4_reasoning_effort_profile", None),
+            )
+            if is_dsv4
+            else None
+        )
 
         global_dp_rank, global_dp_size = RustServer._ingress_identity(scheduler)
         shm_writer = scheduler.load_snapshot_writer
@@ -834,6 +857,14 @@ class RustServer:
             incremental_streaming_output=sa.incremental_streaming_output,
             disaggregation_mode=disaggregation_mode,
             model_config=ext.ModelConfig(
+                model_type=getattr(hf, "model_type", None),
+                dsv4_reasoning_effort_profile=dsv4_profile,
+                default_thinking=envs.SGLANG_DEFAULT_THINKING.get(),
+                default_reasoning_effort=envs.SGLANG_DSV4_REASONING_EFFORT.get(),
+                default_chat_template_kwargs=json.dumps(
+                    get_serving().default_chat_template_kwargs or {}
+                ),
+                bos_token_id=getattr(hf, "bos_token_id", None) if is_dsv4 else None,
                 context_len=mc.context_len,
                 vocab_size=mc.vocab_size,
                 is_multimodal=mc.is_multimodal,

@@ -23,7 +23,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 pyo3 = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -46,7 +46,8 @@ dynamo-tokenizers = "1.7.0"
 # small service helpers.
 dynamo-parsers = "7.0.1"
 dynamo-protocols = "5.1.0"
-dynamo-renderer = "5.0.0"
+dynamo-renderer = "=5.1.2"
+minijinja = "2.24.0"
 flume = "0.12.0"
 hf-hub = { version = "0.4", default-features = false }
 itertools = "0.14"
@@ -59,6 +60,7 @@ numpy = "0.29.0"
 # "anything Rust admits, Python can compile" invariant in `message::sampling`.
 # A minor bump can widen it and silently reopen a scheduler-killing hole.
 regex-syntax = "=0.8.11"
+rustix = { version = "1", features = ["fs"] }
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 # The pure-Rust core of the MM pipeline. `default-features = false` drops the
@@ -67,5 +69,6 @@ rmpv = { version = "1", features = ["with-serde"] }
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 
 [dev-dependencies]
+sha2 = "0.10"
 # `Router::oneshot` for handler-level router tests.
 tower = { version = "0.5", features = ["util"] }

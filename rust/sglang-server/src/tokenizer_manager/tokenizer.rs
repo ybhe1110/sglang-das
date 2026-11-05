@@ -152,6 +152,30 @@ fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
     ids
 }
 
+/// Preserve Python's separate tokenization boundary for assistant continuation.
+pub(crate) fn encode_request(
+    tokenizer: &dyn TextTokenizer,
+    request: &crate::message::request::GenerateRequest,
+    auto_specials: &[i32],
+) -> Result<TokenIds, Error> {
+    let ids = tokenizer.encode(request.text.as_deref().unwrap_or(""))?;
+    let mut ids = if request.skip_special_tokens {
+        strip_auto_specials(ids, auto_specials)
+    } else {
+        ids
+    };
+    if let Some((prefix, bos)) = &request.assistant_prefix {
+        if !prefix.is_empty() {
+            let mut prefix_ids = tokenizer.encode(prefix)?;
+            if bos.is_some_and(|bos| prefix_ids.first() == Some(&bos)) {
+                prefix_ids.remove(0);
+            }
+            ids.extend(prefix_ids);
+        }
+    }
+    Ok(ids)
+}
+
 /// One tokenizer worker: pulls a `Request` off the shared inbox, fills
 /// `input_ids`, returns it to the TokenizerManager. Pinned; backend shared.
 ///
@@ -206,13 +230,9 @@ impl Runnable for TokenizerWorker {
                 if let Some(n) = stop_tokens {
                     g.sampling_params.stop_str_max_len = n;
                 }
-                match self.tokenizer.encode(g.text.as_deref().unwrap_or("")) {
+                match encode_request(self.tokenizer.as_ref(), g, &self.auto_specials) {
                     Ok(ids) => {
-                        g.input_ids = Some(if g.skip_special_tokens {
-                            strip_auto_specials(ids, &self.auto_specials)
-                        } else {
-                            ids
-                        });
+                        g.input_ids = Some(ids);
                         Event::TokenizeDone
                     }
                     Err(err) => Event::Error(err),
@@ -349,5 +369,26 @@ mod tests {
         };
         assert_eq!(run(false), vec![0, 2], "native prompts keep specials");
         assert_eq!(run(true), vec![2], "rendered prompts lose the auto BOS");
+    }
+    #[test]
+    fn assistant_continuation_preserves_token_boundaries_and_strips_one_bos() {
+        let request = GenerateRequest {
+            text: Some("a".into()),
+            assistant_prefix: Some(("bc".into(), Some(0))),
+            ..Default::default()
+        };
+        // Joining strings would yield [0, 3], which changes the model input.
+        assert_eq!(
+            super::encode_request(&MarkedTokenizer, &request, &[0]).unwrap(),
+            vec![0, 1, 2]
+        );
+        let request = GenerateRequest {
+            assistant_prefix: Some(("bc".into(), None)),
+            ..request
+        };
+        assert_eq!(
+            super::encode_request(&MarkedTokenizer, &request, &[0]).unwrap(),
+            vec![0, 1, 0, 2]
+        );
     }
 }

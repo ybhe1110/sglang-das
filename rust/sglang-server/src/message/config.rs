@@ -163,8 +163,6 @@ pub struct ServerArgs {
     pub load_snapshot_dp_rank: usize,
     pub accelerator: Option<String>,
     pub num_accelerators: u32,
-
-
 }
 
 #[pyo3::pymethods]
@@ -242,7 +240,6 @@ impl ServerArgs {
         load_snapshot_dp_rank: usize,
         accelerator: Option<String>,
         num_accelerators: u32,
-
     ) -> Self {
         Self {
             model_path,
@@ -278,7 +275,6 @@ impl ServerArgs {
             load_snapshot_dp_rank,
             accelerator,
             num_accelerators,
-
         }
     }
 }
@@ -322,7 +318,6 @@ impl Default for ServerArgs {
             load_snapshot_dp_rank: 0,
             accelerator: None,
             num_accelerators: 0,
-
         }
     }
 }
@@ -367,6 +362,15 @@ pub enum DisaggregationMode {
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
+    /// HF model type selects a native formatter when the tokenizer has no template.
+    pub model_type: Option<String>,
+    /// Resolved by Python's chat_encoding helper, including checkpoint overrides.
+    pub dsv4_reasoning_effort_profile: Option<String>,
+    pub default_thinking: bool,
+    pub default_reasoning_effort: Option<String>,
+    /// JSON object: PyO3 does not directly extract serde_json::Value.
+    pub default_chat_template_kwargs: String,
+    pub bos_token_id: Option<i32>,
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
@@ -389,14 +393,26 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params))]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type=None, dsv4_reasoning_effort_profile=None, default_thinking=false, default_reasoning_effort=None, default_chat_template_kwargs="{}".to_owned(), bos_token_id=None))]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
         is_multimodal: bool,
         default_sampling_params: DefaultSamplingParams,
+        model_type: Option<String>,
+        dsv4_reasoning_effort_profile: Option<String>,
+        default_thinking: bool,
+        default_reasoning_effort: Option<String>,
+        default_chat_template_kwargs: String,
+        bos_token_id: Option<i32>,
     ) -> Self {
         Self {
+            model_type,
+            dsv4_reasoning_effort_profile,
+            default_thinking,
+            default_reasoning_effort,
+            default_chat_template_kwargs,
+            bos_token_id,
             context_len,
             vocab_size,
             is_multimodal,
@@ -409,6 +425,12 @@ impl Default for ModelConfig {
     /// Test-only: a small but complete model so the runtime boots.
     fn default() -> Self {
         Self {
+            model_type: None,
+            dsv4_reasoning_effort_profile: None,
+            default_thinking: false,
+            default_reasoning_effort: None,
+            default_chat_template_kwargs: "{}".into(),
+            bos_token_id: None,
             context_len: 2048,
             vocab_size: 1000,
             is_multimodal: false,
@@ -714,7 +736,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod ingress_tests {
     use super::ServerArgs;
@@ -722,11 +743,18 @@ mod ingress_tests {
     #[test]
     fn routing_checks_every_rank_and_single_rank_bounds() {
         for rank in 0..16 {
-            let args = ServerArgs { global_dp_rank: rank, global_dp_size: 16, ..Default::default() };
+            let args = ServerArgs {
+                global_dp_rank: rank,
+                global_dp_size: 16,
+                ..Default::default()
+            };
             assert!(args.validate_ingress().is_ok());
             assert!(args.validate_routed_dp_rank(None).is_ok());
             for routed in -1..=16 {
-                assert_eq!(args.validate_routed_dp_rank(Some(routed)).is_ok(), routed == rank as i64);
+                assert_eq!(
+                    args.validate_routed_dp_rank(Some(routed)).is_ok(),
+                    routed == rank as i64
+                );
             }
         }
         let args = ServerArgs::default();
@@ -737,9 +765,14 @@ mod ingress_tests {
 
     #[test]
     fn snapshot_identity_must_match_ingress() {
-        let mut args = ServerArgs { global_dp_rank: 9, global_dp_size: 16,
-            load_snapshot_path: Some("local-rank9".into()), load_snapshot_dp_rank: 9,
-            load_snapshot_dp_size: 16, ..Default::default() };
+        let mut args = ServerArgs {
+            global_dp_rank: 9,
+            global_dp_size: 16,
+            load_snapshot_path: Some("local-rank9".into()),
+            load_snapshot_dp_rank: 9,
+            load_snapshot_dp_size: 16,
+            ..Default::default()
+        };
         assert!(args.validate_ingress().is_ok());
         args.load_snapshot_dp_rank = 0;
         assert!(args.validate_ingress().is_err());
