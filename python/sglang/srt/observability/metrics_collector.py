@@ -1784,7 +1784,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         labels: Dict[str, str],
         prompt_tokens: int,
         generation_tokens: int,
-        cached_tokens: int,
+        cached_tokens: Optional[int],
         e2e_latency: float,
         has_grammar: bool,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
@@ -1801,7 +1801,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             self.spec_verify_calls_total.labels(**labels).inc(spec_verify_ct)
 
         # Report cached tokens with detailed source breakdown
-        if cached_tokens > 0:
+        if cached_tokens is not None and cached_tokens > 0:
             if cached_tokens_details:
                 # Report by cache source (device/host, and storage if L3 enabled)
                 def report_cache_source(source: str, value: int):
@@ -1832,9 +1832,10 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             float(e2e_latency)
         )
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
-        self.uncached_prompt_tokens_histogram.labels(**labels).observe(
-            float(prompt_tokens - cached_tokens)
-        )
+        if cached_tokens is not None:
+            self.uncached_prompt_tokens_histogram.labels(**labels).observe(
+                float(prompt_tokens - cached_tokens)
+            )
         self.generation_tokens_histogram.labels(**labels).observe(
             float(generation_tokens)
         )

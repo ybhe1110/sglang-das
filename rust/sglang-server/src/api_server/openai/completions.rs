@@ -60,16 +60,30 @@ pub(super) struct ChoiceExtensions {
     finish_reason_override: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct CompletionBody {
+    #[serde(flatten)]
+    request: CreateCompletionRequest,
+    priority: Option<i64>,
+}
+
 async fn completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<CompletionBody>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let CompletionBody { request, priority } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    let metric_options = state
+        .server_args
+        .metrics
+        .as_ref()
+        .map(|m| m.openai_options(&headers, priority))
+        .unwrap_or_default();
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
@@ -168,6 +182,7 @@ async fn completions(
                 };
             }
             let native = GenerateRequest {
+                metric_options: metric_options.clone(),
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),

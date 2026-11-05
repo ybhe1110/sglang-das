@@ -204,7 +204,21 @@ class SchedulerOutputStreamer:
         )
         if payload is not None:
             if self.rust_server is not None:
-                self.rust_server.push_generation(payload)
+                usage = None
+                if self.rust_server.metrics_enabled and any(payload.finished_reasons):
+                    usage = [
+                        (
+                            req.cached_tokens,
+                            self.get_cached_tokens_details(req),
+                            req.spec_verify_ct,
+                        )
+                        if reason
+                        else None
+                        for req, reason in zip(
+                            acc.output_reqs, payload.finished_reasons
+                        )
+                    ]
+                self.rust_server.push_generation(payload, usage)
             else:
                 self.send_to_detokenizer.send_output(payload)
 

@@ -13,6 +13,7 @@
 
 mod api_server;
 mod message;
+mod metrics;
 mod multi_modality;
 mod tokenizer_manager;
 mod utils;
@@ -97,12 +98,13 @@ impl Server {
         cores = None,
         bootstrap_addr = None,
         serve_pd_bootstrap = true,
+        metrics_exporter = None,
     ))]
     // pyo3 `#[new]` constructor: the wide arg list is the Python-facing boot
     // surface (all optional overrides), not a call-site ergonomics problem.
     #[allow(clippy::too_many_arguments)]
     fn start(
-        server_args: ServerArgs,
+        mut server_args: ServerArgs,
         http_addr: Option<String>,
         to_scheduler_cap: usize,
         from_scheduler_cap: usize,
@@ -110,7 +112,24 @@ impl Server {
         cores: Option<Vec<usize>>,
         bootstrap_addr: Option<String>,
         serve_pd_bootstrap: bool,
+        metrics_exporter: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
+        if let Some(exporter) = metrics_exporter {
+            let header = Python::attach(|py| {
+                exporter
+                    .getattr(py, "custom_header")?
+                    .extract::<Option<String>>(py)
+            })?;
+            server_args.metrics = Some(metrics::Metrics::start(header, move |events, scrape| {
+                let batch = rmp_serde::to_vec_named(events).map_err(|e| e.to_string())?;
+                Python::attach(|py| {
+                    exporter
+                        .call1(py, (PyBytes::new(py, &batch), scrape))?
+                        .extract::<Vec<u8>>(py)
+                })
+                .map_err(|e: PyErr| e.to_string())
+            })?);
+        }
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
         // mistyped field when Python constructed it); only value checks remain.
         server_args
@@ -260,8 +279,8 @@ impl Server {
     }
 
     /// Signal all threads to stop (best effort).
-    fn shutdown(&self) {
-        self.rt.request_shutdown();
+    fn shutdown(&self, py: Python<'_>) {
+        py.detach(|| self.rt.request_shutdown());
     }
 }
 

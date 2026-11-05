@@ -96,6 +96,7 @@ pub(crate) async fn serve(
     }
 
     // Apply logging and access log middleware.
+    let app = super::metrics::mount(app, server_args.metrics.clone());
     let app = log::apply(app, &server_args);
 
     // The listener was already bound synchronously in `runtime::start` (so a port

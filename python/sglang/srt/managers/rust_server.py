@@ -363,7 +363,9 @@ class RustServer:
         server: Server,
         mm_spec: Optional[NativeMmSpec] = None,
         max_per_poll: int = 256,
+        metrics_enabled: bool = False,
     ):
+        self.metrics_enabled = metrics_enabled
         self.server = server
         self.mm_spec = mm_spec
         self._max_per_poll = max_per_poll
@@ -413,11 +415,18 @@ class RustServer:
             )
         )
 
+        metrics = None
+        if server_args.enable_metrics:
+            from sglang.srt.observability.rust_metrics import RustMetricsExporter
+
+            metrics = RustMetricsExporter(server_args)
+
         server = Server(
             cls._build_server_args(scheduler),
             # None -> run unpinned; the list carries the pinning decision.
             cores=server_cores,
             http_addr=http_addr,
+            metrics_exporter=metrics,
             **cls._bootstrap_listener_args(scheduler),
         )
 
@@ -474,7 +483,7 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, mm_spec=mm_spec)
+        return cls(server, mm_spec=mm_spec, metrics_enabled=metrics is not None)
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -589,7 +598,7 @@ class RustServer:
 
         self.server.push_control_result(recv_req.rid, encoded)
 
-    def push_generation(self, payload: BatchTokenIDOutput) -> None:
+    def push_generation(self, payload: BatchTokenIDOutput, terminal_usage=None) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
         Push the WHOLE batch into the Rust egress ring as one frame (-> detokenizer
@@ -731,6 +740,11 @@ class RustServer:
                 header_cols += extra.header_cols()
                 data_cols += extra.data_cols()
 
+        if terminal_usage is not None:
+            # BatchHeader's first four columns are required; its twelve optional
+            # logprob/hidden shape columns precede the terminal metrics column.
+            header_cols.extend([()] * (16 - len(header_cols)))
+            header_cols.append(terminal_usage)
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame
         # with the GIL released.

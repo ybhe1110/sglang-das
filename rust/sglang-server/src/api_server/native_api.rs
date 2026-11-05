@@ -192,6 +192,10 @@ async fn health_generate(
     let probe = GenerateRequest {
         // The `HEALTH_CHECK_<uuid>` rid form
         rid: Rid::new_health_check(),
+        metric_options: crate::message::request::MetricOptions {
+            log_metrics: Some(false),
+            ..Default::default()
+        },
         input_ids: Some(vec![0]),
         // One greedy token: the cheapest round-trip that still produces a frame.
         sampling_params: SamplingParams {

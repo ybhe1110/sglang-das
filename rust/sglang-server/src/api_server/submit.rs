@@ -40,10 +40,32 @@ pub(super) async fn submit(
     // Async-aware send so a full TM inbox yields (backpressure) instead of parking
     // a thread; Err only when the inbox is closed (shutdown).
     let (tx, rx) = mpsc::channel::<ResponseItem>(state.response_buf);
+    let sink = match (&kind, &state.server_args.metrics) {
+        (RequestKind::Generate(g), Some(metrics))
+            if g.metric_options.log_metrics != Some(false) =>
+        {
+            let p = &g.sampling_params;
+            let grammar = p.json_schema.is_some()
+                || p.regex.is_some()
+                || p.ebnf.is_some()
+                || p.structural_tag.is_some();
+            ResponseSink::Measured(
+                tx,
+                crate::metrics::Generation::new(
+                    metrics.clone(),
+                    stream,
+                    state.server_args.enable_pd_bootstrap(),
+                    grammar,
+                    &g.metric_options,
+                ),
+            )
+        }
+        _ => ResponseSink::Local(tx),
+    };
     let request = Request {
         rid: rid.clone(),
         state: RequestState::Received,
-        sink: ResponseSink::Local(tx),
+        sink,
         kind,
     };
     match state

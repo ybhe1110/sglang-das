@@ -53,6 +53,8 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 /// the same trade Python already makes.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GenerateBody {
+    #[serde(flatten)]
+    pub metric_options: MetricOptions,
     /// Optional client-supplied request id(s): a single string (a batch fans it
     /// out as `{rid}_{i}`, mirroring Python `_normalize_batch`) or one per item.
     #[serde(default)]
@@ -125,6 +127,14 @@ pub struct GenerateBody {
     pub audio_data: Option<rmpv::Value>,
 }
 
+/// Request attributes used only by the frontend metrics collector.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MetricOptions {
+    pub log_metrics: Option<bool>,
+    pub custom_labels: Option<std::collections::BTreeMap<String, String>>,
+    pub priority: Option<i64>,
+}
+
 impl GenerateBody {
     /// Validate, normalize and fan the body into one [`GenerateRequest`] per
     /// prompt + `is_batch` (list form — a 1-element list is still a batch → JSON
@@ -134,6 +144,7 @@ impl GenerateBody {
     /// variant's own status (400).
     pub fn into_requests(self) -> Result<(Vec<GenerateRequest>, bool), Error> {
         let GenerateBody {
+            metric_options,
             rid,
             text,
             input_ids,
@@ -399,6 +410,7 @@ impl GenerateBody {
                 video_data,
                 audio_data,
             )| GenerateRequest {
+                metric_options: metric_options.clone(),
                 rid,
                 text,
                 input_ids,
@@ -593,6 +605,7 @@ pub enum RequestKind {
 /// client-supplied or filled by the Tokenizer stage.
 #[derive(Debug, Default)]
 pub struct GenerateRequest {
+    pub metric_options: MetricOptions,
     /// This item's final rid: the client's (normalized per item by `into_requests`) or a
     /// uuid minted there when none was sent. A [`Rid`], not a `String`: the wire
     /// forms stay textual (`GenerateBody` on the way in, `TokenizedGenerateReqInput`

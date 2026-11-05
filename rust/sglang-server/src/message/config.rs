@@ -81,6 +81,8 @@ impl Default for RuntimeConfig {
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct ServerArgs {
+    /// Only installed by the embedded server when --enable-metrics is set.
+    pub(crate) metrics: Option<crate::metrics::Metrics>,
     /// HF repo id / local dir of the model, reported by `/get_model_info`.
     pub model_path: String,
     /// Model name reported by `/v1/models` and `/server_info`.
@@ -242,6 +244,7 @@ impl ServerArgs {
         num_accelerators: u32,
     ) -> Self {
         Self {
+            metrics: None,
             model_path,
             served_model_name,
             tokenizer_path,
@@ -285,6 +288,7 @@ impl Default for ServerArgs {
     /// this — Python supplies every field.
     fn default() -> Self {
         Self {
+            metrics: None,
             model_path: String::new(),
             served_model_name: String::new(),
             tokenizer_path: String::new(),

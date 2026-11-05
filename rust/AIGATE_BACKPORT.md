@@ -141,8 +141,12 @@ following are acceptance criteria, not a claim that its implementation passes.
 - Treat missing/503/stale load snapshots as unavailable, not zero load. Judge
   freshness by the snapshot timestamp, not the envelope HTTP timestamp.
 - If JSON parsing rejects unknown fields, allow the two new identity fields.
-- `/metrics` is still absent. `/v1/loads?format=prometheus` is only load metrics;
-  do not advertise it as full Python frontend metric compatibility.
+- With `--enable-metrics`, scrape `/metrics` on the API port for the native
+  Prometheus multiprocess registry, including HTTP counts, generation counts,
+  TTFT, inter-token and end-to-end histograms. Listeners sharing one
+  `PROMETHEUS_MULTIPROC_DIR` expose the same aggregate: scrape one target per
+  registry to avoid counting it multiple times. Continue polling each rank's
+  `/v1/loads` separately for routing. With metrics disabled, `/metrics` is 404.
 
 No Aigate code change is required if it already implements those contracts.
 If it registers only two base ports, routes through DPC, copies the D rank to P,

@@ -2601,9 +2601,7 @@ class RefCountedGauge:
                 self._gauge.dec()
 
 
-def add_prometheus_track_response_middleware(
-    app, extra_labels: Optional[Dict[str, str]] = None
-):
+def create_http_metric_collectors(extra_labels=None):
     from prometheus_client import Counter, Gauge
 
     extra_labels = extra_labels or {}
@@ -2635,6 +2633,25 @@ def add_prometheus_track_response_middleware(
             multiprocess_mode="livesum",
         )
     )
+
+    return (
+        http_request_counter,
+        http_response_counter,
+        http_requests_active,
+        routing_keys_active,
+    )
+
+
+def add_prometheus_track_response_middleware(
+    app, extra_labels: Optional[Dict[str, str]] = None
+):
+    extra_labels = extra_labels or {}
+    (
+        http_request_counter,
+        http_response_counter,
+        http_requests_active,
+        routing_keys_active,
+    ) = create_http_metric_collectors(extra_labels)
 
     # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
     # that passes `receive` through, so request.is_disconnected() keeps working.

@@ -17,6 +17,10 @@ use crate::utils::error::Error;
 #[derive(Clone, Debug)]
 pub enum ResponseSink {
     Local(mpsc::Sender<ResponseItem>),
+    Measured(
+        mpsc::Sender<ResponseItem>,
+        std::sync::Arc<std::sync::Mutex<crate::metrics::Generation>>,
+    ),
 }
 
 /// Why an [`ResponseSink::try_send`] failed: `Full` = client backpressure, `Closed`
@@ -30,12 +34,18 @@ pub enum SinkError {
 impl ResponseSink {
     /// Non-blocking send. `Err(Full)` = backpressure, `Err(Closed)` = client gone.
     pub fn try_send(&self, item: ResponseItem) -> Result<(), SinkError> {
-        match self {
-            ResponseSink::Local(tx) => tx.try_send(item).map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => SinkError::Full,
-                mpsc::error::TrySendError::Closed(_) => SinkError::Closed,
-            }),
+        let tx = match self {
+            Self::Local(tx) | Self::Measured(tx, _) => tx,
+        };
+        let permit = tx.try_reserve().map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => SinkError::Full,
+            mpsc::error::TrySendError::Closed(_) => SinkError::Closed,
+        })?;
+        if let Self::Measured(_, metrics) = self {
+            metrics.lock().unwrap().observe(&item);
         }
+        permit.send(item);
+        Ok(())
     }
 }
 
@@ -154,6 +164,8 @@ pub struct BatchHeader {
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
     pub hidden_poslens: Vec<u32>,
+    #[serde(default)]
+    pub terminal_usage: Vec<Option<Box<crate::metrics::TerminalUsage>>>,
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -265,6 +277,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || !per_req_ok(&h.out_tid_reqlens)
         || !per_req_ok(&h.in_tid_reqlens)
         || !per_req_ok(&h.hidden_reqlens)
+        || (!h.terminal_usage.is_empty() && h.terminal_usage.len() != n)
     {
         reject!()
     }
@@ -438,6 +451,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
+            usage: h.terminal_usage.get_mut(i).and_then(Option::take),
             extras,
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
@@ -541,6 +555,7 @@ pub struct ChunkEvent {
     pub finish_reason: Option<FinishReason>,
     /// Prompt token count for this request (constant across its chunks).
     pub prompt_tokens: u32,
+    pub usage: Option<Box<crate::metrics::TerminalUsage>>,
     /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8),
     /// filled by the detok shard. `token_ids` doubles as `output_ids`;
     /// `completion_tokens` is this chunk's count.

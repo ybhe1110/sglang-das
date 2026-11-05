@@ -796,6 +796,7 @@ mod tests {
                 ChunkEvent {
                     rid: "9".into(),
                     text: " 世界".into(),
+                    usage: None,
                     token_ids: vec![-2, 3],
                     completion_tokens: 2,
                     prompt_tokens: 4,

@@ -138,6 +138,7 @@ impl ChatCompletionBody {
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     let raw_request = match body {
@@ -254,6 +255,17 @@ async fn chat_completions(
     });
     let tools_slice = tools.as_deref().unwrap_or_default();
 
+    let metric_options = state
+        .server_args
+        .metrics
+        .as_ref()
+        .map(|m| {
+            m.openai_options(
+                &headers,
+                raw_request.get("priority").and_then(|v| v.as_i64()),
+            )
+        })
+        .unwrap_or_default();
     let (request, prompt) = match prepare_chat_request(&state, request, raw_request).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
@@ -322,6 +334,7 @@ async fn chat_completions(
                 .clone()
         };
         let native = GenerateRequest {
+            metric_options: metric_options.clone(),
             rid: rid.clone(),
             text: Some(choice_prompt.text),
             assistant_prefix: choice_prompt.assistant_prefix,
@@ -1503,7 +1516,7 @@ mod ingress_http_tests {
             "data_parallel_rank": 8
         }))
         .unwrap();
-        let response = chat_completions(State(state), Ok(Json(body))).await;
+        let response = chat_completions(State(state), Default::default(), Ok(Json(body))).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(response.into_body(), 65536)
             .await
