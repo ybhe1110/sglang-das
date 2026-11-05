@@ -53,6 +53,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 /// them. Named fields are consumed before the flattened standard request.
 #[derive(Deserialize)]
 struct ChatCompletionBody {
+    #[serde(default)]
+    min_tokens: i64,
+    #[serde(default)]
+    ignore_eos: bool,
     #[serde(flatten)]
     request: CreateChatCompletionRequest,
     #[serde(default, alias = "request_id")]
@@ -171,6 +175,8 @@ async fn chat_completions(
         return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     let supplied_rid = request.rid.clone();
+    let min_tokens = request.min_tokens;
+    let ignore_eos = request.ignore_eos;
     let (request, pd_routing) = request.into_parts();
     if request.model != state.server_args.served_model_name {
         return openai_error(
@@ -273,11 +279,11 @@ async fn chat_completions(
 
     let sampling = match chat_sampling(
         &request,
-        SamplingDefaults::CHAT,
+        min_tokens,
+        ignore_eos,
         parser.as_deref(),
         &tool_choice,
         tools_slice,
-        request.parallel_tool_calls,
         &state.server_args,
     ) {
         Ok(sampling) => sampling,
@@ -496,23 +502,26 @@ pub(super) async fn prepare_chat_request(
 /// (see `apply_tool_constraint`).
 pub(super) fn chat_sampling(
     request: &CreateChatCompletionRequest,
-    defaults: SamplingDefaults,
+    min_tokens: i64,
+    ignore_eos: bool,
     parser: Option<&str>,
     tool_choice: &DynamoToolChoice,
     tools: &[ToolDefinition],
-    parallel_tool_calls: Option<bool>,
     server_args: &ServerArgs,
 ) -> Result<SamplingParams, String> {
     let mut sampling = chat_sampling_params(
         request,
-        &defaults.with_model_defaults(&server_args.model_config.default_sampling_params),
+        &SamplingDefaults::CHAT
+            .with_model_defaults(&server_args.model_config.default_sampling_params),
     )?;
+    sampling.min_new_tokens = min_tokens;
+    sampling.ignore_eos = ignore_eos;
     apply_tool_constraint(
         &mut sampling,
         parser,
         tool_choice,
         tools,
-        parallel_tool_calls,
+        request.parallel_tool_calls,
     )?;
     sampling
         .normalize(
@@ -1097,6 +1106,41 @@ mod tests {
             "bootstrap_room": 12345, "bootstrap_pair_key": "shared-pair",
             "decode_tp_size": 16, "routed_dp_rank": 9, "disagg_prefill_dp_rank": 0
         })
+    }
+
+    #[test]
+    fn chat_forwards_output_limits_to_normalized_scheduler_params() {
+        for (min, ignore) in [(0, false), (0, true), (8, false), (8, true), (9, true)] {
+            let mut raw = serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 8,
+            });
+            if min != 0 {
+                raw["min_tokens"] = min.into();
+            }
+            if ignore {
+                raw["ignore_eos"] = true.into();
+            }
+            let body: super::ChatCompletionBody = serde_json::from_value(raw).unwrap();
+            let result = super::chat_sampling(
+                &body.request,
+                body.min_tokens,
+                body.ignore_eos,
+                None,
+                &super::DynamoToolChoice::None,
+                &[],
+                &super::ServerArgs::default(),
+            );
+            if min > 8 {
+                assert!(result.is_err());
+            } else {
+                let params = result.unwrap();
+                assert_eq!(params.min_new_tokens, min);
+                assert_eq!(params.ignore_eos, ignore);
+                assert_eq!(params.max_new_tokens, Some(8));
+            }
+        }
     }
 
     #[test]

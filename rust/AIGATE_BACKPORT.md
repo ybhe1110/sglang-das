@@ -121,8 +121,12 @@ are not silently swallowed. The counter is internal, not a `/metrics` export.
 
 ## Aigate integration requirements
 
-The private Aigate implementation is not present in this repository; the
-following are acceptance criteria, not a claim that its implementation passes.
+The 129.1 cluster's Aigate EPP discovers one named `sglang-http` port per
+selected Pod. In the original deployment only the D leader's base port was
+registered. Requests to that listener went to DP0. See the
+[tested DP16 registration layout and benchmark results](benchmarks/aigate-dp16/README.md)
+for the fix and the per-rank checks. For other deployments, verify the
+following integration requirements:
 
 - Discover all 16 real D ingress addresses. With the same base port B on both
   hosts: node0 serves B+0 through B+7, node1 serves B+8 through B+15.
@@ -136,6 +140,10 @@ following are acceptance criteria, not a claim that its implementation passes.
 - Generate one fresh room/pair key per request lifecycle; the matching P and D
   requests share them. Re-pairing retries get new identities. PD Chat uses n=1.
 - Preserve P DP0's configured bootstrap address/port (default 8998).
+- Chat clients can force a fixed output length with `max_tokens`, `min_tokens`
+  and `ignore_eos`. Preserve these fields on both P and D requests. The Chat
+  adapter maps `min_tokens` to `min_new_tokens` and applies `ignore_eos`
+  before normalizing scheduler sampling parameters.
 - Keep cancellation bound to the owning ingress and propagate client disconnects
   to downstream requests. A P failure must cancel its paired D request.
 - Treat missing/503/stale load snapshots as unavailable, not zero load. Judge
