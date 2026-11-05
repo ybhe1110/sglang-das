@@ -82,7 +82,55 @@ impl RequestTiming {
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/generate", post(generate))
+        .route("/abort_request", post(abort_request))
         .merge(health_routes())
+}
+
+#[derive(serde::Deserialize)]
+struct AbortBody {
+    rid: Option<String>,
+    #[serde(default)]
+    abort_all: bool,
+}
+
+async fn abort_request(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<AbortBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.body_text(), false),
+    };
+    if body.abort_all {
+        return native_error(
+            StatusCode::BAD_REQUEST,
+            "this endpoint supports single-request cancellation",
+            false,
+        );
+    }
+    let Some(rid) = body.rid.filter(|id| !id.trim().is_empty()) else {
+        return native_error(
+            StatusCode::BAD_REQUEST,
+            "abort requires a nonempty rid",
+            false,
+        );
+    };
+    // FIFO with Intake: an already submitted request is registered before the lookup.
+    let event = crate::tokenizer_manager::wiring::TmEvent::AbortClient(rid);
+    if state
+        .senders
+        .tok_manager_tx
+        .send_async(event)
+        .await
+        .is_err()
+    {
+        return native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable",
+            false,
+        );
+    }
+    StatusCode::OK.into_response()
 }
 
 /// native api error response: unary → `code` plus the JSON `body`,

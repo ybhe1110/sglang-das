@@ -1958,7 +1958,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # request for KV transfer instead of retiring it.
                 if req.external_kv_abort_requested or is_external_kv_load_failure(req):
                     sender_terminal = self.prefill_abort_sender_terminal(req)
-                    cleanup_done = self.abort_external_kv_request(
+                    self.abort_external_kv_request(
                         req,
                         forward_drained=True,
                         sender_terminal=sender_terminal,
@@ -1971,9 +1971,8 @@ class SchedulerDisaggregationPrefillMixin:
                         emit_response=True,
                     )
                     req.pending_bootstrap = False
-                    if cleanup_done:
-                        req.time_stats.set_completion_time()
-                    elif req not in self.disagg_prefill_inflight_queue:
+                    # All CP ranks enroll, including those already locally drained.
+                    if req not in self.disagg_prefill_inflight_queue:
                         self.disagg_prefill_inflight_queue.append(req)
                     advance_logprob_pt(i, req)
                     continue
@@ -2160,21 +2159,14 @@ class SchedulerDisaggregationPrefillMixin:
         # ranks have completed the deferred cleanup.
         cleanup_ready = all_reduce_min_flags(
             [
-                0
-                if (
-                    (
-                        getattr(req, "external_kv_cleanup_quarantined", False)
-                        and not getattr(req, "external_kv_cleanup_ready", False)
-                    )
-                    or (
-                        (
-                            req.rid in self._external_kv_abort_rids
-                            or getattr(req, "external_kv_abort_requested", False)
-                        )
-                        and not getattr(req, "external_kv_cleanup_done", False)
-                    )
+                # Vote on completed cleanup, not on the absence of an abort.
+                # A Failed poll below may start cleanup for the first time. Its
+                # local result cannot be covered by a vote taken before the poll.
+                int(
+                    getattr(req, "external_kv_cleanup_ready", False)
+                    if getattr(req, "external_kv_cleanup_quarantined", False)
+                    else getattr(req, "external_kv_cleanup_done", False)
                 )
-                else 1
                 for req in self.disagg_prefill_inflight_queue
             ],
             self.attn_cp_cpu_group,
@@ -2241,13 +2233,8 @@ class SchedulerDisaggregationPrefillMixin:
                     emit_response=True,
                 )
                 if cleanup_done:
-                    if cleanup_ready[index]:
-                        done_reqs.append(req)
-                    else:
-                        self._hold_external_kv_cleanup_until_collective(req)
-                        undone_reqs.append(req)
-                else:
-                    undone_reqs.append(req)
+                    self._hold_external_kv_cleanup_until_collective(req)
+                undone_reqs.append(req)
                 continue
 
             if transfer_status is not None:
@@ -2268,13 +2255,8 @@ class SchedulerDisaggregationPrefillMixin:
                         sender_terminal=self.prefill_abort_sender_terminal(req),
                     )
                     if cleanup_done:
-                        if cleanup_ready[index]:
-                            done_reqs.append(req)
-                        else:
-                            self._hold_external_kv_cleanup_until_collective(req)
-                            undone_reqs.append(req)
-                    else:
-                        undone_reqs.append(req)
+                        self._hold_external_kv_cleanup_until_collective(req)
+                    undone_reqs.append(req)
                     continue
 
                 if req.rid not in success_rids:
@@ -2297,13 +2279,8 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                 elif req.external_kv_abort_requested:
                     if req.external_kv_cleanup_done:
-                        if cleanup_ready[index]:
-                            done_reqs.append(req)
-                        else:
-                            self._hold_external_kv_cleanup_until_collective(req)
-                            undone_reqs.append(req)
-                    else:
-                        undone_reqs.append(req)
+                        self._hold_external_kv_cleanup_until_collective(req)
+                    undone_reqs.append(req)
                 elif poll != KVPoll.Failed:
                     undone_reqs.append(req)
                 continue
@@ -2324,13 +2301,8 @@ class SchedulerDisaggregationPrefillMixin:
                     req, sender_terminal=self.prefill_abort_sender_terminal(req)
                 )
                 if cleanup_done:
-                    if cleanup_ready[index]:
-                        done_reqs.append(req)
-                    else:
-                        self._hold_external_kv_cleanup_until_collective(req)
-                        undone_reqs.append(req)
-                else:
-                    undone_reqs.append(req)
+                    self._hold_external_kv_cleanup_until_collective(req)
+                undone_reqs.append(req)
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
@@ -2486,6 +2458,8 @@ class SchedulerDisaggregationPrefillMixin:
         Always enqueue before retrying cleanup, regardless of local readiness.
         """
         self.clear_pending_chunk_send(req)
+        if req not in self.disagg_prefill_inflight_queue:
+            self.disagg_prefill_inflight_queue.append(req)
         if req.external_kv_cleanup_done:
             return False
         req.pending_bootstrap = False
@@ -2496,8 +2470,6 @@ class SchedulerDisaggregationPrefillMixin:
                 pending = self._external_kv_chunked_abort_reqs = {}
             pending[req.rid] = req
             self._pending_chunked_abort_req = req
-        if req not in self.disagg_prefill_inflight_queue:
-            self.disagg_prefill_inflight_queue.append(req)
         self.abort_external_kv_request(
             req,
             forward_drained=False,
@@ -2530,7 +2502,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.to_finish = FINISH_ABORT(
                 error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        cleanup_done = self.abort_external_kv_request(
+        self.abort_external_kv_request(
             req,
             forward_drained=self.prefill_abort_forward_drained(req),
             sender_terminal=self.prefill_abort_sender_terminal(req),
@@ -2538,7 +2510,7 @@ class SchedulerDisaggregationPrefillMixin:
             is_insert=False,
             emit_response=True,
         )
-        if not cleanup_done and req not in self.disagg_prefill_inflight_queue:
+        if req not in self.disagg_prefill_inflight_queue:
             # The bootstrap/waiting queue removes this request after the call.
             # Keep a strong reference, not just a RID, for the next cleanup pass.
             self.disagg_prefill_inflight_queue.append(req)

@@ -250,3 +250,30 @@ HTTP tests cover PD rank 9, preserved bootstrap identities, and both streaming
 and non-streaming reasoning. No live service was restarted or replaced by
 these checks; an image rollout and real Aigate-to-PD generation test remain
 deployment acceptance steps.
+
+## Bootstrap heartbeat, cancellation and CP8 failure recovery
+
+The dedicated bootstrap port serves `GET /health` with HTTP 200 and body `OK`
+as soon as it can accept heartbeats. Use `/route` to check rank registration
+and the main API port's health check to check scheduler readiness.
+
+Aigate can cancel a single request on its owning ingress with
+`POST /abort_request` and JSON `{"rid":"<client RID>"}`. HTTP 200 acknowledges
+the cancellation request. The endpoint matches active client IDs exactly,
+forwards their unique internal IDs, and ignores a repeat after completion.
+Missing/blank IDs and `abort_all:true` return 400. Requests still tokenizing
+cannot subsequently be submitted after their cancellation is processed.
+
+On P, a rank that finishes failed-transfer cleanup keeps the request in the
+inflight queue until all CP/TP peers vote that cleanup has completed. The
+source-drain checks and the queue identity/shape checks remain active.
+
+The reproducible fault fixture is `test/manual/disaggregation/cp8_transfer_replay.py`.
+Use it only on an isolated P, with its test sender installed as described in
+the module. On DSV4 Flash with eight HCUs, the original P exited with
+`count=[0,1] phase=[2,2]` when one rank drained ahead of its peers. With the
+patch, an injected transfer failure returned 500 and explicit cancellation
+returned 499. All eight ranks acknowledged source release; the next generation
+after each fault returned 200 on the same P process. These requests use the
+real HTTP, model and scheduler paths, with a controlled fake KV sender in place
+of physical RDMA.

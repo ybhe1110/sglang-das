@@ -176,10 +176,12 @@ class TestPPPDConsensus(CustomTestCase):
         self.assertEqual(good_rids, [])
         self.assertEqual(failed_rids, ["req-failed"])
 
-    def test_remote_failure_waits_for_local_transfer_terminal_state(self):
+    @patch("sglang.srt.disaggregation.utils.all_reduce_with_timeout")
+    def test_remote_failure_waits_for_local_transfer_terminal_state(self, _reduce):
         sender = SimpleNamespace()
         req = SimpleNamespace(
             rid="req-race",
+            to_finish=None,
             disagg_kv_sender=sender,
             finished_reason=None,
             pending_bootstrap=False,
@@ -187,7 +189,11 @@ class TestPPPDConsensus(CustomTestCase):
             time_stats=SimpleNamespace(set_completion_time=Mock()),
         )
         handle_failure = Mock(return_value=(None, False))
-        scheduler = SimpleNamespace(
+        scheduler = SchedulerDisaggregationPrefillMixin()
+        scheduler.__dict__.update(
+            disagg_metadata_buffers=None,
+            prefill_abort_forward_drained=Mock(return_value=True),
+            abort_external_kv_request=Mock(return_value=True),
             disagg_prefill_inflight_queue=[req],
             attn_cp_cpu_group=object(),
             attn_tp_cpu_group=object(),
@@ -225,7 +231,12 @@ class TestPPPDConsensus(CustomTestCase):
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
         handle_failure.assert_called_once_with(req, sender_terminal=False)
         handle_failure.reset_mock()
-        handle_failure.return_value = (None, True)
+
+        def finish_local_cleanup(req, sender_terminal):
+            req.external_kv_cleanup_done = sender_terminal
+            return None, sender_terminal
+
+        handle_failure.side_effect = finish_local_cleanup
         scheduler.prefill_abort_sender_terminal.return_value = True
 
         with (
@@ -236,10 +247,12 @@ class TestPPPDConsensus(CustomTestCase):
             ),
             patch("sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"),
         ):
-            done_reqs = SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
-                scheduler,
-                transfer_status=([], []),
+            # Local completion is visible to the next consensus, not this poll.
+            self.assertEqual(
+                scheduler.process_disagg_prefill_inflight_queue(([], [])), []
             )
+            self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+            done_reqs = scheduler.process_disagg_prefill_inflight_queue(([], []))
 
         self.assertEqual(done_reqs, [req])
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])

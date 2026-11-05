@@ -38,5 +38,8 @@ pub enum DetokMsg {
     /// Drop the `rid -> sink` entry for a request rejected before the scheduler
     /// (the rejecting stage already answered the client); else `Register` leaks one
     /// entry.
-    Deregister { rid: Rid },
+    Deregister {
+        rid: Rid,
+    },
+    AbortClient(String),
 }

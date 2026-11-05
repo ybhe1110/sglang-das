@@ -87,6 +87,8 @@ pub(crate) async fn serve(
             }
             BootstrapListener::Dedicated(listener) => {
                 tracing::info!(addr = ?listener.local_addr(), "PD KV bootstrap registry on dedicated listener");
+                // Decode probes the dedicated bootstrap listener itself.
+                let routes = routes.route("/health", axum::routing::get(|| async { "OK" }));
                 bootstrap_server = Some((listener, log::apply(routes, &server_args)));
             }
             BootstrapListener::Disabled => unreachable!(),

@@ -325,8 +325,8 @@ async fn query_dp_ranks(
     Json(result).into_response()
 }
 
-/// No `/health` here: the merged api router already serves it (same 200 "OK"
-/// the standalone Python bootstrap server answered, so probes are unchanged).
+/// The API listener keeps its scheduler health check. The dedicated listener
+/// mounts a lightweight registry heartbeat when this router is installed.
 fn router(state: Arc<Registry>) -> Router {
     Router::new()
         // Unmatched methods on a routed path get axum's built-in 405, matching
@@ -428,6 +428,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn abort_http_matches_client_id_and_preserves_its_neighbor() {
+        let (rt, addr) = start_runtime(test_server_args(DisaggregationMode::Null));
+        let next_id = || {
+            assert!(rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)));
+            let batch = rt.to_scheduler_rx.drain(1);
+            let wire = rmpv::decode::read_value(&mut &batch.headers[0][..]).unwrap();
+            wire.as_array().unwrap()[1].as_str().unwrap().to_owned()
+        };
+        let generate = |id: &'static str| {
+            std::thread::spawn(move || {
+                request(
+                    addr,
+                    "POST",
+                    "/generate",
+                    Some(&serde_json::json!({
+                        "rid":id, "input_ids":[7], "sampling_params":{"max_new_tokens":1}
+                    })),
+                )
+            })
+        };
+        let first = generate("request");
+        let first_id = next_id();
+        let other = generate("request-more");
+        let other_id = next_id();
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"rid":""}),
+            serde_json::json!({"abort_all":true}),
+        ] {
+            assert_eq!(request(addr, "POST", "/abort_request", Some(&body)).0, 400);
+        }
+        let abort = |id| {
+            request(
+                addr,
+                "POST",
+                "/abort_request",
+                Some(&serde_json::json!({"rid":id})),
+            )
+            .0
+        };
+        assert_eq!(abort("request"), 200);
+        assert_eq!(next_id(), first_id);
+        assert_eq!(first.join().unwrap().0, 499);
+        assert_eq!(abort("request"), 200); // Already completed.
+        assert_eq!(abort("request-more"), 200);
+        assert_eq!(next_id(), other_id);
+        assert_eq!(other.join().unwrap().0, 499);
+    }
+
     /// Pick a free port (probe-bind pattern, as in the `runtime` tests) and
     /// boot the full runtime there with the bootstrap registry mounted — the
     /// registry serves on the api listener, so these tests also pin the merge
@@ -470,6 +520,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(request(api, "GET", SENTINEL, None).0, 404);
+        assert_eq!(
+            request(bootstrap, "GET", "/health", None),
+            (200, "OK".into())
+        );
         for rank in 0..8 {
             assert_eq!(request(bootstrap, "GET", SENTINEL, None).0, 503);
             let body = put_route(serde_json::json!({"attn_cp_size": 8, "attn_cp_rank": rank}));

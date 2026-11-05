@@ -23,6 +23,8 @@ pub enum TmEvent {
     /// A request back from the tokenizer pool: `PreSendValidating` (ids filled)
     /// on success, or `Failed` on a tokenize error. `drive` handles both.
     Tokenized(Request),
+    /// Cancel locally registered generations with exactly this client-facing RID.
+    AbortClient(String),
     /// An MM worker finished a request parked in `Encoding`: `input_ids` are the
     /// final placeholder-expanded prompt ids. The buffers ride the rid-keyed
     /// sidecar (`Server.take_mm`), not this event.

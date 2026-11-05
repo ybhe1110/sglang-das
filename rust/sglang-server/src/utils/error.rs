@@ -24,6 +24,9 @@ pub enum Error {
     #[error("to_scheduler channel full")]
     QueueFull,
 
+    #[error("request cancelled")]
+    Cancelled,
+
     /// Client went away mid-stream. Drives `Aborted`, not `Failed`.
     #[error("client disconnected")]
     Disconnected,
@@ -41,7 +44,7 @@ impl Error {
     pub fn http_status(&self) -> u16 {
         match self {
             Error::Validation(_) => 400,
-            Error::Disconnected => 499, // nginx-style client closed request
+            Error::Cancelled | Error::Disconnected => 499, // nginx-style client closed request
             Error::QueueFull => 503,
             _ => 500,
         }

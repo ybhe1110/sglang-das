@@ -184,6 +184,12 @@ class TestSourceDrainRetirement(CustomTestCase):
         self.assertTrue(sender.is_transfer_terminal())
 
     def test_tp8_quarantine_retires_together_and_frees_once(self):
+        self._assert_split_drain(start_in_quarantine=True)
+
+    def test_cp8_first_failed_poll_retires_together_and_frees_once(self):
+        self._assert_split_drain(start_in_quarantine=False)
+
+    def _assert_split_drain(self, start_in_quarantine):
         barrier = threading.Barrier(8, timeout=15)
         flags = [None] * 8
         fixtures = []
@@ -206,11 +212,20 @@ class TestSourceDrainRetirement(CustomTestCase):
                 sender.kv_mgr._source_drain.begin(chunk)
             sender.abort()
             sender.clear()
-            fixture.s._quarantine_external_kv_request(
-                fixture.req,
-                abort_message="cancelled",
-                emit_response=False,
-            )
+            if start_in_quarantine:
+                fixture.s._quarantine_external_kv_request(
+                    fixture.req,
+                    abort_message="cancelled",
+                    emit_response=False,
+                )
+            else:
+                # The first globally Failed poll is the first observation of
+                # failure; the earlier preflight saw no pending abort yet.
+                fixture.s._external_kv_abort_rids.clear()
+                fixture.req.pending_bootstrap = False
+                fixture.s.disagg_metadata_buffers = None
+                fixture.s.ps = SimpleNamespace(tp_rank=rank)
+                fixture.s.metrics_reporter = SimpleNamespace(enable_metrics=False)
 
             def reduce(values, *args, rank=rank, **kwargs):
                 flags[rank] = values
@@ -221,18 +236,33 @@ class TestSourceDrainRetirement(CustomTestCase):
                 return result
 
             fixture.env.update(
+                KVPoll=SimpleNamespace(**vars(KVPoll), WaitingForInput=4),
                 all_reduce_min_flags=reduce,
                 poll_and_all_reduce_attn_cp_tp_group=lambda senders, *args: (
                     [KVPoll.Failed] * len(senders)
                 ),
                 _QuarantinedKVSender=lambda: None,
+                maybe_release_pd_hidden_rows_on_hidden_done=Mock(),
             )
             queue_cls = load_methods(
-                PREFILL, ["process_disagg_prefill_inflight_queue"], fixture.env
+                PREFILL,
+                [
+                    "process_disagg_prefill_inflight_queue",
+                    "handle_inflight_transfer_failure",
+                    "_hold_external_kv_cleanup_until_collective",
+                ],
+                fixture.env,
             )
             fixture.s.process_disagg_prefill_inflight_queue = (
                 queue_cls.process_disagg_prefill_inflight_queue.__get__(fixture.s)
             )
+            for method in (
+                "handle_inflight_transfer_failure",
+                "_hold_external_kv_cleanup_until_collective",
+            ):
+                setattr(
+                    fixture.s, method, getattr(queue_cls, method).__get__(fixture.s)
+                )
             fixtures.append(fixture)
             chunks.append(chunk)
 

@@ -219,6 +219,18 @@ impl Runnable for DetokenizerWorker {
                 DetokMsg::Fail { rid, message } => {
                     handle_fail(&mut table, &rid, message, &self.abort)
                 }
+                DetokMsg::AbortClient(client) => {
+                    // Never forward a client prefix to the scheduler. It uses startswith,
+                    // and the unique internal RID also protects later resubmissions.
+                    table.retain(|rid, state| {
+                        if rid.client_facing() != client {
+                            return true;
+                        }
+                        let _ = self.abort.send(AbortSource::Detok(rid.clone()));
+                        let _ = state.sink.try_send(ResponseItem::Error(Error::Cancelled));
+                        false
+                    });
+                }
                 DetokMsg::Deregister { rid } => {
                     table.remove(&rid);
                 }

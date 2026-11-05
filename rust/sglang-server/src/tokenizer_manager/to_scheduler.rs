@@ -34,6 +34,8 @@ pub struct Intake {
     /// resumed by `MmEncoded` / `MmFailed`. Only this thread touches it, so no
     /// lock.
     pending_mm: HashMap<Rid, Request>,
+    /// Entries exist only while the tokenizer owns a request; true means cancelled.
+    tokenizing: HashMap<Rid, bool>,
     shutdown: flume::Receiver<()>,
 }
 
@@ -105,6 +107,7 @@ impl Intake {
             limits,
             mm,
             pending_mm: HashMap::new(),
+            tokenizing: HashMap::new(),
             shutdown,
         }
     }
@@ -129,8 +132,16 @@ impl Runnable for Intake {
             match next {
                 Some(Lane::Abort(rid)) => self.on_abort(rid),
                 // A fresh request and one returning from the tokenizer pool.
-                Some(Lane::Event(TmEvent::Intake(req) | TmEvent::Tokenized(req))) => {
-                    self.drive(req)
+                Some(Lane::Event(TmEvent::Intake(req))) => self.drive(req),
+                Some(Lane::Event(TmEvent::Tokenized(req))) => {
+                    if self.tokenizing.remove(&req.rid) != Some(true) {
+                        self.drive(req);
+                    }
+                }
+                Some(Lane::Event(TmEvent::AbortClient(rid))) => {
+                    for shard in &self.senders.detokenizer_tx {
+                        let _ = shard.send(DetokMsg::AbortClient(rid.clone()));
+                    }
                 }
                 Some(Lane::Event(TmEvent::MmEncoded { rid, input_ids })) => {
                     self.on_mm_encoded(rid, input_ids)
@@ -300,9 +311,11 @@ impl Intake {
                 // `Tokenized` event (PreSendValidating, or Failed on error).
                 // Doesn't loop.
                 RequestState::Tokenizing => {
+                    self.tokenizing.insert(req.rid.clone(), false);
                     if let Err(err) = self.senders.tokenizer_tx.send(req) {
                         // Pool gone (workers exited); flume hands the request back.
                         let mut req = err.into_inner();
+                        self.tokenizing.remove(&req.rid);
                         // Past `Received`, so registration happened.
                         self.fail(
                             &mut req,
@@ -478,6 +491,9 @@ impl Intake {
     /// no generation runs for output nobody will read.
     fn on_abort(&mut self, source: AbortSource) {
         let rid = source.rid().clone();
+        if let Some(cancelled) = self.tokenizing.get_mut(&rid) {
+            *cancelled = true;
+        }
         if self.pending_mm.remove(&rid).is_some() {
             tracing::debug!(rid = %rid, "abort cancelled request parked for MM");
         }
@@ -1360,6 +1376,35 @@ mod tests {
         assert!(
             detok_rx.try_recv().is_err(),
             "admitted request must not be deregistered",
+        );
+    }
+
+    #[test]
+    fn cancelled_tokenizer_return_never_reaches_scheduler() {
+        let (mut intake, _detok, ring, tx, _mm) = make_intake();
+        let (tok_tx, tok_rx) = flume::unbounded();
+        intake.senders.tokenizer_tx = tok_tx;
+        let mut req = generate_req(17, SamplingParams::default());
+        let RequestKind::Generate(g) = &mut req.kind else {
+            unreachable!()
+        };
+        g.text = Some("tokenize me".into());
+        g.input_ids = None;
+        intake.drive(req);
+        let mut req = tok_rx.try_recv().expect("worker owns request");
+        intake.on_abort(AbortSource::Detok(req.rid.clone()));
+        assert_eq!(ring.drain(1).headers.len(), 1, "abort delivered");
+        let RequestKind::Generate(g) = &mut req.kind else {
+            unreachable!()
+        };
+        g.input_ids = Some(vec![7]);
+        req.state = RequestState::PreSendValidating;
+        tx.send(TmEvent::Tokenized(req)).unwrap();
+        drop(tx);
+        intake.run();
+        assert!(
+            ring.drain(1).headers.is_empty(),
+            "late tokenization revived a cancelled request"
         );
     }
 
