@@ -22,7 +22,16 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import (
+    AbstractSet,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import msgspec
 import numpy as np
@@ -1016,11 +1025,22 @@ class CommonKVManager(BaseKVManager):
         self.note_abort_ack(ack.room, ack.prefill_rank, ack.generation)
         return True
 
-    def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
-        """True once every prefill rank that could still write these pages has acked."""
+    def is_abort_release_safe(
+        self,
+        bootstrap_room: int,
+        generation: Optional[int],
+        required_ranks: AbstractSet[int],
+    ) -> bool:
+        """Every potential writer must have acknowledged this receiver's generation."""
+        if not required_ranks:
+            # An unpublished destination has no local writers. Peers still vote.
+            return True
         state = self._deferred_abort_ack_tracker.get(bootstrap_room)
-        acks = state.prefill_ranks if state is not None else ()
-        return len(acks) >= required_acks
+        return (
+            state is not None
+            and state.generation == generation
+            and required_ranks.issubset(state.prefill_ranks)
+        )
 
     def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
         self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
@@ -3018,6 +3038,11 @@ class CommonKVReceiver(BaseKVReceiver):
                 bootstrap_info["target_cp_rank"] = int(prefill_cp_rank)
                 bootstrap_info["target_tp_rank"] = int(target_tp_rank)
                 bootstrap_info["target_pp_rank"] = int(target_pp_rank)
+                # Match the P rank identity on the wire (_prefill_unique_rank),
+                # using the source topology, which may differ from decode's.
+                bootstrap_info["prefill_ack_rank"] = (
+                    target_tp_rank * self.prefill_info.pp_size + target_pp_rank
+                ) * self.prefill_info.attn_cp_size + prefill_cp_rank
                 return bootstrap_info
             else:
                 logger.error(

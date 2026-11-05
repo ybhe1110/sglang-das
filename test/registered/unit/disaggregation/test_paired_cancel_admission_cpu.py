@@ -123,7 +123,7 @@ class TestPairedCancellation(unittest.TestCase):
         self.p._bind_abort_metadata(7, metadata("new-pair", 456), "new")
         r = receiver(self.p, self.d, self.env)
         r.ensure_abort_notified()
-        self.assertTrue(self.d.is_abort_release_safe(7, 1))
+        self.assertTrue(self.d.is_abort_release_safe(7, 123, {0}))
         self.assertEqual(self.p._pending_abort_metadata_count, 1)
         self.assertEqual(set(self.p._pending_abort_metadata[7]), {("new-pair", "new")})
         self.assertEqual(
@@ -242,7 +242,7 @@ class TestPairedCancellation(unittest.TestCase):
         self.p._open_source_room(7, "new-pair")
         self.d.register_deferred_abort_room(7, generation=456)
         self.cancel()
-        self.assertFalse(self.d.is_abort_release_safe(7, 1))
+        self.assertFalse(self.d.is_abort_release_safe(7, 456, {0}))
         self.assertEqual(self.p.request_status[7], self.env["KVPoll"].Bootstrapping)
         self.assertTrue(
             self.p._source_drain.publish(SimpleNamespace(room=7), Mock(), lambda: True)
@@ -266,12 +266,12 @@ class TestPairedCancellation(unittest.TestCase):
         deliver = self.p._send_multipart_locked
         self.p._send_multipart_locked = Mock(side_effect=BlockingIOError("busy"))
         r.ensure_abort_notified()
-        self.assertFalse(self.d.is_abort_release_safe(7, 1))
+        self.assertFalse(self.d.is_abort_release_safe(7, 123, {0}))
         self.assertIn((7, "cancelled-pair"), self.p._cancelled_source_pairs)
         self.p._send_multipart_locked = deliver
         clock[0] += 1.1
         r.retry_abort_notification()
-        self.assertTrue(self.d.is_abort_release_safe(7, 1))
+        self.assertTrue(self.d.is_abort_release_safe(7, 123, {0}))
         self.assertEqual(r._abort_generation, 123)
         self.assertEqual(len(self.p._cancelled_source_pairs), 1)
 

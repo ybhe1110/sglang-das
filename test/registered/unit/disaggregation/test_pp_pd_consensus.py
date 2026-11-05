@@ -239,10 +239,12 @@ class TestPPPDConsensus(CustomTestCase):
             ),
             patch("sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"),
         ):
-            done_reqs = SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
-                scheduler,
-                transfer_status=([], []),
+            self.assertEqual(
+                scheduler.process_disagg_prefill_inflight_queue(([], [])), []
             )
+            self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+            req.external_kv_cleanup_done = True
+            done_reqs = scheduler.process_disagg_prefill_inflight_queue(([], []))
 
         self.assertEqual(done_reqs, [req])
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])

@@ -221,24 +221,43 @@ class TestGenerationAndNativeDrain(CustomTestCase):
         r.ensure_abort_notified()
         self.assertEqual(sent, [[None]])
         r.ensure_abort_notified(force_arm=True)
-        self.assertTrue(m.is_abort_release_safe(7, 1))
+        self.assertTrue(m.is_abort_release_safe(7, r._abort_generation, {0}))
         r.ensure_abort_notified(force_arm=True)
         self.assertEqual(len(sent), 2)
-        self.assertTrue(m.is_abort_release_safe(7, 1))
+        self.assertTrue(m.is_abort_release_safe(7, r._abort_generation, {0}))
 
     def test_stale_and_duplicate_acks_cannot_release_reused_room(self):
         m = manager()
         old = m.register_deferred_abort_room(7)
         m.note_abort_ack(7, 0, old)
         m.note_abort_ack(7, 0, old)
-        self.assertFalse(m.is_abort_release_safe(7, 2))
+        self.assertFalse(m.is_abort_release_safe(7, old, {0, 1}))
         m.clear_deferred_abort_state(7)
         new = m.register_deferred_abort_room(7)
         m.note_abort_ack(7, 1, old)
-        self.assertFalse(m.is_abort_release_safe(7, 1))
+        self.assertFalse(m.is_abort_release_safe(7, new, {0}))
         for rank in (0, 1):
             m.note_abort_ack(7, rank, new)
-        self.assertTrue(m.is_abort_release_safe(7, 2))
+        self.assertTrue(m.is_abort_release_safe(7, new, {0, 1}))
+        self.assertFalse(m.is_abort_release_safe(7, old, {0, 1}))
+        # Two ACKs are insufficient if neither covers the missing CP/PP shard.
+        self.assertFalse(m.is_abort_release_safe(7, new, {0, 7}))
+
+    def test_receiver_expects_the_unique_rank_from_source_topology(self):
+        session = Mock()
+        session.get.return_value.status_code = 200
+        session.get.return_value.json.return_value = {"rank_ip": "peer"}
+        cls = load_methods(
+            COMMON,
+            ["_get_bootstrap_info_from_server"],
+            {"_get_bootstrap_session": lambda addr: session, "logger": Mock()},
+            class_name="CommonKVReceiver",
+        )
+        receiver = cls()
+        receiver.bootstrap_addr = "bootstrap"
+        receiver.prefill_info = SimpleNamespace(pp_size=3, attn_cp_size=4)
+        info = receiver._get_bootstrap_info_from_server(0, 3, 2, 1)
+        self.assertEqual(info["prefill_ack_rank"], 31)
 
     def test_ack_fanout_waits_for_source_tracker_not_just_chunk_counter(self):
         m = mooncake_manager()
@@ -301,8 +320,8 @@ class TestGenerationAndNativeDrain(CustomTestCase):
                 notification = env["AbortNotification"](7, "decode", 6000, generation)
                 for _ in range(2):
                     p._handle_abort_notification(notification.to_zmq())
-                self.assertTrue(d.is_abort_release_safe(7, 1))
-                self.assertFalse(d.is_abort_release_safe(7, 2))
+                self.assertTrue(d.is_abort_release_safe(7, generation, {0}))
+                self.assertFalse(d.is_abort_release_safe(7, generation, {0, 1}))
                 self.assertEqual(
                     sent[-1][1], [b"ABORT_ACK", b"7", b"0", str(generation).encode()]
                 )
@@ -312,7 +331,7 @@ class TestGenerationAndNativeDrain(CustomTestCase):
                 d.clear_deferred_abort_state(7)
                 d.register_deferred_abort_room(7)
                 d.handle_abort_ack_message(sent[-1][1])
-                self.assertFalse(d.is_abort_release_safe(7, 1))
+                self.assertFalse(d.is_abort_release_safe(7, generation, {0}))
 
     def test_wire_ack_waits_until_active_source_has_completed(self):
         p, d, sent, env = wire_managers()
@@ -328,11 +347,11 @@ class TestGenerationAndNativeDrain(CustomTestCase):
         p._handle_abort_notification(
             env["AbortNotification"](7, "decode", 6000, generation).to_zmq()
         )
-        self.assertFalse(d.is_abort_release_safe(7, 1))
+        self.assertFalse(d.is_abort_release_safe(7, generation, {0}))
         self.assertEqual(sent, [])
         p._source_drain.complete(chunk)
         p._maybe_ack_drained_abort(7)
-        self.assertTrue(d.is_abort_release_safe(7, 1))
+        self.assertTrue(d.is_abort_release_safe(7, generation, {0}))
         self.assertEqual(len(sent), 1)
 
     def test_failed_ack_retained_and_fanout_continues(self):
@@ -429,19 +448,19 @@ class TestGenerationAndNativeDrain(CustomTestCase):
         r.ensure_abort_notified()
         generation = r._abort_generation
         d.note_abort_ack(7, 1, generation)  # Preserve another rank's earlier ACK.
-        self.assertFalse(d.is_abort_release_safe(7, 2))
+        self.assertFalse(d.is_abort_release_safe(7, generation, {0, 1}))
         r.retry_abort_notification()
         self.assertEqual(len(notifications), 1)
         clock[0] += 1.0
         r.retry_abort_notification()
         self.assertEqual(notifications[0], notifications[1])
-        self.assertFalse(d.is_abort_release_safe(7, 2))
+        self.assertFalse(d.is_abort_release_safe(7, generation, {0, 1}))
         p._send_multipart_locked = deliver
         clock[0] += 1.0
         r.retry_abort_notification()
         self.assertEqual(notifications[0], notifications[2])
         self.assertEqual(r._abort_generation, generation)
-        self.assertTrue(d.is_abort_release_safe(7, 2))
+        self.assertTrue(d.is_abort_release_safe(7, generation, {0, 1}))
 
     def test_old_abort_cannot_cancel_reused_room_before_or_after_metadata(self):
         p, d, sent, env = wire_managers()
@@ -518,7 +537,7 @@ class TestGenerationAndNativeDrain(CustomTestCase):
         p._handle_abort_notification(
             env["AbortNotification"](7, "decode", 6000, gen).to_zmq()
         )
-        self.assertTrue(d.is_abort_release_safe(7, 1))
+        self.assertTrue(d.is_abort_release_safe(7, gen, {0}))
         self.assertEqual(p.request_status[7], env["KVPoll"].Failed)
 
     def test_new_metadata_before_sender_does_not_inherit_retired_binding(self):
@@ -846,12 +865,15 @@ def queue(env, mgr, rid="r", ready=False):
     if ready:
         mgr.note_abort_ack(7, 0, generation)
     receiver = SimpleNamespace(
-        kv_mgr=mgr, clear=Mock(), retry_abort_notification=Mock()
+        kv_mgr=mgr,
+        _abort_generation=generation,
+        clear=Mock(),
+        retry_abort_notification=Mock(),
     )
     req = SimpleNamespace(
         req=SimpleNamespace(rid=rid, bootstrap_room=7), kv_receiver=receiver
     )
-    q._deferred_releases = [(req, 90.0, 110.0, 3, 1)]
+    q._deferred_releases = [(req, 90.0, 110.0, 3, frozenset({0}))]
     return q, req
 
 
@@ -884,15 +906,17 @@ class TestDecodeReleaseConsensus(CustomTestCase):
         self.env = load_collective_helpers()
         self.env["torch"].uint8 = object()
         self.env.update(
-            time=SimpleNamespace(monotonic=lambda: 100.0), release_kv_cache=Mock()
+            time=SimpleNamespace(monotonic=lambda: 100.0),
+            release_kv_cache=Mock(),
+            logger=Mock(),
         )
         self.env["all_reduce_with_timeout"] = lambda *a, **kw: None
 
     def test_timeout_preserves_all_destination_owners(self):
         q, dr = queue(self.env, manager())
-        q._deferred_releases[0] = (dr, 50.0, 99.0, 3, 1)
-        with self.assertRaises(self.env["DisaggregationCollectiveError"]):
-            q.resolve_deferred_releases()
+        q._deferred_releases[0] = (dr, 50.0, 99.0, 3, frozenset({0}))
+        q.resolve_deferred_releases()
+        q.resolve_deferred_releases()
         self.assertEqual(q.num_pending_deferred_releases(), 1)
         self.env["release_kv_cache"].assert_not_called()
         q._release_pd_hidden_rows.assert_not_called()
@@ -900,6 +924,13 @@ class TestDecodeReleaseConsensus(CustomTestCase):
         dr.kv_receiver.clear.assert_not_called()
         with self.assertRaises(RuntimeError):
             q.release_memory_occupation()
+        q._observe_deferred_kv_release.assert_called_once_with(50.0, "timeout")
+        mgr = dr.kv_receiver.kv_mgr
+        mgr.note_abort_ack(7, 0, mgr._deferred_abort_ack_tracker[7].generation)
+        q.resolve_deferred_releases()
+        q.resolve_deferred_releases()
+        self.assertFalse(q.has_pending_deferred_releases())
+        self.env["release_kv_cache"].assert_called_once()
 
     def test_complete_acks_release_all_owners_once(self):
         q, dr = queue(self.env, manager(), ready=True)
@@ -913,6 +944,26 @@ class TestDecodeReleaseConsensus(CustomTestCase):
         q.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
         receiver.clear.assert_called_once_with()
         self.assertFalse(q.has_pending_deferred_releases())
+
+    def test_overdue_hold_does_not_block_other_rooms(self):
+        mgr = manager()
+        q, held = queue(self.env, mgr)
+        _, ready = queue(self.env, manager(), rid="ready")
+        ready.req.bootstrap_room = 8
+        ready.kv_receiver.kv_mgr = mgr
+        ready.kv_receiver._abort_generation = mgr.register_deferred_abort_room(8)
+        mgr.note_abort_ack(8, 0, ready.kv_receiver._abort_generation)
+        q._deferred_releases = [
+            (held, 50.0, 99.0, 3, frozenset({0})),
+            (ready, 90.0, 110.0, 4, frozenset({0})),
+        ]
+        q.metadata_buffers.bootstrap_room[4] = 8
+        q.resolve_deferred_releases()
+        self.assertEqual(q.metadata_buffers.bootstrap_room, {3: 7, 4: 0})
+        self.assertEqual(q.num_pending_deferred_releases(), 1)
+        self.env["release_kv_cache"].assert_called_once_with(
+            ready.req, q.tree_cache, is_insert=False
+        )
 
     def test_partial_free_exception_is_quarantined_without_retry(self):
         q, dr = queue(self.env, manager(), ready=True)
