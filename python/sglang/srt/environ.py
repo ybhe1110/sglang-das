@@ -676,11 +676,9 @@ class Envs:
     # operator-provided MC_TRANSFER_TIMEOUT value.
     SGLANG_DISAGGREGATION_MOONCAKE_TRANSFER_TIMEOUT = EnvFloat(30.0)
     # Deferred decode-side KV release: on abort, hold an in-flight request's KV
-    # pages/slot until prefill acknowledges a drained transfer. Expiring the
-    # deadline fails closed and keeps the pages held until process teardown;
-    # it must not be interpreted as a native DMA fence. Applies to backends
-    # that acknowledge drain
-    # (supports_deferred_decode_kv_release).
+    # pages/slot until prefill acknowledges a drained transfer. The timeout
+    # reports an overdue hold once; decode keeps retrying with the same
+    # generation while those buffers remain allocated.
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 

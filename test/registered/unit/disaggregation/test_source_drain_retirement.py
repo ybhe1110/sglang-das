@@ -184,6 +184,12 @@ class TestSourceDrainRetirement(CustomTestCase):
         self.assertTrue(sender.is_transfer_terminal())
 
     def test_tp8_quarantine_retires_together_and_frees_once(self):
+        self._check_collective_retirement(quarantined=True)
+
+    def test_first_failed_poll_with_one_active_sender_retires_together(self):
+        self._check_collective_retirement(quarantined=False)
+
+    def _check_collective_retirement(self, quarantined):
         barrier = threading.Barrier(8, timeout=15)
         flags = [None] * 8
         fixtures = []
@@ -206,11 +212,16 @@ class TestSourceDrainRetirement(CustomTestCase):
                 sender.kv_mgr._source_drain.begin(chunk)
             sender.abort()
             sender.clear()
-            fixture.s._quarantine_external_kv_request(
-                fixture.req,
-                abort_message="cancelled",
-                emit_response=False,
-            )
+            if quarantined:
+                fixture.s._quarantine_external_kv_request(
+                    fixture.req, abort_message="cancelled", emit_response=False
+                )
+            else:
+                fixture.s._external_kv_abort_rids.clear()
+                fixture.req.pending_bootstrap = False
+                fixture.s.ps = SimpleNamespace(tp_rank=rank)
+                fixture.s.metrics_reporter = SimpleNamespace(enable_metrics=False)
+                sender.failure_exception = Mock(side_effect=RuntimeError("aborted"))
 
             def reduce(values, *args, rank=rank, **kwargs):
                 flags[rank] = values
@@ -226,6 +237,7 @@ class TestSourceDrainRetirement(CustomTestCase):
                     [KVPoll.Failed] * len(senders)
                 ),
                 _QuarantinedKVSender=lambda: None,
+                maybe_release_pd_hidden_rows_on_hidden_done=Mock(),
             )
             queue_cls = load_methods(
                 PREFILL, ["process_disagg_prefill_inflight_queue"], fixture.env

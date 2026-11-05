@@ -2757,10 +2757,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
-        # Aborted-mid-transfer requests whose KV pages/slot are held until drained
-        # or timed out. Entries:
-        # (decode_req, start_time, deadline, metadata_idx, required_acks).
-        self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
+        # Failed transfers retain their pages and slots until all writers drain.
+        # A None deadline means the timeout has already been reported.
+        self._deferred_releases: List[
+            Tuple[DecodeRequest, float, Optional[float], int, frozenset[int]]
+        ] = []
         self._deferred_release_quarantine = {}
         self.kv_manager = None
         self.locally_aborted_rids: Set[str] = set()
@@ -3510,10 +3511,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def _defer_release(self, decode_req: DecodeRequest) -> None:
         start_time = time.monotonic()
         deadline = start_time + self.deferred_kv_release_timeout
-        # Require an ack from every notified prefill rank (dummy-proof). Snapshot
-        # now -- the receiver may be cleared by resolve time.
-        required_acks = len(
-            getattr(decode_req.kv_receiver, "bootstrap_infos", None) or []
+        # Include dummy ranks: any notified source could have received addresses.
+        required_ranks = frozenset(
+            info["prefill_ack_rank"]
+            for info in (getattr(decode_req.kv_receiver, "bootstrap_infos", None) or ())
         )
         self._deferred_releases.append(
             (
@@ -3521,7 +3522,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 start_time,
                 deadline,
                 decode_req.metadata_buffer_index,
-                required_acks,
+                required_ranks,
             )
         )
 
@@ -3563,10 +3564,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return _all_reduce_polls(flags, self.gloo_group) if flags else []
 
     def resolve_deferred_releases(self) -> None:
-        """Release only on a rank-agreed drain; an expired hold is fatal.
+        """Release only on a rank-agreed drain; keep retrying an expired hold.
 
-        A timer is not a native DMA fence. Keep ownership on timeout and let
-        the scheduler fail closed, rather than recycling potentially live pages.
+        An expired hold still consumes its original pool capacity. Only a
+        positive drain vote authorizes returning those slots to the allocator.
         Even empty ranks join the fixed-size preflight to detect queue drift.
         """
         entries = self._deferred_releases
@@ -3575,7 +3576,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             [
                 int(
                     entry[0].kv_receiver.kv_mgr.is_abort_release_safe(
-                        entry[0].req.bootstrap_room, entry[4]
+                        entry[0].req.bootstrap_room,
+                        entry[0].kv_receiver._abort_generation,
+                        entry[4],
                     )
                 )
                 for entry in entries
@@ -3584,28 +3587,27 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             phase=41,
         )
         within_deadline = self._reduce_deferred_flags(
-            [int(now < entry[2]) for entry in entries], entries, phase=42
+            [int(entry[2] is None or now < entry[2]) for entry in entries],
+            entries,
+            phase=42,
         )
-        expired = [
-            entry
-            for entry, done, live in zip(entries, ready, within_deadline)
-            if not done and not live
-        ]
-        if expired:
-            for entry in expired:
-                self._observe_deferred_kv_release(max(0.0, now - entry[1]), "timeout")
-            raise DisaggregationCollectiveError(
-                "Deferred KV drain deadline expired; retaining KV/metadata/PD-hidden "
-                "instead of reusing memory without a native fence: "
-                + ",".join(entry[0].req.rid for entry in expired)
-            )
-        for entry, done in zip(entries, ready):
+        pending = []
+        for entry, done, live in zip(entries, ready, within_deadline):
             if not done:
+                if not live:
+                    decode_req, start, _, idx, ranks = entry
+                    self._observe_deferred_kv_release(max(0.0, now - start), "timeout")
+                    logger.warning(
+                        "Deferred KV drain timed out for rid=%s room=%s; "
+                        "holding destination buffers until acknowledged",
+                        decode_req.req.rid,
+                        decode_req.req.bootstrap_room,
+                    )
+                    entry = (decode_req, start, None, idx, ranks)
+                pending.append(entry)
                 entry[0].kv_receiver.retry_abort_notification()
         to_release = [entry for entry, done in zip(entries, ready) if done]
-        self._deferred_releases = [
-            entry for entry, done in zip(entries, ready) if not done
-        ]
+        self._deferred_releases = pending
         released = []
         for entry in to_release:
             decode_req, start_time, _, idx, _ = entry

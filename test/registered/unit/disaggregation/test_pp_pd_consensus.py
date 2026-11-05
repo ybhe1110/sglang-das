@@ -187,17 +187,17 @@ class TestPPPDConsensus(CustomTestCase):
             time_stats=SimpleNamespace(set_completion_time=Mock()),
         )
         handle_failure = Mock(return_value=(None, False))
-        scheduler = SimpleNamespace(
-            disagg_prefill_inflight_queue=[req],
-            attn_cp_cpu_group=object(),
-            attn_tp_cpu_group=object(),
-            ps=SimpleNamespace(pp_rank=1),
-            handle_inflight_transfer_failure=handle_failure,
-            output_streamer=SimpleNamespace(stream_output=Mock()),
-            req_to_metadata_buffer_idx_allocator=object(),
-            _external_kv_abort_rids=set(),
-            prefill_abort_sender_terminal=Mock(return_value=False),
-        )
+        scheduler = SchedulerDisaggregationPrefillMixin()
+        scheduler.disagg_prefill_inflight_queue = [req]
+        scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = object()
+        scheduler.handle_inflight_transfer_failure = handle_failure
+        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        scheduler.req_to_metadata_buffer_idx_allocator = object()
+        scheduler._external_kv_abort_rids = set()
+        scheduler.prefill_abort_sender_terminal = Mock(return_value=False)
+        collective = patch("sglang.srt.disaggregation.utils.all_reduce_with_timeout")
+        collective.start()
+        self.addCleanup(collective.stop)
         req.external_kv_response_sent = False
         req.external_kv_metadata_released = False
 
@@ -236,10 +236,12 @@ class TestPPPDConsensus(CustomTestCase):
             ),
             patch("sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"),
         ):
-            done_reqs = SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
-                scheduler,
-                transfer_status=([], []),
+            self.assertEqual(
+                scheduler.process_disagg_prefill_inflight_queue(([], [])), []
             )
+            self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+            req.external_kv_cleanup_done = True
+            done_reqs = scheduler.process_disagg_prefill_inflight_queue(([], []))
 
         self.assertEqual(done_reqs, [req])
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])

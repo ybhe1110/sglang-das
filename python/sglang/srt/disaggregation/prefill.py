@@ -106,10 +106,10 @@ _is_npu = is_npu()
 
 
 class _QuarantinedKVSender:
-    """Nonblocking placeholder kept in the rank-synchronized poll list."""
+    """Report the abort to peers without polling an already retired sender."""
 
     def poll(self) -> int:
-        return KVPoll.Transferring
+        return KVPoll.Failed
 
 
 def should_force_retry(req: Req) -> bool:
@@ -1713,6 +1713,8 @@ class SchedulerDisaggregationPrefillMixin:
         if not quarantine:
             return
         for req in tuple(quarantine.values()):
+            if req.external_kv_cleanup_ready:
+                continue  # Only the next collective can retire this placeholder.
             try:
                 forward_drained = self.prefill_abort_forward_drained(req)
                 sender_terminal = self.prefill_abort_sender_terminal(req)
@@ -2022,8 +2024,8 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     req.pending_bootstrap = False
                     if cleanup_done:
-                        req.time_stats.set_completion_time()
-                    elif req not in self.disagg_prefill_inflight_queue:
+                        self._hold_external_kv_cleanup_until_collective(req)
+                    if req not in self.disagg_prefill_inflight_queue:
                         self.disagg_prefill_inflight_queue.append(req)
                     advance_logprob_pt(i, req)
                     continue
@@ -2205,26 +2207,17 @@ class SchedulerDisaggregationPrefillMixin:
         success_rids = set(transfer_status[0]) if transfer_status is not None else set()
         failed_rids = set(transfer_status[1]) if transfer_status is not None else set()
 
-        # Keep the queue shape identical on every rank while a request is
-        # quarantined.  Only remove it after a MIN reduction agrees that all
-        # ranks have completed the deferred cleanup.
+        # Only vote for cleanup completed before this pass. A normal sender
+        # may enter Failed below; that transition must keep its ordered slot.
         cleanup_ready = all_reduce_min_flags(
             [
-                0
-                if (
-                    (
-                        getattr(req, "external_kv_cleanup_quarantined", False)
-                        and not getattr(req, "external_kv_cleanup_ready", False)
-                    )
-                    or (
-                        (
-                            req.rid in self._external_kv_abort_rids
-                            or getattr(req, "external_kv_abort_requested", False)
-                        )
-                        and not getattr(req, "external_kv_cleanup_done", False)
+                int(
+                    getattr(req, "external_kv_cleanup_done", False)
+                    and (
+                        not getattr(req, "external_kv_cleanup_quarantined", False)
+                        or getattr(req, "external_kv_cleanup_ready", False)
                     )
                 )
-                else 1
                 for req in self.disagg_prefill_inflight_queue
             ],
             self.attn_cp_cpu_group,
@@ -2238,16 +2231,7 @@ class SchedulerDisaggregationPrefillMixin:
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [
-                _QuarantinedKVSender()
-                if getattr(req, "external_kv_cleanup_quarantined", False)
-                else req.disagg_kv_sender
-                for req in self.disagg_prefill_inflight_queue
-            ],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        polls = self._poll_inflight_transfers()
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
@@ -2291,13 +2275,8 @@ class SchedulerDisaggregationPrefillMixin:
                     emit_response=True,
                 )
                 if cleanup_done:
-                    if cleanup_ready[index]:
-                        done_reqs.append(req)
-                    else:
-                        self._hold_external_kv_cleanup_until_collective(req)
-                        undone_reqs.append(req)
-                else:
-                    undone_reqs.append(req)
+                    self._hold_external_kv_cleanup_until_collective(req)
+                undone_reqs.append(req)
                 continue
 
             if transfer_status is not None:
@@ -2318,13 +2297,8 @@ class SchedulerDisaggregationPrefillMixin:
                         sender_terminal=self.prefill_abort_sender_terminal(req),
                     )
                     if cleanup_done:
-                        if cleanup_ready[index]:
-                            done_reqs.append(req)
-                        else:
-                            self._hold_external_kv_cleanup_until_collective(req)
-                            undone_reqs.append(req)
-                    else:
-                        undone_reqs.append(req)
+                        self._hold_external_kv_cleanup_until_collective(req)
+                    undone_reqs.append(req)
                     continue
 
                 if req.rid not in success_rids:
@@ -2344,18 +2318,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
                     self.send_kv_chunk(req, last_chunk=True)
-                    undone_reqs.append(req)
-                elif req.external_kv_abort_requested:
-                    if req.external_kv_cleanup_done:
-                        if cleanup_ready[index]:
-                            done_reqs.append(req)
-                        else:
-                            self._hold_external_kv_cleanup_until_collective(req)
-                            undone_reqs.append(req)
-                    else:
-                        undone_reqs.append(req)
-                elif poll != KVPoll.Failed:
-                    undone_reqs.append(req)
+                undone_reqs.append(req)
                 continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
@@ -2374,13 +2337,8 @@ class SchedulerDisaggregationPrefillMixin:
                     req, sender_terminal=self.prefill_abort_sender_terminal(req)
                 )
                 if cleanup_done:
-                    if cleanup_ready[index]:
-                        done_reqs.append(req)
-                    else:
-                        self._hold_external_kv_cleanup_until_collective(req)
-                        undone_reqs.append(req)
-                else:
-                    undone_reqs.append(req)
+                    self._hold_external_kv_cleanup_until_collective(req)
+                undone_reqs.append(req)
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
@@ -2492,18 +2450,28 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc, cleanup_done
 
-    def get_transferred_rids(
-        self: Scheduler,
-    ) -> Tuple[List[str], List[str]]:
-        """
-        Used by PP to inspect local terminal transfers without popping requests.
-        """
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+    def _poll_inflight_transfers(self: Scheduler) -> List[int]:
+        return poll_and_all_reduce_attn_cp_tp_group(
+            [
+                (
+                    _QuarantinedKVSender()
+                    if (
+                        getattr(req, "external_kv_cleanup_quarantined", False)
+                        or getattr(req, "external_kv_cleanup_done", False)
+                    )
+                    else req.disagg_kv_sender
+                )
+                for req in self.disagg_prefill_inflight_queue
+            ],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
 
+    def get_transferred_rids(
+        self: Scheduler,
+    ) -> Tuple[List[str], List[str]]:
+        """Used by PP to inspect local terminal transfers without popping requests."""
+        polls = self._poll_inflight_transfers()
         success_rids: List[str] = []
         failed_rids: List[str] = []
         pd_hidden_pool = getattr(
@@ -2588,9 +2556,11 @@ class SchedulerDisaggregationPrefillMixin:
             is_insert=False,
             emit_response=True,
         )
-        if not cleanup_done and req not in self.disagg_prefill_inflight_queue:
-            # The bootstrap/waiting queue removes this request after the call.
-            # Keep a strong reference, not just a RID, for the next cleanup pass.
+        if cleanup_done:
+            self._hold_external_kv_cleanup_until_collective(req)
+        if req not in self.disagg_prefill_inflight_queue:
+            # Bootstrap removes the request on all ranks. Keep the same ordered
+            # inflight owner even where local cleanup has already finished.
             self.disagg_prefill_inflight_queue.append(req)
 
         if self.metrics_reporter.enable_metrics:
