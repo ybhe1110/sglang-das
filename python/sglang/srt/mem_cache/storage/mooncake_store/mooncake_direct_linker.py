@@ -386,6 +386,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # (rids, success) per started load batch. Pushed from a finally so a
         # failed batch still releases the tree-side locks it pinned.
         self.completed_loads: Queue[tuple[list[str], bool]] = Queue()
+        # Set when a session start/end call raised or reported a failure the
+        # native side does not account for: session ownership is then unknown,
+        # so no further load may run until the process is torn down.
+        self._session_cleanup_error: str | None = None
+        self._uncertain_sessions: list[tuple[str, ...]] = []
         self.offload_queue: Queue[
             tuple[list[PoolTransfer], int, float, object] | None
         ] = Queue()
@@ -616,6 +621,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        self._raise_if_session_cleanup_uncertain()
         # Query establishes a boundary at which every component is restorable;
         # insert then removes pages already resident in L1. Loading is therefore
         # intentionally partial and may contain only a side pool such as SWA.
@@ -648,6 +654,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         return self._prepare_expanded_load(rid, expanded)
+
+    def _raise_if_session_cleanup_uncertain(self) -> None:
+        error = getattr(self, "_session_cleanup_error", None)
+        if error is not None:
+            raise RuntimeError(error)
+
+    def _quarantine_sessions(self, keys: list[str], reason: str) -> None:
+        """Record that native session ownership is unknown for ``keys``.
+
+        A raise or a failure status from the session API does not say which
+        sessions the master still holds. Retrying could release a session
+        another holder has since reacquired, so the linker refuses further
+        loads and leaves the keys to process teardown.
+        """
+        if getattr(self, "_uncertain_sessions", None) is None:
+            self._uncertain_sessions = []
+        self._uncertain_sessions.append(tuple(keys))
+        self._session_cleanup_error = (
+            "Mooncake session ownership uncertain; process teardown required: "
+            f"keys={len(keys)} reason={reason}"
+        )
+        logger.error(self._session_cleanup_error)
 
     def _prepare_expanded_load(self, rid: str, expanded: list[PoolTransfer]) -> bool:
         keys = []
@@ -697,9 +725,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 else:
                     results = []
                     sources = []
-            except BaseException:
+            except BaseException as error:
                 logger.warning(
                     "Mooncake get session start raised for rid=%s", rid, exc_info=True
+                )
+                # The native call may have acquired some of these sessions
+                # before raising; nothing says which. Never guess by retrying.
+                self._quarantine_sessions(
+                    new_keys, f"session start: {type(error).__name__}"
                 )
                 self._rollback_session_refs_locked(acquired)
                 return False
@@ -1164,12 +1197,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.session_refcounts[key] = count - 1
         if to_end:
             try:
-                self.storage.store.batch_get_session_end(to_end)
-            except BaseException:
-                logger.warning(
-                    "Mooncake get session cleanup failed for %d keys.",
-                    len(to_end),
-                    exc_info=True,
+                status = self.storage.store.batch_get_session_end(to_end)
+                # The native ABI reports an integer status; a plain return
+                # alone does not establish that every session was released.
+                # None is tolerated for bindings that return nothing.
+                if status is not None and (type(status) is not int or status != 0):
+                    raise RuntimeError(f"Mooncake get session end failed: {status!r}")
+            except BaseException as error:
+                logger.exception(
+                    "Mooncake get session cleanup failed for %d keys.", len(to_end)
+                )
+                self._quarantine_sessions(
+                    to_end, f"session end: {type(error).__name__}"
                 )
 
     def _abort_prepared_load_now(self, rid: str) -> None:
@@ -1206,6 +1245,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.gc_frozen = True
 
     def start_layer_wise_loading(self) -> int:
+        self._raise_if_session_cleanup_uncertain()
         broadcaster = self.mla_broadcaster
         if broadcaster is not None:
             # Compare the logical load order (not local slots), including empty
@@ -1581,7 +1621,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def pop_completed_offload(self) -> bool:
         return self.offload_results.get_nowait()
 
-    def reset(self) -> None:
+    def reset(self, *, closing: bool = False) -> None:
+        if not closing:
+            # Teardown must still drain the worker threads; every other reset
+            # of a linker with unknown session ownership is refused.
+            self._raise_if_session_cleanup_uncertain()
         with self.host_prefetch_lock:
             for entry in self.host_prefetch_entries.values():
                 entry["cancelled"] = True
@@ -1612,7 +1656,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.layer_done_counter.reset()
 
     def close(self) -> None:
-        self.reset()
+        if getattr(self, "_session_cleanup_error", None) is not None:
+            logger.error(
+                "Closing the Mooncake direct linker with %d session batch(es) of "
+                "unknown ownership; they are left to process teardown",
+                len(getattr(self, "_uncertain_sessions", ())),
+            )
+        self.reset(closing=True)
         self.load_queue.put(None)
         self.offload_queue.put(None)
         for _ in self.host_prefetch_threads:

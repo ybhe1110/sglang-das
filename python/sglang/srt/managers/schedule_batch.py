@@ -1304,6 +1304,10 @@ class Req(ReqDllmMixin):
         self.host_loaded_length = 0
         # Absolute external-cache hit boundary shared by PP0; None outside PP.
         self.external_cache_hit_length: Optional[int] = None
+        # Ownership bit of a direct-L3 load's translated SWA slots: set by the
+        # SWA component's ABORT so a repeated ABORT cannot free them twice,
+        # cleared by PREPARE and by the next load_back.
+        self.external_kv_private_swa_slots_released = False
         # Buffer-mode host memory is transport staging, not an L2 cache tier.
         self.host_hit_is_storage = False
         self.storage_prefetch_retry_attempts = 0

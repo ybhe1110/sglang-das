@@ -3058,8 +3058,28 @@ class Scheduler(
             max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
         )
 
+    def _prepare_prefill_batch(self, batch: ScheduleBatch) -> None:
+        """Allocate the batch and start its host/L3 loads in the right order.
+
+        L2 (HiCache) starts loading before allocation, as before. Direct-L3
+        loads land in request-private slots, so they start only after
+        prepare_for_extend has written every request's KV row: the row is what
+        makes the request the owner of those slots for cleanup.
+        """
+        if self.enable_unified_cache_external_linker:
+            batch.prepare_for_extend()
+            batch.hicache_consumer_index = self.tree_cache.ready_to_load_host_cache()
+            return
+        if self.enable_hierarchical_cache:
+            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            batch.hicache_consumer_index = self.tree_cache.ready_to_load_host_cache()
+        batch.prepare_for_extend()
+
     def init_invariant_checker(self) -> None:
         self.invariant_checker = SchedulerInvariantChecker(
+            get_inflight_req_count=lambda: len(
+                getattr(self, "disagg_prefill_inflight_queue", ())
+            ),
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
             disaggregation_mode=self.disaggregation_mode,
@@ -5237,13 +5257,7 @@ class Scheduler(
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
-        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
-            )
-
-        new_batch.prepare_for_extend()
+        self._prepare_prefill_batch(new_batch)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:

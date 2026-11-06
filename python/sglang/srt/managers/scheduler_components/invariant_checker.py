@@ -69,6 +69,9 @@ class SchedulerInvariantChecker:
     # The chunked-prefill request parked between chunks is in neither batch;
     # it still owns its KV row.
     get_chunked_req: Callable = field(default=lambda: None)
+    # Prefill requests parked in the disaggregation inflight queue own KV rows
+    # while their transfer drains; reported with every leak verdict.
+    get_inflight_req_count: Callable[[], int] = field(default=lambda: 0)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -479,7 +482,23 @@ class SchedulerInvariantChecker:
             has_leak |= mamba_leak
             messages.append(mamba_msg)
 
+        if has_leak:
+            messages.append(self._pool_owner_diagnostics())
         return has_leak, messages
+
+    def _pool_owner_diagnostics(self) -> str:
+        """Holders of slots outside the tree that a leak verdict must name:
+        the direct-L3 linker's private loads and quarantined releases, plus
+        in-flight prefill requests. Read from the same pass as the verdict."""
+        linker = getattr(self.tree_cache, "linker", None)
+        return (
+            f"[owners] allocator={type(self.token_to_kv_pool_allocator).__name__} "
+            f"page_size={self.page_size} "
+            f"private_loads={len(getattr(linker, 'private_loads', {}))} "
+            f"inflight_load_rids={len(getattr(linker, 'inflight_load_rids', ()))} "
+            f"cleanup_quarantine={len(getattr(linker, 'cleanup_quarantine', {}))} "
+            f"inflight_reqs={self.get_inflight_req_count()}"
+        )
 
     def _check_tree_cache(self):
         if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():

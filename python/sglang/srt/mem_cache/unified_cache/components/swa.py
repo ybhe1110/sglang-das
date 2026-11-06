@@ -1282,6 +1282,12 @@ class SWAComponent(TreeComponent):
         prefix_len: int,
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
+            # SWA has its own physical allocator. ABORT can reach the same load
+            # twice (an admission rollback and a later request cleanup), so
+            # claim this translated range before freeing it: one owner frees.
+            if getattr(req, "external_kv_private_swa_slots_released", False):
+                return None
+            req.external_kv_private_swa_slots_released = True
             self.cache.token_to_kv_pool_allocator.swa_attn_allocator.free(
                 transfer.device_indices
             )
@@ -1289,6 +1295,7 @@ class SWAComponent(TreeComponent):
 
         allocator = self.cache.token_to_kv_pool_allocator
         if phase == ExternalLinkerLoadPhase.PREPARE:
+            req.external_kv_private_swa_slots_released = False
             swa_len = len(transfer.device_indices)
             allocator.set_full_to_swa_mapping(
                 full_transfer.device_indices[-swa_len:], transfer.device_indices

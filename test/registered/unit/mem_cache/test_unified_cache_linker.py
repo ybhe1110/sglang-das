@@ -42,8 +42,10 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+from sglang.srt.disaggregation.utils import DisaggregationCollectiveError
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
+    ExternalLinkerCleanupError,
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
@@ -1063,7 +1065,7 @@ def test_finish_loads_adopts_a_peer_rank_failure():
 
     assert wrapper.finish_loads() == ["a", "b"]  # this rank landed, a peer did not
     assert wrapper.finish_loads() == []  # nothing loaded: no collective
-    reduce.assert_called_once()
+    assert reduce.call_count == 2  # the RID preflight, then the landed verdict
 
 
 @pytest.mark.parametrize("device_len", [0, 2])
@@ -1527,6 +1529,228 @@ def test_linker_load_preserves_swa_boundaries(
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+
+# ---- rank agreement: match preflight, load-batch identity, slot ownership ----
+
+
+def _peer_preflight(overrides):
+    """One simulated peer whose value/negation preflight fields differ from the
+    local ones at the given indices; MIN over the pairs yields min and max."""
+
+    def reduce(tensor, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        if tensor.dtype != torch.int64:
+            return  # the restorable mask: peer agrees
+        local = tensor[0::2].tolist()
+        peer = [overrides.get(index, value) for index, value in enumerate(local)]
+        peer_tensor = torch.tensor(
+            [item for value in peer for item in (value, -value)], dtype=torch.int64
+        )
+        torch.minimum(tensor, peer_tensor, out=tensor)
+
+    return reduce
+
+
+def _match_wrapper(full, reduce, restorable=(2,)):
+    node = SimpleNamespace(id=1, external_cache_stored=False)
+    cache = _cache_for_wrapper(
+        _components_tuple=(full,),
+        components={ComponentType.FULL: full},
+        tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
+        page_size=2,
+        _all_reduce_attn_groups=reduce,
+        get_last_hash_value=lambda node: None,
+        resolve_node_handle=lambda node_id: node,
+    )
+    backend = _FakeLinker()
+    backend.lookup = MagicMock(return_value=list(restorable))
+    return UnifiedCacheLinkerWrapper(cache, backend), backend
+
+
+def _empty_match(device_prefix_len=0):
+    return MatchResult(
+        device_prefix_len=device_prefix_len,
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+
+
+_KEY = RadixKey(array("q", [1, 2, 3, 4]))
+
+# Preflight payload layout: key_len, device_hit_len, tail_pages, valid,
+# reusable, rid digest (2), sequence, phase.
+_FIELD_KEY_LEN, _FIELD_TAIL_PAGES, _FIELD_VALID, _FIELD_SEQUENCE = 0, 2, 3, 7
+
+
+def test_match_preflight_geometry_mismatch_is_fatal(full_linker_component):
+    wrapper, backend = _match_wrapper(
+        full_linker_component, _peer_preflight({_FIELD_KEY_LEN: 2})
+    )
+    with pytest.raises(DisaggregationCollectiveError, match="geometry"):
+        wrapper.match(_KEY, SimpleNamespace(rid="r"), _empty_match())
+    backend.lookup.assert_not_called()
+
+
+def test_match_preflight_identity_mismatch_is_fatal(full_linker_component):
+    wrapper, backend = _match_wrapper(
+        full_linker_component, _peer_preflight({_FIELD_SEQUENCE: 5})
+    )
+    with pytest.raises(DisaggregationCollectiveError, match="RID/sequence"):
+        wrapper.match(_KEY, SimpleNamespace(rid="r"), _empty_match())
+    backend.lookup.assert_not_called()
+
+
+def test_match_skips_lookup_on_every_rank_when_a_peer_cannot_build(
+    full_linker_component, caplog
+):
+    wrapper, backend = _match_wrapper(
+        full_linker_component, _peer_preflight({_FIELD_VALID: 0})
+    )
+    matched = wrapper.match(_KEY, SimpleNamespace(rid="r"), _empty_match())
+    assert matched.host_hit_length == 0
+    backend.lookup.assert_not_called()  # a lookup here would desync the mask
+    assert "valid on some ranks only" in caplog.text
+
+
+def test_match_joins_preflight_when_local_component_cannot_build(caplog):
+    full = SimpleNamespace(
+        component_type=ComponentType.FULL,
+        build_external_linker_transfer=MagicMock(return_value=None),
+    )
+    reduce = MagicMock(side_effect=lambda value, op: None)
+    wrapper, backend = _match_wrapper(full, reduce)
+    matched = wrapper.match(_KEY, SimpleNamespace(rid="r"), _empty_match())
+    assert matched.host_hit_length == 0
+    reduce.assert_called_once()  # the peers learn to skip, instead of hanging
+    backend.lookup.assert_not_called()
+
+
+def test_match_full_local_hit_joins_preflight_silently(
+    full_linker_component, caplog
+):
+    reduce = MagicMock(side_effect=lambda value, op: None)
+    wrapper, backend = _match_wrapper(full_linker_component, reduce)
+    matched = wrapper.match(
+        _KEY, SimpleNamespace(rid="r"), _empty_match(device_prefix_len=4)
+    )
+    assert matched.host_hit_length == 0
+    reduce.assert_called_once()
+    backend.lookup.assert_not_called()
+    assert "preflight rejected" not in caplog.text
+    assert wrapper._match_sequence == 1
+
+
+def test_match_agrees_on_the_hit_after_preflight(full_linker_component):
+    wrapper, backend = _match_wrapper(full_linker_component, _peer_preflight({}))
+    matched = wrapper.match(_KEY, SimpleNamespace(rid="r"), _empty_match())
+    assert matched.host_hit_length == 4
+    backend.lookup.assert_called_once()
+
+
+def test_finish_loads_rejects_a_divergent_load_batch():
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(_all_reduce_attn_groups=_peer_preflight({1: 0})),
+        _FakeLinker(),
+    )
+    wrapper.inflight_load_rids = ["a"]
+    wrapper.start_layer_wise_loading()
+    with pytest.raises(DisaggregationCollectiveError, match="RID/order"):
+        wrapper.finish_loads()
+
+
+def _load_wrapper(full, backend=None):
+    cache = _cache_for_wrapper(
+        _components_tuple=(full,),
+        components={ComponentType.FULL: full},
+        page_size=2,
+        _all_reduce_attn_groups=lambda value, op: None,
+    )
+    backend = backend or _FakeLinker()
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
+        prefix_key=_KEY, tail_hashes=["h0", "h1"], device_hit_len=0
+    )
+    req = SimpleNamespace(
+        rid="rid",
+        kv=None,
+        prefix_len=0,
+        last_node=0,
+        host_loaded_length=0,
+        swa_branching_seqlen=None,
+    )
+    return wrapper, backend, req
+
+
+def test_rejected_admission_rolls_the_private_load_back(full_linker_component):
+    full = full_linker_component
+    full.update_external_linker_load = MagicMock(
+        side_effect=full.update_external_linker_load
+    )
+    wrapper, backend, req = _load_wrapper(full)
+    admitted = []
+    with wrapper.load_back_admission(req, admitted):
+        loaded, req.last_node = wrapper.load_back(req)
+        req.host_loaded_length = loaded
+        req.prefix_len += loaded
+        assert backend.queued_loads and wrapper.private_loads["rid"].bound is False
+        # a later gate rejects the request: it never joins `admitted`
+
+    assert backend.queued_loads == {}  # cancelled before the backend started it
+    assert wrapper.private_loads == {} and wrapper.private_load_indices == {}
+    assert wrapper.inflight_load_rids == []
+    phases = [c.args[0] for c in full.update_external_linker_load.call_args_list]
+    assert phases == [ExternalLinkerLoadPhase.PREPARE, ExternalLinkerLoadPhase.ABORT]
+    assert (req.prefix_len, req.host_loaded_length, req.last_node) == (0, 0, 0)
+
+
+def test_admitted_load_binds_to_its_row_before_it_starts(full_linker_component):
+    wrapper, backend, req = _load_wrapper(full_linker_component)
+    admitted = []
+    with wrapper.load_back_admission(req, admitted):
+        loaded, _ = wrapper.load_back(req)
+        req.prefix_len += loaded
+        admitted.append(req)
+    assert backend.queued_loads  # admitted: the load stays queued
+
+    with pytest.raises(ExternalLinkerCleanupError, match="row owner"):
+        wrapper.start_layer_wise_loading()  # prepare_for_extend did not run
+
+    req.kv = SimpleNamespace(req_pool_idx=3, kv_allocated_len=4)
+    wrapper.bind_private_load(req)
+    assert wrapper.private_loads["rid"].bound
+    assert wrapper.start_layer_wise_loading() == 3
+
+
+def test_bind_rejects_an_incomplete_row_handoff(full_linker_component):
+    wrapper, _backend, req = _load_wrapper(full_linker_component)
+    admitted = [req]
+    with wrapper.load_back_admission(req, admitted):
+        loaded, _ = wrapper.load_back(req)
+        req.prefix_len += loaded
+    req.kv = SimpleNamespace(req_pool_idx=None, kv_allocated_len=4)
+    with pytest.raises(ExternalLinkerCleanupError, match="handoff"):
+        wrapper.bind_private_load(req)
+
+
+def test_ambiguous_abort_quarantines_the_linker(full_linker_component):
+    full = full_linker_component
+    full.update_external_linker_load = MagicMock(side_effect=RuntimeError("free"))
+    wrapper, _backend, req = _load_wrapper(full)
+    transfer = PoolTransfer(
+        name=PoolName.KV, keys=["h0", "h1"], device_indices=torch.arange(4)
+    )
+    with pytest.raises(ExternalLinkerCleanupError, match="uncertain"):
+        wrapper._update_load(
+            ExternalLinkerLoadPhase.ABORT, req, [(full, transfer)], 4
+        )
+    assert wrapper.cleanup_quarantine["rid"]["states"] == ("uncertain",)
+    assert wrapper.has_pending_operations()
+    with pytest.raises(ExternalLinkerCleanupError, match="quarantined"):
+        wrapper.match(_KEY, req, _empty_match())
+    with pytest.raises(ExternalLinkerCleanupError):
+        wrapper.reset()  # never retries the free
 
 
 if __name__ == "__main__":

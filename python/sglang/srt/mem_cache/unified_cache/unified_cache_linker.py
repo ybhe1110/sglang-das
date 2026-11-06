@@ -22,12 +22,16 @@ reaches nothing but its own requests, which the scheduler aborts.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
+import zlib
 from dataclasses import replace
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
+from contextlib import contextmanager
+from copy import copy
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -134,6 +138,31 @@ class LayerWiseLoadCounter:
 
 class ExternalLinkerLoadError(RuntimeError):
     """A recoverable external-cache load failure for the current batch."""
+
+
+class ExternalLinkerCleanupError(RuntimeError):
+    """Allocator ownership is uncertain; only process teardown is safe."""
+
+
+_INT63_MASK = (1 << 63) - 1
+_MATCH_PHASE = 0x4D41544348  # "MATCH"
+_LOAD_PHASE = 0x4C4F4144  # "LOAD"
+
+
+def _collective_error(message: str) -> RuntimeError:
+    # Imported lazily: disaggregation.utils reaches server_args, which the
+    # cache layer must not import at module load.
+    from sglang.srt.disaggregation.utils import DisaggregationCollectiveError
+
+    return DisaggregationCollectiveError(message)
+
+
+def _rid_digest(rid) -> tuple[int, int]:
+    digest = hashlib.blake2b(str(rid).encode("utf-8"), digest_size=16).digest()
+    return (
+        int.from_bytes(digest[:8], "little") & _INT63_MASK,
+        int.from_bytes(digest[8:], "little") & _INT63_MASK,
+    )
 
 
 class UnifiedCacheLinker(ABC):
@@ -258,6 +287,22 @@ class _PendingOffload(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+class _PrivateLoad(NamedTuple):
+    """A queued or in-flight load whose device slots belong to one request.
+
+    The slots are request-private from ``load_back`` on. ``bound`` is set only
+    after ``alloc_for_extend`` has written the prefix into the request's KV
+    row; until then the request's normal release cannot reach the slots, so a
+    rollback has to free them through the component ABORT phase instead.
+    """
+
+    req: Req
+    prev_prefix_len: int
+    prefix_len: int
+    transfers: list[tuple[TreeComponent, PoolTransfer]]
+    bound: bool = False
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -298,6 +343,14 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_rids: list[str] = []
         # Loaded tails stay outside the tree until their forward completes.
         self.private_load_indices: dict[str, torch.Tensor] = {}
+        # The component transfers behind each private tail: needed to roll a
+        # load back when a later admission gate rejects its request, before
+        # any KV row owns the slots.
+        self.private_loads: dict[str, _PrivateLoad] = {}
+        # A component ABORT that raised may have freed only part of a pool.
+        # Never retry it; keep the descriptors so teardown can report them.
+        self.cleanup_quarantine: dict[str, dict] = {}
+        self._match_sequence = 0
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
@@ -321,11 +374,94 @@ class UnifiedCacheLinkerWrapper:
             or self.inflight_load_rids
             or self.private_load_indices
             or self.pending_offloads
+            or self.cleanup_quarantine
         )
+
+    def _raise_if_cleanup_quarantined(self) -> None:
+        if self.cleanup_quarantine:
+            raise ExternalLinkerCleanupError(
+                "external KV cleanup quarantined; process teardown required: "
+                f"rids={list(self.cleanup_quarantine)}"
+            )
+
+    @contextmanager
+    def load_back_admission(self, req: Req, admitted_reqs: list[Req]):
+        """Roll a private load back if a later admission gate rejects ``req``.
+
+        ``init_load_back`` queues the load and extends the request's prefix
+        before the re-selection and shard gates run. A request those gates
+        reject stays in the waiting queue while the backend is about to write
+        into its slots, so the load is cancelled here. Only a positive cancel
+        result proves the slots are untouched; otherwise the descriptor is
+        retained and the scheduler must stop.
+        """
+        self._raise_if_cleanup_quarantined()
+        if req.rid in self.private_loads:
+            raise ExternalLinkerCleanupError(
+                f"external KV admission still owns a private load: rid={req.rid}"
+            )
+        prefix_len = req.prefix_len
+        last_node = req.last_node
+        host_loaded_length = getattr(req, "host_loaded_length", 0)
+        swa_branching_seqlen = getattr(req, "swa_branching_seqlen", None)
+        kv = copy(req.kv) if getattr(req, "kv", None) is not None else None
+        try:
+            yield
+        finally:
+            admitted = any(candidate is req for candidate in admitted_reqs)
+            private = None if admitted else self.private_loads.get(req.rid)
+            if private is not None:
+                self._raise_if_cleanup_quarantined()
+                if private.bound or not self.cache_linker.cancel_queued_load(
+                    req.rid
+                ):
+                    # A worker may already be writing; neither a rematch nor
+                    # a timed wait is a fence. Keep the descriptor and slots.
+                    raise ExternalLinkerCleanupError(
+                        "cannot cancel unadmitted external KV load; "
+                        f"private slots retained: rid={req.rid}"
+                    )
+                self.private_loads.pop(req.rid)
+                if req.rid in self.inflight_load_rids:
+                    self.inflight_load_rids.remove(req.rid)
+                self._abort_private_load(req.rid, private)
+                # PREPARE may have created ReqKvInfo or advanced its SWA
+                # boundary, and admission advanced the prefix. Restore the
+                # request to its pre-load view for the next scheduling round.
+                req.prefix_len = prefix_len
+                req.last_node = last_node
+                req.host_loaded_length = host_loaded_length
+                req.swa_branching_seqlen = swa_branching_seqlen
+                req.kv = kv
+                self.hit_markers.pop(req.rid, None)
+
+    def bind_private_load(self, req: Req) -> None:
+        """Record the request-row owner once its prefix indices are written."""
+        private = self.private_loads.get(req.rid)
+        if private is None:
+            return
+        kv = getattr(req, "kv", None)
+        if (
+            private.req is not req
+            or kv is None
+            or kv.req_pool_idx is None
+            or req.prefix_len < private.prefix_len
+            or kv.kv_allocated_len < private.prefix_len
+        ):
+            raise ExternalLinkerCleanupError(
+                f"external KV request-row handoff is incomplete: rid={req.rid}"
+            )
+        self.private_loads[req.rid] = private._replace(bound=True)
 
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        self._raise_if_cleanup_quarantined()
+        private = self.private_loads.get(req.rid)
+        if private is not None and not private.bound:
+            raise ExternalLinkerCleanupError(
+                f"cannot rematch unbound external KV slots: rid={req.rid}"
+            )
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -339,36 +475,38 @@ class UnifiedCacheLinkerWrapper:
             key = key[:known_hit_len]
         elif cache.pp_size > 1:
             if cache.pp_rank != 0:
+                # Uniform per stage: every rank of this stage returns here.
                 req.external_cache_hit_length = 0
                 return result
             # The local device hit is part of PP0's canonical restorable
             # boundary even when the external tail lookup misses.
             req.external_cache_hit_length = device_hit_len
 
-        if device_hit_len >= len(key):
-            if prefetched_hit is not None:
-                self.cancel_waiting_queue_prefetch(req.rid)
-            return result
-
-        tail_hashes = self._tail_hashes(key, result, device_hit_len)
-        if not tail_hashes:
-            if prefetched_hit is not None:
-                self.cancel_waiting_queue_prefetch(req.rid)
-            return result
-
+        # Local facts only, with no early return: a full local hit, a missing
+        # hash anchor, a component that cannot build a lookup transfer and a
+        # reusable prefetch are all rank-local, while every rank of the
+        # attention group must reach the collectives below in the same order.
+        # The fixed-size preflight carries those facts to the group first.
+        tail_hashes = (
+            self._tail_hashes(key, result, device_hit_len)
+            if device_hit_len < len(key)
+            else []
+        )
         lookup_transfers = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
-            )
-            if transfer is None:
-                if prefetched_hit is not None:
-                    self.cancel_waiting_queue_prefetch(req.rid)
-                return result
-            lookup_transfers.append(transfer)
-        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
+        local_valid = bool(tail_hashes)
+        if local_valid:
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, tail_hashes
+                )
+                if transfer is None:
+                    local_valid = False
+                    lookup_transfers = []
+                    break
+                lookup_transfers.append(transfer)
 
-        if prefetched_hit is not None:
+        reusable = False
+        if prefetched_hit is not None and local_valid:
             expected_len = (
                 prefetched_hit.device_hit_len + len(prefetched_hit.tail_hashes) * page
             )
@@ -386,6 +524,32 @@ class UnifiedCacheLinkerWrapper:
                 == prefetched_hit.tail_hashes
                 and same_prefix
             )
+
+        if known_hit_len is None:
+            valid, common_tail_pages, reusable = self._match_preflight(
+                req.rid,
+                key_len=len(key),
+                device_hit_len=device_hit_len,
+                tail_pages=len(tail_hashes),
+                local_valid=local_valid,
+                reusable=reusable,
+            )
+            if not valid:
+                if prefetched_hit is not None:
+                    self.cancel_waiting_queue_prefetch(req.rid)
+                return result
+            # Geometry agreed, so this is a no-op; keep the negotiated bound so
+            # a future backend cannot produce different mask lengths.
+            tail_hashes = tail_hashes[:common_tail_pages]
+        elif not local_valid:
+            # A rematch under PP reuses the boundary PP0 agreed on and runs no
+            # collective here, so a local miss is final on this rank.
+            if prefetched_hit is not None:
+                self.cancel_waiting_queue_prefetch(req.rid)
+            return result
+        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
+
+        if prefetched_hit is not None:
             if reusable:
                 hit_pages = len(prefetched_hit.tail_hashes)
                 hit_tokens = hit_pages * page
@@ -446,6 +610,103 @@ class UnifiedCacheLinkerWrapper:
             ),
         )
 
+    def _match_preflight(
+        self,
+        rid: str,
+        *,
+        key_len: int,
+        device_hit_len: int,
+        tail_pages: int,
+        local_valid: bool,
+        reusable: bool,
+    ) -> tuple[bool, int, bool]:
+        """Agree on the match geometry before any variable-size collective.
+
+        One MIN reduction over value/negation pairs yields the group minimum
+        and maximum of every field. Geometry (key length, device hit, tail
+        pages) and identity (RID digest, match sequence, phase) must agree: a
+        mismatch means the ranks are matching different prefixes or different
+        requests, and the forward collectives would then consume different KV
+        layouts, so it is fatal. Validity and prefetch reuse may differ: the
+        external lookup is then skipped on every rank, costing a recompute.
+
+        Returns ``(valid, tail_pages, reusable)``, identical on every rank.
+        """
+        sequence = self._match_sequence
+        self._match_sequence = sequence + 1
+        digest_lo, digest_hi = _rid_digest(rid)
+        values = [
+            key_len,
+            device_hit_len,
+            tail_pages,
+            int(local_valid),
+            int(reusable),
+            digest_lo,
+            digest_hi,
+            sequence,
+            _MATCH_PHASE,
+        ]
+        payload = torch.tensor(
+            [item for value in values for item in (value, -value)], dtype=torch.int64
+        )
+        self.cache._all_reduce_attn_groups(payload, torch.distributed.ReduceOp.MIN)
+        lo = payload[0::2].tolist()
+        hi = [-value for value in payload[1::2].tolist()]
+
+        if any(lo[i] != hi[i] for i in (5, 6, 7, 8)):
+            logger.error(
+                "External KV match identity mismatch: rid=%s sequence=%d "
+                "min=%s max=%s",
+                rid,
+                sequence,
+                lo[5:],
+                hi[5:],
+            )
+            raise _collective_error(
+                "external KV match RID/sequence/phase differs across ranks"
+            )
+        if any(lo[i] != hi[i] for i in (0, 1, 2)):
+            logger.error(
+                "External KV match geometry mismatch: rid=%s "
+                "local=(key_len=%d,device_hit_len=%d,tail_pages=%d) "
+                "group=(key_len=[%d,%d],device_hit_len=[%d,%d],tail_pages=[%d,%d])",
+                rid,
+                key_len,
+                device_hit_len,
+                tail_pages,
+                lo[0],
+                hi[0],
+                lo[1],
+                hi[1],
+                lo[2],
+                hi[2],
+            )
+            raise _collective_error("external KV match geometry differs across ranks")
+
+        if lo[3] != 1:
+            if lo[2] == 0:
+                # Every rank has a complete local hit or no page-aligned tail:
+                # a normal no-op, but only after the preflight; returning
+                # earlier would desynchronize the peers.
+                return False, 0, False
+            if hi[3] == 1:
+                logger.warning(
+                    "External KV match preflight rejected: rid=%s key_len=%d "
+                    "device_hit_len=%d tail_pages=%d: valid on some ranks only",
+                    rid,
+                    key_len,
+                    device_hit_len,
+                    tail_pages,
+                )
+            else:
+                logger.debug(
+                    "External KV match skipped on every rank: rid=%s tail_pages=%d",
+                    rid,
+                    tail_pages,
+                )
+            return False, 0, False
+        return True, lo[2], lo[4] == 1
+
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
     ) -> int:
@@ -490,10 +751,18 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> request-private device slots ----
 
     def load_back(self, req: Req) -> tuple[int, NodeId]:
+        self._raise_if_cleanup_quarantined()
+        if req.rid in self.private_loads:
+            raise ExternalLinkerCleanupError(
+                f"external KV load already has an owner: rid={req.rid}"
+            )
         cache = self.cache
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return 0, req.last_node
+        # A new load: the SWA ABORT ownership bit of any earlier load of this
+        # request is stale, and a stale True would skip the next ABORT's free.
+        req.external_kv_private_swa_slots_released = False
 
         prepared_from_host_prefetch = False
         prefetched = self.host_prefetch_hits.pop(req.rid, None) is not None
@@ -668,6 +937,9 @@ class UnifiedCacheLinkerWrapper:
         ):
             req.swa_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
+        self.private_loads[req.rid] = _PrivateLoad(
+            req, device_hit_len, prefix_len, component_transfers
+        )
         self.inflight_load_rids.append(req.rid)
         return len(full_transfer.device_indices), req.last_node
 
@@ -680,20 +952,83 @@ class UnifiedCacheLinkerWrapper:
     ) -> list[PoolTransfer]:
         if not component_transfers:
             return []
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            return self._abort_transfers_with_quarantine(
+                req, component_transfers, prefix_len
+            )
         full = component_transfers[0][1]
         result = []
-        transfers = (
-            reversed(component_transfers)
-            if phase == ExternalLinkerLoadPhase.ABORT
-            else component_transfers
-        )
-        for component, transfer in transfers:
+        for component, transfer in component_transfers:
             transfer = component.update_external_linker_load(
                 phase, req, full, transfer, prefix_len
             )
             if transfer is not None:
                 result.append(transfer)
         return result
+
+    def _abort_transfers_with_quarantine(
+        self,
+        req: Req,
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]],
+        prefix_len: int,
+    ) -> list[PoolTransfer]:
+        """Free the components in reverse order; quarantine an ambiguous free.
+
+        A component that raises mid-ABORT may have returned part of its range
+        to the allocator. Retrying would double-free it, so the descriptors
+        are retained with each component's outcome and every later linker
+        operation refuses to run until the process is torn down.
+        """
+        self._raise_if_cleanup_quarantined()
+        full = component_transfers[0][1]
+        states = ["not_attempted"] * len(component_transfers)
+        for index in reversed(range(len(component_transfers))):
+            component, transfer = component_transfers[index]
+            states[index] = "uncertain"
+            try:
+                component.update_external_linker_load(
+                    ExternalLinkerLoadPhase.ABORT, req, full, transfer, prefix_len
+                )
+            except BaseException as error:
+                # Keep the tensor references alive; never retry, even on close.
+                self.cleanup_quarantine[req.rid] = {
+                    "req": req,
+                    "transfers": component_transfers,
+                    "prefix_len": prefix_len,
+                    "states": tuple(states),
+                }
+                component_slots = [
+                    (
+                        str(t.name),
+                        int(t.device_indices.numel())
+                        if t.device_indices is not None
+                        else 0,
+                        states[i],
+                    )
+                    for i, (_, t) in enumerate(component_transfers)
+                ]
+                logger.exception(
+                    "External KV release quarantined: rid=%s prefix_len=%d "
+                    "components=(pool,slots,state)=%s; process teardown required",
+                    req.rid,
+                    prefix_len,
+                    component_slots,
+                )
+                raise ExternalLinkerCleanupError(
+                    f"external KV release uncertain for rid={req.rid}"
+                ) from error
+            states[index] = "released"
+        return []
+
+    def _abort_private_load(self, rid: str, private: _PrivateLoad) -> None:
+        """Free a cancelled load's slots: no KV row references them yet."""
+        self.private_load_indices.pop(rid, None)
+        self._update_load(
+            ExternalLinkerLoadPhase.ABORT,
+            private.req,
+            private.transfers,
+            private.prefix_len,
+        )
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 
@@ -759,8 +1094,52 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def start_layer_wise_loading(self) -> int:
+        unbound = [
+            rid for rid, private in self.private_loads.items() if not private.bound
+        ]
+        if unbound:
+            # The scheduler writes every admitted request's KV row before
+            # starting the batch's loads; a load with no row owner here is
+            # one the admission rollback missed.
+            raise ExternalLinkerCleanupError(
+                f"cannot start external KV loads without a row owner: rids={unbound}"
+            )
         self.inflight_load_index = self.cache_linker.start_layer_wise_loading()
         return self.inflight_load_index
+
+    def _preflight_inflight_loads(self, rids: Sequence[str]) -> None:
+        """Agree on which requests the next verdict is for.
+
+        The backend completion is local and carries no identity, so two ranks
+        could reduce a success bit that belongs to different requests. A fixed
+        eight-value payload (count, ordered digest, XOR digest, phase, each
+        with its negation) catches a count, order or membership difference
+        before the variable request state is committed.
+        """
+        encoded = [zlib.crc32(str(rid).encode("utf-8")) & 0x7FFFFFFF for rid in rids]
+        ordered = 0
+        xor = 0
+        for value in encoded:
+            ordered = ((ordered * 16777619) ^ value) & 0x7FFFFFFF
+            xor ^= value
+        values = [len(encoded), ordered, xor, _LOAD_PHASE]
+        payload = torch.tensor(
+            [item for value in values for item in (value, -value)], dtype=torch.int64
+        )
+        self.cache._all_reduce_attn_groups(payload, torch.distributed.ReduceOp.MIN)
+        lo = payload[0::2].tolist()
+        hi = [-value for value in payload[1::2].tolist()]
+        if lo != hi:
+            logger.error(
+                "External linker load batch differs across ranks: local=%s "
+                "reduced_min=%s reduced_max=%s",
+                list(rids),
+                lo,
+                hi,
+            )
+            raise _collective_error(
+                "external linker load batch RID/order differs across ranks"
+            )
 
     def finish_loads(self) -> list[str]:
         """Wait for the loads of the batch that just ran; return the rids whose
@@ -768,21 +1147,34 @@ class UnifiedCacheLinkerWrapper:
 
         Runs after that batch's forward, so no slot it wrote to has been freed
         or inserted yet. Every rank holds the same ``inflight_load_rids``
-        because ``match`` reduces the hit across ranks, so either all ranks or
-        none enter the reduction. The verdict is reduced because an MLA dedup
-        peer only receives the broadcast and never sees the source's error.
+        because ``match`` agrees on the hit across ranks, so either all ranks
+        or none enter the reductions; the empty case therefore stays local,
+        which keeps decode steps free of collectives. The verdict is reduced
+        because an MLA dedup peer only receives the broadcast and never sees
+        the source's error.
         """
         rids, self.inflight_load_rids = self.inflight_load_rids, []
         if not rids:
             return []
         index, self.inflight_load_index = self.inflight_load_index, -1
+        self._preflight_inflight_loads(rids)
         landed = torch.tensor(
             [int(self.cache_linker.finish_layer_wise_loading(index))],
             dtype=torch.int,
         )
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
+        unbound = []
         for rid in rids:
             self.private_load_indices.pop(rid, None)
+            private = self.private_loads.pop(rid, None)
+            if private is not None and not private.bound:
+                unbound.append(rid)
+        if unbound:
+            # Its slots were read into but no KV row ever claimed them, so the
+            # normal request release cannot return them.
+            raise ExternalLinkerCleanupError(
+                f"completed external KV load has no request-row owner: rids={unbound}"
+            )
         if landed.item():
             return []
         logger.error(
@@ -793,6 +1185,7 @@ class UnifiedCacheLinkerWrapper:
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        self._raise_if_cleanup_quarantined()
         self.cache_linker.reset()
         for rid in list(self.pending_host_prefetch_submissions):
             self.cancel_waiting_queue_prefetch(rid)
@@ -800,6 +1193,7 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
+        self.private_loads.clear()
         self.inflight_load_index = -1
         self._release_pending_offloads()
 
@@ -812,17 +1206,30 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
+        self._raise_if_cleanup_quarantined()
         self.cancel_waiting_queue_prefetch(rid)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
             self.inflight_load_rids.remove(rid)
+            private = self.private_loads.pop(rid, None)
+            if private is not None and not private.bound:
+                # No KV row references these slots yet, so the request's own
+                # release cannot return them; free them here instead.
+                self._abort_private_load(rid, private)
             self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
+        if self.cleanup_quarantine:
+            logger.error(
+                "Closing the external linker with quarantined releases: rids=%s; "
+                "their device slots were never returned",
+                list(self.cleanup_quarantine),
+            )
         self.cache_linker.close()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
+        self.private_loads.clear()
         self._release_pending_offloads()
 
     def get_host_prefetch_admission_state(self, rid: str) -> str:
