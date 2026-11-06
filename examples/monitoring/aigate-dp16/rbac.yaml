@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sglang-discovery
+  namespace: aiservice
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sglang-discovery
+  namespace: aiservice
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sglang-discovery
+  namespace: aiservice
+subjects:
+  - kind: ServiceAccount
+    name: sglang-discovery
+    namespace: aiservice
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sglang-discovery

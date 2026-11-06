@@ -121,6 +121,11 @@ are not silently swallowed. The counter is internal, not a `/metrics` export.
 
 ## Aigate integration requirements
 
+For persistent Kubernetes rank registration and dynamic Prometheus targets, use
+the [DP16 discovery reconciler and acceptance checks](../examples/monitoring/aigate-dp16/README.md).
+They cover the missing rank8 registration, Pod rescheduling, stale scrape-role
+labels, and before/after request-counter and histogram validation.
+
 The 129.1 cluster's Aigate EPP discovers one named `sglang-http` port per
 selected Pod. In the original deployment only the D leader's base port was
 registered. Requests to that listener went to DP0. See the

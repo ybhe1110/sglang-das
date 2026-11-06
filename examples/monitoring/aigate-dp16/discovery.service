@@ -1,0 +1,20 @@
+[Unit]
+Description=Aigate DP16 registrations and SGLang Prometheus discovery
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=sglang-discovery
+Environment=KUBECONFIG=/etc/sglang-discovery/kubeconfig
+EnvironmentFile=/etc/sglang-discovery/discovery.env
+WorkingDirectory=/opt/sglang
+ExecStart=/usr/bin/python3 /opt/sglang/scripts/reconcile_aigate_dp16.py --namespace ${NAMESPACE} --engine-group ${ENGINE_GROUP} --name-prefix ${NAME_PREFIX} --router-group ${ROUTER_GROUP} --transfer-group ${TRANSFER_GROUP} --model ${MODEL} --pause-image ${PAUSE_IMAGE} --base-port ${BASE_PORT} --output-dir /var/lib/sglang-discovery --apply --watch 15
+StateDirectory=sglang-discovery
+StateDirectoryMode=0755
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

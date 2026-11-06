@@ -4,6 +4,10 @@ In the 129.1 cluster's 32K/C128 run, Aigate registered one decode endpoint and a
 
 ## Register each decode listener
 
+For ongoing deployments, prefer the [Pod-aware reconciler](../../../examples/monitoring/aigate-dp16/README.md).
+The static command below reproduces the original benchmark layout only: it assumes
+both engine Pods already advertise rank0/rank8 and does not follow rescheduling.
+
 Rust binds each decode ingress to `base_port + global_dp_rank` and submits requests to its local scheduler. EPP in this deployment discovers the port named `sglang-http` on each selected Pod. With only the leader's port in the registry, sending to that address repeatedly selects the same rank.
 
 For the tested two-node, host-network deployment, advertise the following ports:

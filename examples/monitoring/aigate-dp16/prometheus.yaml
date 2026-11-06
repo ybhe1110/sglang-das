@@ -1,0 +1,10 @@
+# Replace the old static `sglang` job; do not run both against the same registry.
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: sglang
+    metrics_path: /metrics
+    file_sd_configs:
+      - files:
+          - /var/lib/sglang-discovery/sglang-targets.json
+        refresh_interval: 15s
