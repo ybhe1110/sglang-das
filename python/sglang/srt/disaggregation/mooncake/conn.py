@@ -794,6 +794,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         except Exception:
             logger.exception("Failed to close mooncake server_socket during teardown")
 
+        # ack_wakeup sockets are created from _zmq_ctx but are not in
+        # _socket_cache, so close them explicitly before tearing the context
+        # down rather than relying on destroy() to reap them.
+        pd_hidden = getattr(self, "pd_hidden_events", None)
+        if pd_hidden is not None:
+            for attr in ("ack_wakeup_receiver", "ack_wakeup_sender"):
+                sock = getattr(pd_hidden, attr, None)
+                if sock is not None:
+                    try:
+                        sock.close(linger=0)
+                    except Exception:
+                        pass
+                    setattr(pd_hidden, attr, None)
+
         # destroy() force-closes every socket in the context; plain term()
         # would block waiting on them.
         try:
