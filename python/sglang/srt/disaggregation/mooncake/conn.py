@@ -4368,12 +4368,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self, notification: AbortNotification, room_active: bool
     ) -> None:
         room = notification.room
-        if room_active or self._staging_outstanding.get(room, 0) > 0:
-            self.update_status(room, KVPoll.Failed)
-            self._wake_pd_hidden_ack_waiters(room)
-
         ack_target = notification.deferred_ack_target()
         if ack_target is None:
+            # Unattributable ABORT: a prealloc abort that never armed (no
+            # generation), or a peer with no usable return address. There is no
+            # receiver identity to validate, so keep the legacy contract and
+            # latch an active room; only attributable ABORTs are matched
+            # against the room lifecycle below.
+            if room_active or self._staging_outstanding.get(room, 0) > 0:
+                self.update_status(room, KVPoll.Failed)
+                self._wake_pd_hidden_ack_waiters(room)
             return
         if notification.bootstrap_pair_key is not None:
             self._cancel_paired_source(
@@ -4403,9 +4407,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # decode reuse addresses that a later sender could consume.
                 # Decode keeps the destination and retries the same identity.
                 return
-            status = self.request_status.get(room)
-            if status is not None and status != KVPoll.Success:
+            if room_active or self._staging_outstanding.get(room, 0) > 0:
                 self.update_status(room, KVPoll.Failed)
+                self._wake_pd_hidden_ack_waiters(room)
             self.register_deferred_ack_target(room, ack_target)
         self._maybe_ack_drained_abort(room)
 

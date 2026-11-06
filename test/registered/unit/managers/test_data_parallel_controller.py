@@ -57,7 +57,7 @@ def _make_controller(num_dp_ranks: int) -> DataParallelController:
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
-    ctl.dp_budget = DPBudget(num_dp_ranks=num_dp_ranks)
+    ctl.dp_budget = DPBudget(dp_size=num_dp_ranks)
     return ctl
 
 
@@ -291,7 +291,7 @@ class TestLocalKvEventSources(CustomTestCase):
 
 class TestDPBudgetUpdateBudget(CustomTestCase):
     def test_maps_running_plus_waiting_to_total_requests(self):
-        budget = DPBudget(num_dp_ranks=2)
+        budget = DPBudget(dp_size=2)
         budget.update_budget(
             [
                 _load(dp_rank=0, timestamp=1.0, num_running_reqs=3, num_waiting_reqs=2),
@@ -301,7 +301,7 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.total_requests, [5, 6])
 
     def test_maps_num_total_tokens_not_num_used_tokens(self):
-        budget = DPBudget(num_dp_ranks=2)
+        budget = DPBudget(dp_size=2)
         budget.update_budget(
             [
                 _load(
@@ -315,7 +315,7 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.total_tokens, [150, 80])
 
     def test_partial_update_only_affects_reported_rank(self):
-        budget = DPBudget(num_dp_ranks=3)
+        budget = DPBudget(dp_size=3)
         budget.update_budget(
             [
                 _load(
@@ -348,7 +348,7 @@ class TestDPBudgetDispatch(CustomTestCase):
     """DPBudget.dispatch picks a rank from current state and updates counters."""
 
     def test_total_requests_dispatch_picks_min_and_increments(self):
-        budget = DPBudget(num_dp_ranks=3)
+        budget = DPBudget(dp_size=3)
         budget.total_requests = [4, 2, 7]
         rank = budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
         self.assertEqual(rank, 1)
@@ -359,7 +359,7 @@ class TestDPBudgetDispatch(CustomTestCase):
         )
 
     def test_total_tokens_dispatch_applies_estimated_tokens(self):
-        budget = DPBudget(num_dp_ranks=3)
+        budget = DPBudget(dp_size=3)
         budget.total_tokens = [100, 50, 200]
         budget.total_requests = [0, 0, 0]
         rank = budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=30)
@@ -376,7 +376,7 @@ class TestDPBudgetDispatch(CustomTestCase):
         )
 
     def test_total_tokens_tie_breaks_on_total_requests(self):
-        budget = DPBudget(num_dp_ranks=3)
+        budget = DPBudget(dp_size=3)
         budget.total_tokens = [50, 50, 50]
         budget.total_requests = [4, 2, 7]
         rank = budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=10)
@@ -387,7 +387,7 @@ class TestDPBudgetDispatch(CustomTestCase):
     def test_dispatch_returns_none_for_methods_not_handled(self):
         """Round-robin and follow_bootstrap_room dispatch elsewhere; DPBudget
         only handles the load-aware variants."""
-        budget = DPBudget(num_dp_ranks=3)
+        budget = DPBudget(dp_size=3)
         self.assertIsNone(budget.dispatch(LoadBalanceMethod.ROUND_ROBIN))
         self.assertIsNone(budget.dispatch(LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM))
 

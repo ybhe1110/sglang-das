@@ -1093,14 +1093,20 @@ class PrefillBootstrapQueue:
             )
 
         bootstrapped_reqs = []
-        indices_to_remove = set()
+        failed_reqs = []
 
-        if len(self.queue) == 0:
-            return []
+        # Settle the candidate list before any variable-length collective: each
+        # rank admits and drops requests on local facts, so an unaligned queue
+        # would make the poll and resource reductions below diverge in length.
+        requests = self.queue if self.pp_size > 1 else self._aligned_bootstrap_requests()
+        if not requests:
+            if return_failed_reqs is False:
+                return []
+            return [], []
 
         if self.pp_size > 1:
             polls = poll_and_all_reduce_prefill_pp(
-                [req.disagg_kv_sender for req in self.queue],
+                [req.disagg_kv_sender for req in requests],
                 self.scheduler.attn_cp_cpu_group,
                 self.scheduler.attn_tp_cpu_group,
                 self.scheduler.pp_group,
@@ -1110,20 +1116,25 @@ class PrefillBootstrapQueue:
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
-                [req.disagg_kv_sender for req in self.queue],
+                [req.disagg_kv_sender for req in requests],
                 self.scheduler.attn_cp_cpu_group,
                 self.scheduler.attn_tp_cpu_group,
             )
 
-        resource_ready = self._get_consensus_bootstrap_resource_ready(
-            self.queue, polls
-        )
+        resource_ready = self._get_consensus_bootstrap_resource_ready(requests, polls)
 
-        for i, (req, poll) in enumerate(zip(self.queue, polls)):
+        for i, (req, poll) in enumerate(zip(requests, polls)):
+            if poll is None:
+                continue
             if poll == KVPoll.Failed:
                 self.scheduler.handle_bootstrap_failure(req)
-                indices_to_remove.add(i)
+                failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
+                if not resource_ready[i]:
+                    # The vote already reserved this rank's metadata buffer for
+                    # the optimistic forward; admitting locally without it lets
+                    # queue contents diverge across ranks.
+                    continue
                 if self._requires_pd_hidden_transfer(req):
                     # PD hidden must be captured for every prefill chunk.
                     # Do not run optimistic forward before hidden rows and
@@ -1134,7 +1145,6 @@ class PrefillBootstrapQueue:
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
                     bootstrapped_reqs.append(req)
-                    indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
                     req.arrival_processed_tokens = (
                         self.scheduler.processed_tokens_counter
@@ -1149,7 +1159,6 @@ class PrefillBootstrapQueue:
                 elif req.pending_bootstrap and not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
-                indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
                 req.arrival_processed_tokens = self.scheduler.processed_tokens_counter
             else:
@@ -1157,11 +1166,15 @@ class PrefillBootstrapQueue:
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
                 )
 
-        self.queue = [
-            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
-        ]
+        # ``requests`` is a subset of ``self.queue``, so positions no longer map
+        # back; drop by object identity to keep the survivors and their order.
+        if bootstrapped_reqs or failed_reqs:
+            removed = {id(req) for req in bootstrapped_reqs + failed_reqs}
+            self.queue = [req for req in self.queue if id(req) not in removed]
 
-        return bootstrapped_reqs
+        if return_failed_reqs is False:
+            return bootstrapped_reqs
+        return bootstrapped_reqs, failed_reqs
 
     def _pop_bootstrapped_hcu_pp(
         self,
