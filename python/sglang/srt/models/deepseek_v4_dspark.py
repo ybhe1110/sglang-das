@@ -27,6 +27,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization import dsv41_channelwise_fp8 as channelwise_fp8
+from sglang.srt.layers.quantization import w8a8_int8 as channelwise_int8
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -462,7 +463,11 @@ class DSparkAttention(MqaAttentionBase):
             o.shape[1] * o.shape[2] // self.n_local_groups,
         )
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        if self.wo_a_channelwise_fp8:
+        if self.wo_a_int8:
+            o = channelwise_int8.grouped(
+                o, self.wo_a, self.n_local_groups, self.o_lora_rank
+            )
+        elif self.wo_a_channelwise_fp8:
             o = channelwise_fp8.grouped(
                 o, self.wo_a, self.n_local_groups, self.o_lora_rank
             )
@@ -593,10 +598,13 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
     ) -> torch.Tensor:
         if isinstance(
             getattr(self.markov_w2, "quant_method", None),
-            channelwise_fp8.ChannelwiseFp8Method,
+            (
+                channelwise_fp8.ChannelwiseFp8Method,
+                channelwise_int8.ChannelwiseInt8Method,
+            ),
         ):
             if weight is not None:
-                raise ValueError("FP8 Markov slices require matching scale offsets")
+                raise ValueError("Quantized Markov slices require matching scale offsets")
             dtype = torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
             return self.markov_w2.quant_method.apply(
                 self.markov_w2, latent_states.to(dtype)
@@ -622,6 +630,21 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             shard.org_vocab_start : shard.org_vocab_end
         ]
         if isinstance(
+            getattr(self.markov_w2, "quant_method", None),
+            channelwise_int8.ChannelwiseInt8Method,
+        ):
+            bias = channelwise_int8.linear(
+                latent,
+                weight_local,
+                self.markov_w2.weight_scale[
+                    shard.org_vocab_start : shard.org_vocab_end
+                ],
+                output_dtype=torch.bfloat16
+                if self._opt_markov_w2_bf16
+                else torch.float32,
+            )
+            return bias, state
+        elif isinstance(
             getattr(self.markov_w2, "quant_method", None),
             channelwise_fp8.ChannelwiseFp8Method,
         ):
@@ -965,6 +988,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_rank=int(dspark_config.markov_rank),
             is_dsv41=getattr(config, "model_type", None) == "deepseek_v41",
         )
+        if (
+            getattr(config, "model_type", None) == "deepseek_v41"
+            and channelwise_int8.enabled(
+                self.markov_head.markov_w2,
+                quant_config,
+                add_prefix("markov_head.head", prefix),
+            )
+        ):
+            channelwise_int8.install(self.markov_head.markov_w2)
         if channelwise_fp8.enabled(quant_config):
             channelwise_fp8.install(self.markov_head.markov_w2)
         self.confidence_head = build_dspark_v4_confidence_head(
@@ -1012,7 +1044,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
         from sglang.srt.speculative.draft_lm_head_vp import (
             DSparkLMHeadVocabParallel,
-            channelwise_fp8_lm_head_scale,
+            channelwise_lm_head_scale,
         )
 
         if self._use_fp32_lm_head:
@@ -1022,12 +1054,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
         if self.lm_head is None or int(self.lm_head.tp_size) != 1:
             raise ValueError("DSPARK draft VP requires a replicated DP LM-head.")
-        head_scale = channelwise_fp8_lm_head_scale(self.lm_head)
+        head_scale = channelwise_lm_head_scale(self.lm_head)
         if head_scale is None and should_apply_lm_head_quant_method(
             self.lm_head, self.lm_head.quant_method
         ):
             raise ValueError(
-                "DSPARK draft VP supports only unquantized or channelwise-FP8 LM-heads."
+                "DSPARK draft VP supports unquantized, channelwise-FP8 or channelwise-INT8 LM-heads."
             )
         self.draft_lm_head_vp = DSparkLMHeadVocabParallel(
             full_weight=self.lm_head.weight,
@@ -1294,7 +1326,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return draft_vp.project_logits(x, padded_rows=vp_padded_rows)
         if self._use_fp32_lm_head and isinstance(
             getattr(self.lm_head, "quant_method", None),
-            channelwise_fp8.ChannelwiseFp8Method,
+            (
+                channelwise_fp8.ChannelwiseFp8Method,
+                channelwise_int8.ChannelwiseInt8Method,
+            ),
         ):
             local_logits = project_through_lm_head(x.float(), self.lm_head)
         elif self._use_fp32_lm_head and weight.dtype in (

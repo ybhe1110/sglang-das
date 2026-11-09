@@ -1491,6 +1491,7 @@ class Req(ReqDllmMixin):
         # kv_send(req.input_ids[req.start_send_idx:req.extend_end])
         # start_send_idx = req.extend_end
         self.start_send_idx: int = 0
+        self.disagg_page_indices = None
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
@@ -2117,6 +2118,7 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        self.disagg_page_indices = None
 
         self.prefix_len = 0
         self.routed_experts = None
@@ -2935,7 +2937,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
-        self.loc_tensor = torch.tensor([-1], device=self.device)
+        self.loc_tensor = torch.full((1,), -1, dtype=torch.int64, device=self.device)
 
         if get_exec().features.enable_encoder_swa_bounded_replay:
             for req in reqs:
