@@ -371,6 +371,7 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
 STEP_MAX_US = 2_000_000
+LOAD_STALL_REFRESH_S = 0.05
 
 
 def _accumulate_decode_moment(
@@ -405,6 +406,8 @@ class Scheduler(
     SchedulerMlxOverlapMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
+
+    _last_stall_publish_ts: float = float("-inf")
 
     def __init__(
         self,
@@ -4653,10 +4656,15 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
-        # No forward does not mean fully idle: failed transfers can retain KV
-        # and queues for many iterations. Keep their load visible to routing.
-        self.publish_load_snapshot()
         if not self.is_fully_idle():
+            # No forward does not mean fully idle: KV/preallocation waits and
+            # failed transfers can hold queues for many iterations without a
+            # batch result. This path spins without sleeping, so a wall-clock
+            # floor bounds the O(queue) get_loads while routing stays fresh.
+            now = time.monotonic()
+            if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
+                self._last_stall_publish_ts = now
+                self.publish_load_snapshot(force=True)
             return
 
         if self.enable_unified_memory:
@@ -4694,7 +4702,7 @@ class Scheduler(
         # reset token ratio
         self.new_token_ratio_tracker.reset()
 
-        # Publish the idle transition before sleeping regardless of interval.
+        # Publish the idle state so /get_loads and DP balancing do not see stale load.
         self.publish_load_snapshot(force=True)
 
         # sleep until next event

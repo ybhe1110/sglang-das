@@ -159,7 +159,13 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_forward,
+    get_parallel,
+    max_speculative_num_draft_tokens,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -864,7 +870,12 @@ class MqaAttentionBase(nn.Module):
         )
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
-            seqlen=config.max_position_embeddings,
+            # A verify window can extend past the admitted context before
+            # finished requests discard its extra candidates. Target, draft,
+            # compressor and indexer kernels all index this table directly.
+            # Keep the model's context and YaRN scaling parameters unchanged.
+            seqlen=config.max_position_embeddings
+            + (max_speculative_num_draft_tokens() or 0),
             original_seq_len=original_seq_len,
             base=self.rope_base,
             factor=scaling.get("factor", 1.0),

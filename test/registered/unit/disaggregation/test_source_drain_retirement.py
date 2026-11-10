@@ -283,23 +283,46 @@ class TestSourceDrainRetirement(CustomTestCase):
             fixture.env["release_kv_cache"].assert_called_once()
             fixture.env["maybe_release_metadata_buffer"].assert_called_once()
 
-    def test_load_snapshot_updates_without_forward_or_full_idle(self):
-        env = {}
+    def _stalled_scheduler(self, clock, snapshots, state):
+        env = dict(
+            time=SimpleNamespace(monotonic=lambda: clock[0]),
+            LOAD_STALL_REFRESH_S=0.05,
+        )
         cls = load_methods(SCHED, ["on_idle", "publish_load_snapshot"], env)
         s = cls()
-        snapshots = []
+        s._last_stall_publish_ts = float("-inf")
+        # A large decode interval proves the stall publish does not depend on
+        # how many on_idle iterations happen to elapse.
         s.load_snapshot_writer = SimpleNamespace(
-            publish_counter=0, publish_interval=1, write=snapshots.append
+            publish_counter=0, publish_interval=15, write=snapshots.append
         )
         s.maybe_send_health_check_signal = Mock()
         s.is_fully_idle = lambda: False
-        state = {"inflight": 46}
         s.load_inquirer = SimpleNamespace(get_loads=lambda: dict(state))
         s.dp_budget_source = SimpleNamespace(attach=lambda *args: None)
+        return s
+
+    def test_load_snapshot_updates_without_forward_or_full_idle(self):
+        clock, snapshots, state = [100.0], [], {"inflight": 46}
+        s = self._stalled_scheduler(clock, snapshots, state)
         s.on_idle()
         state["inflight"] = 0
+        clock[0] += 0.1
         s.on_idle()
         self.assertEqual(snapshots, [{"inflight": 46}, {"inflight": 0}])
+
+    def test_spinning_stall_publish_is_wall_clock_bounded(self):
+        clock, snapshots, state = [100.0], [], {"inflight": 46}
+        s = self._stalled_scheduler(clock, snapshots, state)
+        for _ in range(100):
+            s.on_idle()
+        self.assertEqual(snapshots, [{"inflight": 46}])
+        clock[0] += 0.049
+        s.on_idle()
+        self.assertEqual(len(snapshots), 1)
+        clock[0] += 0.002
+        s.on_idle()
+        self.assertEqual(len(snapshots), 2)
 
 
 if __name__ == "__main__":

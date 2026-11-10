@@ -10,6 +10,7 @@ from torch import nn
 import sglang.srt.models.deepseek_v4 as deepseek_v4
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -67,14 +68,18 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
             },
         )
 
-    def _make_layer(self, compress_ratio):
+    def _make_layer(self, compress_ratio, *, num_draft_tokens=None, hip=False):
         parallel = SimpleNamespace(attn_tp_rank=0, attn_tp_size=1, tp_size=1)
         device = SimpleNamespace(device=torch.device("cpu"))
         with (
+            get_context().override_server_args(
+                speculative_num_draft_tokens=num_draft_tokens,
+                speculative_adaptive=False,
+            ),
             envs.SGLANG_OPT_FUSE_WQA_WKV.override(False),
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(False),
             patch.object(deepseek_v4, "_FP8_WO_A_GEMM", False),
-            patch.object(deepseek_v4, "_is_hip", False),
+            patch.object(deepseek_v4, "_is_hip", hip),
             patch.object(deepseek_v4, "_is_npu", False),
             patch.object(deepseek_v4, "is_dsa_enable_prefill_cp", return_value=False),
             patch.object(deepseek_v4, "get_parallel", return_value=parallel),
@@ -139,6 +144,36 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
                 if compress_ratio == 4:
                     self.assertIs(layer.indexer.freqs_cis, layer.compressor.freqs_cis)
                     self.assertIs(layer.indexer.rotary_emb, layer.compressor.rotary_emb)
+
+    def test_speculative_lookahead_past_context_has_rope_rows(self):
+        """The last live request must evaluate its entire verify window safely.
+
+        The 1M incident indexed beyond the original RoPE allocation before
+        completion clipping discarded the extra candidates. Exercise that same
+        boundary with a small context, including the HIP-derived cos/sin tables.
+        """
+        positions = torch.arange(126, 132)
+        for compress_ratio in (0, 4, 128):
+            with self.subTest(compress_ratio=compress_ratio):
+                baseline = self._make_layer(compress_ratio)
+                layer = self._make_layer(compress_ratio, num_draft_tokens=6, hip=True)
+                self.assertTrue(
+                    torch.isfinite(layer.freqs_cis.index_select(0, positions)).all()
+                )
+                self.assertTrue(torch.equal(layer.freqs_cis[:128], baseline.freqs_cis))
+                self.assertEqual(layer.freqs_cis.shape[0], 134)
+                for table, expected in (
+                    (layer.cos_cache, layer.freqs_cis.real),
+                    (layer.sin_cache, layer.freqs_cis.imag),
+                ):
+                    actual = table.index_select(0, positions).flatten(1)
+                    torch.testing.assert_close(
+                        actual, expected[positions].to(torch.bfloat16), rtol=0, atol=0
+                    )
+                if compress_ratio:
+                    self.assertIs(layer.compressor.freqs_cis, layer.freqs_cis)
+                if compress_ratio == 4:
+                    self.assertIs(layer.indexer.freqs_cis, layer.freqs_cis)
 
 
 if __name__ == "__main__":
