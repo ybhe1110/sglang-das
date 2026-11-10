@@ -1,20 +1,25 @@
+import json
 import logging
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.managers.utils import compute_spec_context_reserve
+from sglang.srt.runtime_context import get_context, get_parallel, get_spec
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
+class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
-      1. context: input_len + max_new_tokens < max_req_len
+      1. context: input_len + max_new_tokens + spec_context_reserve < max_req_len
       2. admission budget (PrefillAdder):
          ceil_page(input_len) + max_new_tokens + page_size < max_total_num_tokens
       3. env limit: <= SGLANG_MAX_NEW_TOKENS_LIMIT when set and positive
@@ -38,6 +43,9 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         cls._scheduler_logger.setLevel(cls._old_level)
 
     def setUp(self):
+        config = get_context().override_server_args(speculative_algorithm=None)
+        config.install()
+        self.addCleanup(config.restore)
         # The scheduler scales the budget by the live DCP size
         # (`get_parallel().attn_dcp_size`), so the double states a topology
         # rather than publishing a config it does not otherwise need.
@@ -50,11 +58,13 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_req_len: int = 128,
         max_total_num_tokens: int = 1024,
         page_size: int = 1,
+        enable_overlap: bool = True,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
+        scheduler.spec_context_reserve = compute_spec_context_reserve(enable_overlap)
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         return scheduler
 
@@ -81,7 +91,10 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
-            context_ok = input_len + candidate < scheduler.max_req_len
+            context_ok = (
+                input_len + candidate + scheduler.spec_context_reserve
+                < scheduler.max_req_len
+            )
             budget_ok = (
                 paged_input_len + candidate + page_size < scheduler.max_total_num_tokens
             )
@@ -179,6 +192,97 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                                         max_new_tokens=requested, input_len=input_len
                                     )
                                     self._init_and_check(scheduler, req)
+
+    def test_speculative_boundary_inflight_windows(self):
+        """Completion clipping happens after verify and, in overlap, after the
+        next forward is launched. Every final-window phase must stay inside
+        model context even when the pending verify accepts its entire window.
+        A RoPE table enlarged by only one window cannot guarantee this.
+        """
+        context_len = 1048576
+        input_len = context_len - 2000
+        for algorithm in ("DSPARK", "DFLASH", "EAGLE3"):
+            for window in (6, 17):
+                for overlap in (False, True):
+                    for requested in (None, 4000):
+                        with self.subTest(
+                            algorithm=algorithm,
+                            window=window,
+                            overlap=overlap,
+                            requested=requested,
+                        ), get_spec().override(
+                            speculative_algorithm=algorithm,
+                            speculative_num_draft_tokens=window,
+                            speculative_num_steps=window - 1,
+                            speculative_eagle_topk=1,
+                            speculative_adaptive=False,
+                        ), envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(
+                            None
+                        ):
+                            scheduler = self._new_scheduler(
+                                max_req_len=context_len - 1,
+                                max_total_num_tokens=2 * context_len,
+                                enable_overlap=overlap,
+                            )
+                            req = self._new_req(requested, input_len=0)
+                            req.origin_input_ids = range(input_len)
+                            scheduler.init_req_max_new_tokens(req)
+                            output_limit = req.sampling_params.max_new_tokens
+                            completion_limit = input_len + output_limit
+                            for remaining in range(1, window + 1):
+                                # The last output token has not yet been fed
+                                # back into the model (hence the extra -1).
+                                prefix_len = completion_limit - remaining - 1
+                                last_position = prefix_len + window - 1
+                                if overlap:
+                                    last_position += window
+                                self.assertLess(last_position, context_len)
+
+    def test_speculative_short_request_and_minimum_clipping(self):
+        with get_spec().override(
+            speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=17,
+            speculative_num_steps=1,
+            speculative_eagle_topk=1,
+        ), envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
+            scheduler = self._new_scheduler()
+            self.assertEqual(self._init_and_check(scheduler, self._new_req(16)), 16)
+            req = self._new_req(64, input_len=80, min_new_tokens=64)
+            self.assertEqual(self._init_and_check(scheduler, req), 13)
+            self.assertEqual(req.sampling_params.min_new_tokens, 13)
+            self.assertEqual(
+                self._init_and_check(scheduler, self._new_req(None, input_len=100)), 0
+            )
+
+    def test_eagle_tree_reserve_larger_than_verify_window(self):
+        with get_spec().override(
+            speculative_algorithm="EAGLE3",
+            speculative_num_draft_tokens=6,
+            speculative_num_steps=5,
+            speculative_eagle_topk=4,
+        ), envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
+            for overlap, expected in ((False, 99), (True, 79)):
+                scheduler = self._new_scheduler(enable_overlap=overlap)
+                self.assertEqual(
+                    self._init_and_check(scheduler, self._new_req(None)), expected
+                )
+
+    def test_adaptive_reserves_largest_configured_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "adaptive.json"
+            path.write_text(json.dumps({"1": {"candidate_steps": [1, 5, 16]}}))
+            with get_spec().override(
+                speculative_algorithm="EAGLE3",
+                speculative_num_draft_tokens=2,
+                speculative_num_steps=1,
+                speculative_eagle_topk=1,
+                speculative_adaptive=True,
+                speculative_adaptive_config=str(path),
+            ), envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
+                scheduler = self._new_scheduler()
+                self.assertEqual(
+                    self._init_and_check(scheduler, self._new_req(None)), 85
+                )
 
 
 if __name__ == "__main__":

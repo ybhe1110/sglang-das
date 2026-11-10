@@ -412,3 +412,17 @@ def compute_num_reserved_tokens() -> int:
         spec.speculative_eagle_topk * spec.speculative_num_steps,
         max_speculative_num_draft_tokens(),
     )
+
+
+def compute_spec_context_reserve(enable_overlap: bool) -> int:
+    """Context headroom for speculative forwards before CPU completion clipping.
+
+    The final verify can overshoot the requested output length. Overlap can
+    launch one more window before that result is consumed, so reserve two
+    windows there. Include EAGLE's draft tree and the largest adaptive window,
+    not just the currently selected draft-token count.
+    """
+    if SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm).is_none():
+        return 0
+    window = max(compute_num_reserved_tokens(), max_speculative_num_draft_tokens() or 0)
+    return window * (2 if enable_overlap else 1)
