@@ -818,6 +818,16 @@ def alloc_for_spec_decode(
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
+    # Validate the whole host plan before allocating slots or writing any row.
+    # This uses existing CPU lengths and does not synchronize the device.
+    row_width = req_to_token_pool.req_to_token.shape[1]
+    max_alloc_len = int(nxt_kv_lens_cpu.max()) if nxt_kv_lens_cpu.numel() else 0
+    if max_alloc_len > row_width:
+        raise ValueError(
+            f"Speculative KV allocation exceeds req_to_token row width: "
+            f"{max_alloc_len} > {row_width}. "
+            "Check speculative context reserve and KV row headroom."
+        )
     if num_needed_tokens > 0:
         if tree_cache.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)

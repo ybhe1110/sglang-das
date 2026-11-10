@@ -228,6 +228,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_platform,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -1239,7 +1240,10 @@ class MqaAttentionBase(nn.Module):
         )
         self.rope_kwargs = dict(
             dim=self.qk_rope_head_dim,
-            seqlen=config.max_position_embeddings,
+            # Verify evaluates the full window before completion clipping.
+            # All derived tables share this bound; keep context/YaRN unchanged.
+            seqlen=config.max_position_embeddings
+            + (max_speculative_num_draft_tokens() or 0),
             original_seq_len=original_seq_len,
             base=self.rope_base,
             factor=scaling.get("factor", 1.0),

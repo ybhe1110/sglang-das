@@ -304,6 +304,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    compute_spec_context_reserve,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -1272,6 +1273,7 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.spec_context_reserve = compute_spec_context_reserve(self.enable_overlap)
         if (
             get_serving().glm_check_total_num_tokens
             and not get_serving().allow_auto_truncate
@@ -3278,12 +3280,13 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        # Keep this bound consistent with PrefillAdder's admission budget.
+        # Bound speculative forward positions before applying the allocator's
+        # memory budget; completion clipping runs after the full verify window.
         max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len - input_len - 1 - self.spec_context_reserve,
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
