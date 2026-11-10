@@ -16,6 +16,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _should_auto_enable_hip_rejection_sampling(
+    *,
+    is_hip: bool,
+    is_hcu: bool,
+    use_rejection_sampling: bool,
+    algorithm: Optional[str],
+    token_map: Optional[str],
+    eagle_topk: int,
+    accept_threshold_single: float,
+    accept_threshold_acc: float,
+    enable_deterministic_inference: bool,
+) -> bool:
+    """Enable HIP sampling only where the chain sampler supports the proposal.
+
+    HCU already samples linear MTP target rows before tree verification. Keep
+    that path and its draft policy. Reduced-vocab EAGLE3/token-map proposals,
+    branching trees and nondefault acceptance policies cannot be auto-enabled.
+    """
+    return (
+        is_hip
+        and not is_hcu
+        and not use_rejection_sampling
+        and algorithm == "EAGLE"
+        and token_map is None
+        and eagle_topk == 1
+        and accept_threshold_single == 1.0
+        and accept_threshold_acc == 1.0
+        and not enable_deterministic_inference
+    )
+
+
 def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     if server_args.device != "cpu" or server_args.disable_overlap_schedule:
         return
@@ -877,24 +908,47 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
-    if server_args.speculative_use_rejection_sampling:
+    from sglang.srt.utils import is_hcu, is_hip
+
+    cfg = resolved_view(server_args)
+    if _should_auto_enable_hip_rejection_sampling(
+        is_hip=is_hip(),
+        is_hcu=is_hcu(),
+        use_rejection_sampling=cfg.speculative_use_rejection_sampling,
+        algorithm=cfg.speculative_algorithm,
+        token_map=cfg.speculative_token_map,
+        eagle_topk=cfg.speculative_eagle_topk,
+        accept_threshold_single=cfg.speculative_accept_threshold_single,
+        accept_threshold_acc=cfg.speculative_accept_threshold_acc,
+        enable_deterministic_inference=cfg.enable_deterministic_inference,
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family",
+            speculative_use_rejection_sampling=True,
+        )
+        logger.info("Enabling rejection sampling for EAGLE verification on HIP.")
+
+    # Refresh after the declaration so validation sees the effective policy.
+    cfg = resolved_view(server_args)
+    if cfg.speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
         # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
         # the rejection-sampling kernel consumes; everything else (STANDALONE,
         # FROZEN_KV_MTP, NGRAM, DFLASH) is unsupported.
-        if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
             raise NotImplementedError(
                 "--speculative-use-rejection-sampling is only supported for "
                 "EAGLE / EAGLE3 / NEXTN, not "
-                f"speculative_algorithm={server_args.speculative_algorithm}."
+                f"speculative_algorithm={cfg.speculative_algorithm}."
             )
-        if server_args.speculative_eagle_topk != 1:
+        if cfg.speculative_eagle_topk != 1:
             raise ValueError(
                 "--speculative-use-rejection-sampling requires --speculative-eagle-topk=1."
             )
         if (
-            server_args.speculative_accept_threshold_single != 1.0
-            or server_args.speculative_accept_threshold_acc != 1.0
+            cfg.speculative_accept_threshold_single != 1.0
+            or cfg.speculative_accept_threshold_acc != 1.0
         ):
             raise ValueError(
                 "--speculative-use-rejection-sampling is incompatible with "
@@ -902,19 +956,14 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "--speculative-accept-threshold-acc; rejection sampling ignores "
                 "the accept thresholds."
             )
-        if server_args.enable_deterministic_inference:
+        if cfg.enable_deterministic_inference:
             raise ValueError(
                 "--speculative-use-rejection-sampling is incompatible with "
                 "--enable-deterministic-inference; the sampling kernel draws "
                 "coins from the global RNG and is not batch-invariant."
             )
 
-        from sglang.srt.arg_groups.overrides import resolved_view
-
-        if (
-            resolved_view(server_args).enable_multi_layer_eagle
-            and server_args.speculative_eagle_topk != 1
-        ):
+        if cfg.enable_multi_layer_eagle and cfg.speculative_eagle_topk != 1:
             raise ValueError(
                 "--speculative-use-rejection-sampling with multi-layer EAGLE "
                 "(--enable-multi-layer-eagle) requires --speculative-eagle-topk 1; "

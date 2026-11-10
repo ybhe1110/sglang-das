@@ -179,15 +179,31 @@ def renorm_draft_probs(
     return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
 
 
-def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+def sample_draft_proposal(
+    next_token_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: Optional[torch.Tensor] = None,
+):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
     Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
     only if q is exactly the distribution X was drawn from, so callers must hand
     the returned q (not a recomputed one) to the verify.
+
+    SamplingParams represents temperature=0 as temperature=1, top_k=1. Such
+    rows must propose argmax even in a mixed batch. Their target distribution
+    is one-hot after verify's top-k renormalization, so both acceptance and
+    residual sampling still commit the target argmax with the q returned here.
     """
     probs = torch.softmax(next_token_logits / temperatures, dim=-1)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
+    if top_ks is not None:
+        assert (
+            top_ks.device == probs.device
+        ), f"top_ks must be on {probs.device}, got {top_ks.device}"
+        greedy = (top_ks <= 1).view(-1, 1)
+        topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
+        topk_p = probs.gather(1, topk_index)
     return probs, topk_p, topk_index
 
 

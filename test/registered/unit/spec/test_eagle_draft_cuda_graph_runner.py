@@ -19,6 +19,8 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -193,6 +195,28 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         for observation in backend.observations:
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
+
+    def test_replay_refreshes_per_request_greedy_flags(self):
+        # Both requests have normalized temperature=1. Only top_k distinguishes
+        # the greedy one; replay must refresh it when the request order changes.
+        backend = _RecordingDraftBackend()
+        runner = self._build_runner(backend)
+        runner.temperatures = torch.ones(CAPTURE_BS, 1)
+        runner.top_ks = torch.full((CAPTURE_BS,), TOP_K_ALL, dtype=torch.int32)
+        runner._replay_graph = lambda *_: runner.top_ks.clone()
+        with get_context().override_server_args(
+            speculative_use_rejection_sampling=True
+        ):
+            runner.model_runner.server_args = get_server_args()
+            for top_ks in ([1, TOP_K_ALL], [TOP_K_ALL, 1]):
+                with self.subTest(top_ks=top_ks):
+                    batch = self._build_forward_batch([10, 11], 21)
+                    batch.sampling_info = SimpleNamespace(
+                        temperatures=torch.ones(2, 1),
+                        top_ks=torch.tensor(top_ks, dtype=torch.int32),
+                    )
+                    observed = runner.execute(batch)
+                    self.assertEqual(observed.tolist(), top_ks + [TOP_K_ALL] * 2)
 
 
 if __name__ == "__main__":

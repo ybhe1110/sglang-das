@@ -676,6 +676,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 probs, topk_p, topk_index = sample_draft_proposal(
                     output.logits_output.next_token_logits,
                     forward_batch.sampling_info.temperatures,
+                    forward_batch.sampling_info.top_ks,
                 )
                 draft_probs_list.append(probs)
             else:
@@ -813,6 +814,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                             step_logits,
                             forward_batch.sampling_info.temperatures,
+                            forward_batch.sampling_info.top_ks,
                         )
                         ret_draft_probs_list.append(probs)
                     if rotates_in_graph:
@@ -886,7 +888,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     ]
                 if self.use_rejection_sampling and self.topk == 1:
                     probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
-                        logits_sel, forward_batch.sampling_info.temperatures
+                        logits_sel,
+                        forward_batch.sampling_info.temperatures,
+                        forward_batch.sampling_info.top_ks,
                     )
                     ret_draft_probs_list.append(probs)
                 else:

@@ -65,6 +65,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.multi_layer_eagle_utils import (
@@ -131,6 +132,7 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     # Rejection sampling with the single-CG runner only, else None (the presence
     # of draft_probs selects the in-graph proposal branch in _run_step_body).
     temperatures: Optional[torch.Tensor]
+    top_ks: Optional[torch.Tensor]
     draft_probs: Optional[torch.Tensor]
 
 
@@ -388,6 +390,13 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.draft_probs[:bs, self.step],
         )
         ret.topk_p, ret.topk_index = fast_sample(probs, num_samples=1)
+        # Same mixed-batch greedy policy as sample_draft_proposal. Keep the
+        # preallocated q buffer consumed by the chain verifier unchanged.
+        greedy = (buffers.top_ks[:bs] <= 1).view(-1, 1)
+        ret.topk_index = torch.where(
+            greedy, probs.argmax(dim=-1, keepdim=True), ret.topk_index
+        )
+        ret.topk_p = probs.gather(1, ret.topk_index)
 
     def _run_step_body(self, forward_batch: ForwardBatch, num_tokens: int, bs: int):
         """One draft step's body: model forward + chain-hidden write + top-k.
@@ -663,12 +672,14 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 and self.eagle_worker.topk == 1
             ):
                 temperatures = torch.ones((max_bs, 1), dtype=torch.float)
+                top_ks = torch.full((max_bs,), TOP_K_ALL, dtype=torch.int32)
                 draft_probs = torch.empty(
                     (max_bs, self.speculative_num_steps, vocab_size),
                     dtype=torch.float,
                 )
             else:
                 temperatures = None
+                top_ks = None
                 draft_probs = None
 
             if self.require_gathered_buffer:
@@ -705,6 +716,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             temperatures=temperatures,
+            top_ks=top_ks,
             draft_probs=draft_probs,
         )
 
@@ -717,6 +729,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         buffers = self.buffers
         raw_bs = forward_batch.batch_size
         num_tokens = raw_bs * self.captured_req_width
+        if buffers.top_ks is not None:
+            buffers.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
 
         # Bucketize to a captured batch size (padding the tail).
         if self.require_mlp_tp_gather:

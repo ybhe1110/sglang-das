@@ -805,12 +805,13 @@ def eagle_sample(
             verify_input.positions,
         )
 
+    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     target_predict = None
     if (
         sampling_info.is_all_greedy
         or _is_cpu
         or _is_npu
-        or (_is_hip and not _is_hcu)
+        or (_is_hip and not _is_hcu and not use_rejection_sampling)
         or _is_xpu
         or sampled_target_ids is not None
     ):
@@ -847,23 +848,26 @@ def eagle_sample(
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
-
         from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
 
-        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+        if use_rejection_sampling:
+            sampling_fn = chain_speculative_sampling_triton
+        else:
+            from sgl_kernel import tree_speculative_sampling_target_only
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
+            sampling_fn = tree_speculative_sampling_target_only
+
+        if _is_hip:
+            from sglang.kernels.ops.sampling.renorm_triton import (
+                top_k_renorm_probs_triton as top_k_renorm_prob,
+            )
+            from sglang.kernels.ops.sampling.renorm_triton import (
+                top_p_renorm_probs_triton as top_p_renorm_prob,
+            )
+        else:
+            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
         # These full-vocabulary matrices are consumed by the sampling kernel
         # within this step. Returned tensors were allocated before the scope,
