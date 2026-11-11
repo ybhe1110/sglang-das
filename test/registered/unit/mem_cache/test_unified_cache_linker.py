@@ -138,7 +138,8 @@ def test_restorable_prefix_intersects_sparse_rank_results():
 
     def intersect_remote_mask(mask, op):
         assert op == torch.distributed.ReduceOp.MIN
-        mask.copy_(torch.minimum(mask, remote_mask))
+        if mask.dtype == torch.int:
+            mask.copy_(torch.minimum(mask, remote_mask))
 
     cache = _cache_for_wrapper(_all_reduce_attn_groups=intersect_remote_mask)
     wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
@@ -193,9 +194,9 @@ def test_match_preflight_rejects_rank_shape_mismatch_without_variable_collective
     with pytest.raises(DisaggregationCollectiveError, match="geometry"):
         wrapper.match(key, req, result)
     assert backend.lookup_calls == []
-    # The preflight is fixed at eighteen int64 values; no rank-dependent mask
+    # The preflight is fixed at twenty int64 values; no rank-dependent mask
     # tensor (3, 15, or 21 int32 values) is ever submitted.
-    assert reduce_shapes == [(18, torch.int64)]
+    assert reduce_shapes == [(20, torch.int64)]
 
 
 def test_match_preflight_validity_mismatch_falls_back_safely(caplog):
@@ -238,7 +239,7 @@ def test_match_preflight_validity_mismatch_falls_back_safely(caplog):
 
     assert wrapper.match(key, req, result) is result
     assert backend.lookup_calls == []
-    assert reduce_shapes == [18]
+    assert reduce_shapes == [20]
     assert "External KV match preflight rejected" in caplog.text
 
 
@@ -270,7 +271,7 @@ def test_match_preflight_is_called_for_local_early_return(caplog, key_len):
 
     assert wrapper.match(key, req, result) is result
     assert len(calls) == 1
-    assert calls[0][0:2] == (18, torch.int64)
+    assert calls[0][0:2] == (20, torch.int64)
     assert backend.lookup_calls == []
     assert "External KV match preflight rejected" not in caplog.text
 

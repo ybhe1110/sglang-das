@@ -290,12 +290,6 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
-        self._raise_if_cleanup_quarantined()
-        private = self.private_loads.get(req.rid)
-        if private is not None and not private.bound:
-            raise ExternalLinkerCleanupError(
-                f"cannot rematch unbound external KV slots: rid={req.rid}"
-            )
         cache = self.cache
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
@@ -317,22 +311,35 @@ class UnifiedCacheLinkerWrapper:
         # build a transfer.  Those are local facts; the other ranks still
         # need a fixed-size preflight to learn that the external lookup must
         # be skipped for the whole group.
-        tail_hashes = (
-            self._tail_hashes(key, result, device_hit_len)
-            if not skip_lookup and device_hit_len < len(key)
-            else []
-        )
+        tail_hashes = []
         lookup_transfers = []
-        local_valid = bool(tail_hashes)
-        if local_valid:
-            for component in cache._components_tuple:
-                transfer = component.build_external_linker_transfer(
-                    LinkerTransferPhase.LOOKUP, None, tail_hashes
+        local_valid = False
+        local_error = False
+        try:
+            self._raise_if_cleanup_quarantined()
+            private = self.private_loads.get(req.rid)
+            if private is not None and not private.bound:
+                raise ExternalLinkerCleanupError(
+                    f"cannot rematch unbound external KV slots: rid={req.rid}"
                 )
-                if transfer is None:
-                    local_valid = False
-                    break
-                lookup_transfers.append(transfer)
+            tail_hashes = (
+                self._tail_hashes(key, result, device_hit_len)
+                if not skip_lookup and device_hit_len < len(key)
+                else []
+            )
+            local_valid = bool(tail_hashes)
+            if local_valid:
+                for component in cache._components_tuple:
+                    transfer = component.build_external_linker_transfer(
+                        LinkerTransferPhase.LOOKUP, None, tail_hashes
+                    )
+                    if transfer is None:
+                        local_valid = False
+                        break
+                    lookup_transfers.append(transfer)
+        except Exception:
+            local_error = True
+            logger.exception("External KV match preparation failed: rid=%s", req.rid)
 
         local_valid, common_tail_pages = self._match_preflight(
             req.rid,
@@ -341,6 +348,7 @@ class UnifiedCacheLinkerWrapper:
             tail_pages=len(tail_hashes),
             local_valid=local_valid,
             boundary_mode=2 if skip_lookup else int(known_hit_len is not None),
+            local_error=local_error,
         )
         if not local_valid:
             if known_hit_len is not None and device_hit_len < len(key):
@@ -354,10 +362,18 @@ class UnifiedCacheLinkerWrapper:
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         if known_hit_len is None:
+            restorable = []
+            lookup_failed = False
+            try:
+                restorable = list(self.cache_linker.lookup(req.rid, lookup_transfers))
+            except Exception:
+                lookup_failed = True
+                logger.exception("External KV lookup failed: rid=%s", req.rid)
             hit_pages = self._sync_restorable_prefix(
-                self.cache_linker.lookup(req.rid, lookup_transfers),
+                restorable,
                 num_pages=len(tail_hashes),
                 device_hit_pages=0,
+                lookup_failed=lookup_failed,
             )
             if cache.pp_size > 1 and hit_pages:
                 req.external_cache_hit_length = device_hit_len + hit_pages * page
@@ -399,10 +415,11 @@ class UnifiedCacheLinkerWrapper:
         tail_pages: int,
         local_valid: bool,
         boundary_mode: int = 0,
+        local_error: bool = False,
     ) -> tuple[bool, int]:
         """Negotiate match geometry before any variable-size collective.
 
-        The payload is always eighteen int64 values, in value/negation pairs.
+        The payload is always twenty int64 values, in value/negation pairs.
         RID fingerprint, sequence and phase must agree even for a full L1 hit.
         A geometry mismatch means that ranks are looking at different
         radix-tree prefixes.  Continuing with local results would make the
@@ -432,6 +449,8 @@ class UnifiedCacheLinkerWrapper:
                 int(local_valid),
                 -int(local_valid),
                 *identity_payload,
+                int(local_error),
+                -int(local_error),
             ],
             dtype=torch.int64,
         )
@@ -446,7 +465,12 @@ class UnifiedCacheLinkerWrapper:
                 preflight[8:].tolist(),
             )
             raise DisaggregationCollectiveError(
-                "external KV match RID/sequence/phase differs across ranks"
+                "external KV match RID/sequence/phase/PP mode differs across ranks"
+            )
+
+        if int(preflight[19]) != 0:
+            raise DisaggregationCollectiveError(
+                "external KV match preparation failed on a rank"
             )
 
         same_geometry = (
@@ -501,7 +525,12 @@ class UnifiedCacheLinkerWrapper:
         return True, int(preflight[4])
 
     def _sync_restorable_prefix(
-        self, restorable: list[int], *, num_pages: int, device_hit_pages: int
+        self,
+        restorable: list[int],
+        *,
+        num_pages: int,
+        device_hit_pages: int,
+        lookup_failed: bool = False,
     ) -> int:
         """Intersect the per-rank sets of restorable prefix lengths and return the
         longest one, or 0 when the ranks share none beyond the device prefix.
@@ -510,6 +539,29 @@ class UnifiedCacheLinkerWrapper:
         length that only some ranks can restore. On a 0/1 mask MIN is AND, which
         makes the reduction an intersection.
         """
+        # This helper owns the variable-size collective, so validate its shape
+        # here too. Lookup failures must join this fixed-size vote rather than
+        # leave peers waiting in the mask reduction. A mismatch is fatal: a
+        # shorter mask could select KV for different token prefixes.
+        geometry = torch.tensor(
+            [
+                num_pages,
+                -num_pages,
+                device_hit_pages,
+                -device_hit_pages,
+                int(not lookup_failed),
+            ],
+            dtype=torch.int64,
+        )
+        self.cache._all_reduce_attn_groups(geometry, torch.distributed.ReduceOp.MIN)
+        if int(geometry[4]) == 0:
+            raise DisaggregationCollectiveError("external KV lookup failed on a rank")
+        if int(geometry[0]) != -int(geometry[1]) or int(geometry[2]) != -int(
+            geometry[3]
+        ):
+            raise DisaggregationCollectiveError(
+                "external KV restorable mask geometry differs across ranks"
+            )
         mask = torch.zeros(num_pages + 1, dtype=torch.int)
         for pages in restorable:
             if device_hit_pages < pages <= num_pages:
