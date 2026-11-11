@@ -21,6 +21,7 @@ from test_collective_timeout import load_collective_helpers
 from test_external_kv_abort_drain import (
     CONN,
     ROOT,
+    KVPoll,
     SourceDrainTracker,
     load_methods,
     register_cpu_ci,
@@ -93,7 +94,7 @@ def wire_managers():
         logger=Mock(),
         ABORT_TAG=b"ABORT",
         ABORT_ACK_TAG=b"ABORT_ACK",
-        KVPoll=SimpleNamespace(Success=1, Failed=2, Bootstrapping=3, WaitingForInput=4),
+        KVPoll=KVPoll,
         NamedTuple=NamedTuple,
         dataclasses=dataclasses,
         NetworkAddress=lambda ip, port: SimpleNamespace(
@@ -1098,21 +1099,20 @@ class TestPDHiddenOwnership(CustomTestCase):
 
 class TestRestoreAndOffload(CustomTestCase):
     def test_restore_failure_and_pending_are_part_of_reduced_poll(self):
-        polls = SimpleNamespace(Failed=0, Transferring=1, Success=2)
         restore = SimpleNamespace(FAILED="failed", PENDING="pending", READY="ready")
         path = ROOT / "python/sglang/srt/disaggregation/decode_hicache_mixin.py"
         cls = load_methods(
             path,
             ["poll"],
-            {"KVPoll": polls, "HiCacheRestoreResult": restore},
+            {"KVPoll": KVPoll, "HiCacheRestoreResult": restore},
             class_name="HiCacheRestoreGatedKVReceiver",
         )
         for local, state, expected in (
-            (2, "failed", 0),
-            (2, "pending", 1),
-            (2, "ready", 2),
-            (1, "failed", 1),
-            (0, "pending", 0),
+            (KVPoll.Success, "failed", KVPoll.Failed),
+            (KVPoll.Success, "pending", KVPoll.Transferring),
+            (KVPoll.Success, "ready", KVPoll.Success),
+            (KVPoll.Transferring, "failed", KVPoll.Transferring),
+            (KVPoll.Failed, "pending", KVPoll.Failed),
         ):
             with self.subTest(local=local, state=state):
                 gate = cls()

@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from test_external_kv_abort_drain import CONN, load_methods, register_cpu_ci
+from test_external_kv_abort_drain import CONN, KVPoll, load_methods, register_cpu_ci
 from test_pd_failure_protocol_cpu import COMMON
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -188,7 +188,7 @@ class TestMooncakeShutdown(unittest.TestCase):
             pack_string_list=lambda *a: b"",
             pack_state_types=lambda *a: b"",
             zmq=SimpleNamespace(ZMQError=ZMQError),
-            KVPoll=SimpleNamespace(Failed=2),
+            KVPoll=KVPoll,
         )
         cls = load_methods(CONN, ["_register_kv_args"], env)
         manager_cls = load_methods(COMMON, ["record_failure"], {})
@@ -218,8 +218,8 @@ class TestMooncakeShutdown(unittest.TestCase):
         r._connect_to_bootstrap_server = lambda info: (sock, threading.Lock())
         self.assertFalse(r._register_kv_args())
         self.assertIn("_register_kv_args", m.failure_records[7])
-        self.assertEqual(r.conclude_state, 2)
-        m.update_status.assert_called_once_with(7, 2)
+        self.assertEqual(r.conclude_state, KVPoll.Failed)
+        m.update_status.assert_called_once_with(7, KVPoll.Failed)
 
 
 if __name__ == "__main__":

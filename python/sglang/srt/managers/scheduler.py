@@ -2481,6 +2481,24 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
+        # A positive generation request must not silently become prefill-only
+        # when speculative forward positions consume the context headroom.
+        # Keep explicit zero-output requests valid and distinguish this from
+        # the independent KV memory budget applied below.
+        if (
+            max_new_tokens > 0
+            and self.spec_context_reserve > 0
+            and self.max_req_len - input_len - 1 - self.spec_context_reserve <= 0
+        ):
+            req.set_finish_with_abort(
+                f"Request context ({input_len}) leaves no room for speculative "
+                f"decoding (reserve={self.spec_context_reserve}). "
+                "Reduce input length or disable speculative decoding."
+            )
+            req.sampling_params.max_new_tokens = 0
+            req.sampling_params.min_new_tokens = 0
+            return
+
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
         # smaller than max_total_num_tokens. Otherwise a request can be accepted

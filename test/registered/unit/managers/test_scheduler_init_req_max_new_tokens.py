@@ -3,9 +3,11 @@ import logging
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import compute_spec_context_reserve
 from sglang.srt.runtime_context import get_context, get_parallel, get_spec
@@ -71,11 +73,83 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
     def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
         return SimpleNamespace(
             rid="test-req",
+            set_finish_with_abort=Mock(),
             origin_input_ids=[0] * input_len,
             sampling_params=SimpleNamespace(
                 max_new_tokens=max_new_tokens, min_new_tokens=min_new_tokens
             ),
         )
+
+    def test_speculative_context_exhaustion_reports_error(self):
+        """Positive/default output requests must not silently become prefill-only.
+
+        Explicit zero remains valid, and KV-only clipping is not a speculative
+        context error. Check the real abort reason returned to the tokenizer.
+        """
+        for context_len in (128, 1048576):
+            for requested, reserve, remaining, expected, aborted in (
+                (8, 30, 30, 0, True),
+                (None, 30, 30, 0, True),
+                (8, 30, 29, 0, True),
+                (0, 30, 30, 0, False),
+                (0, 30, 29, 0, False),
+                (8, 30, 31, 1, False),
+                (8, 0, 30, 8, False),
+                (8, 0, 0, 0, False),
+                (0, 0, 0, 0, False),
+            ):
+                with (
+                    self.subTest(
+                        context_len=context_len,
+                        requested=requested,
+                        reserve=reserve,
+                        remaining=remaining,
+                    ),
+                    envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None),
+                ):
+                    scheduler = self._new_scheduler(
+                        max_req_len=context_len,
+                        max_total_num_tokens=2 * context_len,
+                    )
+                    scheduler.spec_context_reserve = reserve
+                    minimum = 0 if requested == 0 else 4
+                    req = self._new_req(requested, input_len=0, min_new_tokens=minimum)
+                    input_len = context_len - remaining - 1
+                    req.origin_input_ids = range(input_len)
+                    req.to_finish = None
+                    req.release_mm_inputs_on_abort = Mock()
+                    req.set_finish_with_abort = MethodType(
+                        Req.set_finish_with_abort, req
+                    )
+                    scheduler.init_req_max_new_tokens(req)
+                    self.assertEqual(req.sampling_params.max_new_tokens, expected)
+                    self.assertEqual(
+                        req.sampling_params.min_new_tokens, min(minimum, expected)
+                    )
+                    if aborted:
+                        self.assertIsNotNone(req.to_finish)
+                        reason = req.to_finish.to_json()
+                        self.assertEqual(reason["type"], "abort")
+                        self.assertEqual(reason["status_code"], 400)
+                        self.assertEqual(reason["err_type"], "BadRequestError")
+                        self.assertIn(f"context ({input_len})", reason["message"])
+                        self.assertIn("reserve=30", reason["message"])
+                        self.assertIn("disable speculative decoding", reason["message"])
+                    else:
+                        self.assertIsNone(req.to_finish)
+                        self.assertEqual(len(req.origin_input_ids), input_len)
+
+    def test_kv_capacity_exhaustion_is_not_speculative_context_error(self):
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
+            scheduler = self._new_scheduler(max_total_num_tokens=10)
+            scheduler.spec_context_reserve = 30
+            req = self._new_req(8, input_len=8)
+            req.to_finish = None
+            req.release_mm_inputs_on_abort = Mock()
+            req.set_finish_with_abort = MethodType(Req.set_finish_with_abort, req)
+            scheduler.init_req_max_new_tokens(req)
+            self.assertEqual(req.sampling_params.max_new_tokens, 0)
+            self.assertIsNone(req.to_finish)
 
     def _init_and_check(self, scheduler, req) -> int:
         """Run init_req_max_new_tokens, then assert all admission rules hold
