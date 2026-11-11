@@ -38,7 +38,22 @@ tracker_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tracker_module)
 SourceDrainTracker = tracker_module.SourceDrainTracker
 SourceTransferTimeout = tracker_module.SourceTransferTimeout
-KVPoll = SimpleNamespace(Success=1, Failed=2, Transferring=3, WaitingForInput=4)
+
+
+def _load_kv_poll():
+    # Use the production states without importing the GPU-dependent module.
+    # These values are ordered: cross-rank polls reduce them with MIN.
+    path = ROOT / "python/sglang/srt/disaggregation/base/conn.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "KVPoll"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["KVPoll"]
+
+
+KVPoll = _load_kv_poll()
 
 
 class Reason:

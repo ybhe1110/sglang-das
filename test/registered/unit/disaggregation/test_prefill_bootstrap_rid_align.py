@@ -13,7 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from test_collective_timeout import UTILS, load_collective_helpers
-from test_external_kv_abort_drain import PREFILL, load_methods, register_cpu_ci
+from test_external_kv_abort_drain import PREFILL, KVPoll, load_methods, register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -38,7 +38,7 @@ def run_rank(rank, rendezvous):
         # Run the real poll, timeout, resource vote and queue methods without
         # importing model kernels. Stub only request creation and allocation.
         env = load_collective_helpers()
-        poll = SimpleNamespace(Failed=0, Bootstrapping=1, WaitingForInput=2)
+        poll = KVPoll
         env.update(
             torch=torch,
             dist=dist,
