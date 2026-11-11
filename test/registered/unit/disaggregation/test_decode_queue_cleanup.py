@@ -379,7 +379,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
     def test_transfer_failure_cleanup_respects_deferred_release_gates(
         self, mock_poll, mock_prepare_abort, mock_release_kv_cache
     ):
+        """An aborted transfer must be removed without stopping later cleanup."""
         receiver = FakeReceiver()
+        receiver.failure_exception = MagicMock(
+            side_effect=KVTransferError(7, "Aborted by AbortReq")
+        )
         req = SimpleNamespace(
             rid="failed-transfer",
             bootstrap_room=7,
@@ -395,6 +399,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
         queue.enable_staging = False
+        queue.enable_host_receive = False
         queue.enable_deferred_kv_release = False
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
@@ -425,6 +430,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
             [req], req.return_logprob
         )
         mock_prepare_abort.assert_called_once()
+        self.assertIn("Aborted by AbortReq", mock_prepare_abort.call_args.args[1])
+        self.assertEqual(queue.metadata_buffers.bootstrap_room[3], 0)
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_not_called()
         mock_release_kv_cache.assert_called_once_with(
             req, queue.tree_cache, checkpoint=False
         )
@@ -434,6 +442,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         decode_req.kv_receiver = receiver
         queue.queue = [decode_req]
         queue.enable_deferred_kv_release = True
+        scheduler.metrics_reporter.enable_metrics = True
         queue.req_to_metadata_buffer_idx_allocator.reset_mock()
         mock_release_kv_cache.reset_mock()
 
@@ -443,6 +452,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue.queue, [])
         self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once_with()
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
         mock_release_kv_cache.assert_called_once_with(
             req, queue.tree_cache, checkpoint=False
@@ -455,9 +465,16 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_deferred_kv_release = False
         queue._defer_release = MagicMock()
         queue.queue = [decode_req]
+        queue.metadata_buffers.bootstrap_room[3] = req.bootstrap_room
         queue.req_to_metadata_buffer_idx_allocator.reset_mock()
         mock_release_kv_cache.reset_mock()
         self.assertEqual(queue.pop_transferred(), [])
+        self.assertEqual(queue.queue, [])
+        self.assertIs(decode_req.kv_receiver, receiver)
+        self.assertEqual(queue.metadata_buffers.bootstrap_room[3], req.bootstrap_room)
+        self.assertEqual(
+            scheduler.metrics_collector.increment_transfer_failed_reqs.call_count, 2
+        )
         receiver.abort.assert_called_once_with()
         queue._defer_release.assert_called_once_with(decode_req)
         receiver.clear.assert_not_called()
@@ -466,6 +483,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         queue.queue = [decode_req]
         decode_req.req.finished_reason = FINISH_ABORT("cancelled")
+        decode_req.pd_hidden_state = MagicMock(enabled=False)
+        decode_req.pd_hidden_state.request_done.return_value = True
         with (
             patch.object(
                 queue, "_poll_with_metadata_gate", return_value=[KVPoll.Success]

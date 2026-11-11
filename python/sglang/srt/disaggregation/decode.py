@@ -3899,7 +3899,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
                     indices_to_remove.add(i)
-                self._record_transfer_failure(failure_reason)
+                self._record_transfer_failure(error_message)
                 continue
             elif poll == KVPoll.Success:
                 if self.enable_host_receive and decode_req.host_staged:
