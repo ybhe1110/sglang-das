@@ -662,11 +662,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             with condition:
                 condition.notify_all()
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        super().update_status(bootstrap_room, status)
-        if status in (KVPoll.Success, KVPoll.Failed):
-            self._notify_transfer_waiters()
-
     def wait_for_transfer_rooms(
         self, bootstrap_rooms: Set[int], timeout_s: float
     ) -> bool:
@@ -4807,13 +4802,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def update_status(self, bootstrap_room, status):
         if not hasattr(self, "_source_drain"):
-            return super().update_status(bootstrap_room, status)
-        with self._source_drain.lock:
             super().update_status(bootstrap_room, status)
-            if status == KVPoll.Failed:
-                self._source_drain.poison(bootstrap_room)
-            elif status == KVPoll.Success:
-                self._source_drain.close(bootstrap_room)
+        else:
+            with self._source_drain.lock:
+                super().update_status(bootstrap_room, status)
+                if status == KVPoll.Failed:
+                    self._source_drain.poison(bootstrap_room)
+                elif status == KVPoll.Success:
+                    self._source_drain.close(bootstrap_room)
+        # Waiters acquire their condition before checking room state. Notify
+        # after releasing the source lock to avoid reversing that lock order.
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self._notify_transfer_waiters()
 
     def source_transfers_drained(self, room, generation=None):
         if self.request_status.get(room) == KVPoll.Success:

@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import unittest
+import zlib
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -38,7 +39,11 @@ CustomTestCase = extract_class(
     "CustomTestCase",
     {"__init_subclass__", "setUp"},
     ["TestCase"],
-    {"TestCase": unittest.TestCase, "_wait_for_gpu_idle_in_ci": lambda: None},
+    {
+        "TestCase": unittest.TestCase,
+        "_wait_for_gpu_idle_in_ci": lambda: None,
+        "is_in_ci": lambda: False,
+    },
 )
 
 
@@ -93,7 +98,9 @@ def wire_managers():
         logger=Mock(),
         ABORT_TAG=b"ABORT",
         ABORT_ACK_TAG=b"ABORT_ACK",
-        KVPoll=SimpleNamespace(Success=1, Failed=2, Bootstrapping=3, WaitingForInput=4),
+        KVPoll=SimpleNamespace(
+            Failed=0, Bootstrapping=1, WaitingForInput=2, Transferring=3, Success=4
+        ),
         NamedTuple=NamedTuple,
         dataclasses=dataclasses,
         NetworkAddress=lambda ip, port: SimpleNamespace(
@@ -146,6 +153,8 @@ def wire_managers():
             "_handle_deferred_abort_notification",
             "_cancel_paired_source",
             "_handle_legacy_abort_notification",
+            "_notify_transfer_waiters",
+            "wait_for_transfer_rooms",
         },
         ["CommonKVManager"],
         env,
@@ -156,12 +165,14 @@ def wire_managers():
         del m._send_abort_ack  # Exercise actual dynamic dispatch, not a mock.
         m.enable_deferred_decode_kv_release = True
         m.request_status = {}
+        m.deferred_bootstrap = None
         m.attn_tp_rank = m.pp_rank = m.attn_cp_rank = 0
         m.pp_size = m.attn_cp_size = 1
         return m
 
     p, d = init(cls()), init(base())
     p._source_drain = SourceDrainTracker()
+    p._wake_pd_hidden_ack_waiters = Mock()
     p._abort_room_bindings = {}
     p._source_room_pair_keys = {}
     p._pending_abort_metadata = {}
@@ -182,6 +193,52 @@ def wire_managers():
 
 
 class TestGenerationAndNativeDrain(CustomTestCase):
+
+    def test_terminal_status_wakes_waiter_without_releasing_active_source(self):
+        """Cancellation/completion must wake final-poll waiters before timeout."""
+        for status_name in ("Failed", "Success"):
+            for tracked in (False, True):
+                with self.subTest(status=status_name, tracked=tracked):
+                    p, _, _, env = wire_managers()
+                    waiting = threading.Event()
+
+                    class Condition(threading.Condition):
+                        def wait(self, timeout=None):
+                            waiting.set()
+                            return super().wait(timeout)
+
+                    condition = p._transfer_completion_condition = Condition()
+                    p.defer_decode_allocation = False
+                    p.request_status[7] = env["KVPoll"].WaitingForInput
+                    chunk = SimpleNamespace(room=7)
+                    if tracked:
+                        p._source_drain.publish(chunk, Mock(), lambda: True)
+                        p._source_drain.begin(chunk)
+                    else:
+                        del p._source_drain
+                    with ThreadPoolExecutor(1) as pool:
+                        result = pool.submit(p.wait_for_transfer_rooms, {7}, 5.0)
+                        try:
+                            self.assertTrue(waiting.wait(1))
+                            # Acquiring the condition proves the waiter has released
+                            # it inside wait(), so the notification cannot race ahead.
+                            with condition:
+                                pass
+                            p.update_status(7, getattr(env["KVPoll"], status_name))
+                            self.assertTrue(result.result(timeout=1))
+                            if tracked:
+                                self.assertFalse(p._source_drain.terminal(7))
+                                self.assertFalse(
+                                    p._source_drain.publish(
+                                        SimpleNamespace(room=7), Mock(), lambda: True
+                                    )
+                                )
+                                p._source_drain.complete(chunk)
+                                self.assertTrue(p._source_drain.terminal(7))
+                        finally:
+                            with condition:
+                                condition.notify_all()
+
     def test_legacy_abort_is_upgraded_once_after_partial_metadata_publish(self):
         class Notification(SimpleNamespace):
             def to_zmq(self):
@@ -664,12 +721,15 @@ class TestGenerationAndNativeDrain(CustomTestCase):
         p, d, sent, env = wire_managers()
         p._open_source_room(7, "pair-7")
         p.request_status[7] = env["KVPoll"].Bootstrapping
-        for generation in (None, 111):
+        # A stale identified abort is ignored; legacy abort cancels the room
+        # but neither path authorizes freeing an unacknowledged destination.
+        for generation in (111, None):
             p._handle_abort_notification(
                 env["AbortNotification"](7, "decode", 6000, generation).to_zmq()
             )
+            expected = "Bootstrapping" if generation is not None else "Failed"
+            self.assertEqual(p.request_status[7], getattr(env["KVPoll"], expected))
         self.assertEqual(sent, [])
-        self.assertEqual(p.request_status[7], env["KVPoll"].Bootstrapping)
         self.assertFalse(
             p._bind_abort_metadata(
                 7,
@@ -842,6 +902,9 @@ def queue(env, mgr, rid="r", ready=False):
         DECODE,
         [
             "_reduce_deferred_flags",
+            "_deferred_entry_drained",
+            "_is_host_staged_entry",
+            "_release_request",
             "resolve_deferred_releases",
             "_do_release",
             "has_pending_deferred_releases",
@@ -855,6 +918,7 @@ def queue(env, mgr, rid="r", ready=False):
     q.gloo_group = object()
     q.queue = []
     q.enable_staging = False
+    q.enable_host_receive = False
     q.tree_cache = object()
     q._release_pd_hidden_rows = Mock()
     q.req_to_metadata_buffer_idx_allocator = Mock()
@@ -904,7 +968,43 @@ class PairMin:
 class TestDecodeReleaseConsensus(CustomTestCase):
     def setUp(self):
         self.env = load_collective_helpers()
+        class Tensor(list):
+            @property
+            def values(self):
+                return self
+
+            def tolist(self):
+                return list(self)
+
+        self.env["torch"].tensor = lambda values, **kwargs: Tensor(values)
+        self.env["torch"].int64 = object()
         self.env["torch"].uint8 = object()
+        self.env["dist"].get_world_size = lambda group: 2
+        self.env["dist"].ReduceOp = SimpleNamespace(MIN="min")
+        self.env["zlib"] = zlib
+        path = ROOT / "python/sglang/srt/disaggregation/utils.py"
+        nodes = [
+            node
+            for node in ast.parse(path.read_text(encoding="utf-8")).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_all_reduce_flags_preflight", "_all_reduce_polls"}
+        ]
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(
+                        body=[
+                            ast.ImportFrom("__future__", [ast.alias("annotations")], 0)
+                        ]
+                        + nodes,
+                        type_ignores=[],
+                    )
+                ),
+                str(path),
+                "exec",
+            ),
+            self.env,
+        )
         self.env.update(
             time=SimpleNamespace(monotonic=lambda: 100.0),
             release_kv_cache=Mock(),
@@ -938,7 +1038,7 @@ class TestDecodeReleaseConsensus(CustomTestCase):
         q.resolve_deferred_releases()
         q.resolve_deferred_releases()
         self.env["release_kv_cache"].assert_called_once_with(
-            dr.req, q.tree_cache, is_insert=False
+            dr.req, q.tree_cache, checkpoint=False
         )
         q._release_pd_hidden_rows.assert_called_once_with(dr)
         q.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
@@ -962,7 +1062,7 @@ class TestDecodeReleaseConsensus(CustomTestCase):
         self.assertEqual(q.metadata_buffers.bootstrap_room, {3: 7, 4: 0})
         self.assertEqual(q.num_pending_deferred_releases(), 1)
         self.env["release_kv_cache"].assert_called_once_with(
-            ready.req, q.tree_cache, is_insert=False
+            ready.req, q.tree_cache, checkpoint=False
         )
 
     def test_partial_free_exception_is_quarantined_without_retry(self):

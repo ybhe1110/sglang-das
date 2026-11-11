@@ -105,6 +105,7 @@ class TestAbortDrain(unittest.TestCase):
             release_kv_cache=Mock(),
             prepare_abort=Mock(),
             AbortReq=SimpleNamespace,
+            get_parallel=lambda: SimpleNamespace(tp_rank=0),
         )
         prefill_cls = load_methods(
             PREFILL,
@@ -578,7 +579,7 @@ class TestSourceDrain(unittest.TestCase):
 
         cls = load_methods(
             CONN,
-            ["transfer_worker", "_complete_source_chunk"],
+            ["transfer_worker", "_complete_source_chunk", "_notify_transfer_waiters"],
             dict(KVPoll=KVPoll, logger=Mock(), concurrent=concurrent),
         )
         mgr = cls()

@@ -1774,7 +1774,7 @@ class SchedulerDisaggregationPrefillMixin:
             state = 2 if batch_result.copy_done.query() else 1
         if self.tp_size > 1:
             batch_result_completion_status.fill_(state)
-            torch.distributed.all_reduce(
+            all_reduce_with_timeout(
                 batch_result_completion_status,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_cpu_group,

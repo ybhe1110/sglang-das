@@ -81,6 +81,10 @@ def make_sender():
         dict(KVPoll=KVPoll),
     )
     mgr = manager_cls()
+    mgr.deferred_bootstrap = None
+    mgr.req_to_decode_prefix_len = {}
+    mgr.req_to_pd_hidden_meta = {}
+    mgr.transfer_infos = {}
     mgr._source_drain = SourceDrainTracker()
     mgr._abort_room_bindings = {}
     mgr._source_room_pair_keys = {}
@@ -284,7 +288,12 @@ class TestSourceDrainRetirement(CustomTestCase):
             fixture.env["maybe_release_metadata_buffer"].assert_called_once()
 
     def test_load_snapshot_updates_without_forward_or_full_idle(self):
-        env = {}
+        clock = [1.0]
+        env = dict(
+            time=SimpleNamespace(monotonic=lambda: clock[0], monotonic_ns=lambda: 0),
+            LOAD_STALL_REFRESH_S=0.1,
+            DisaggregationMode=SimpleNamespace(NULL="null"),
+        )
         cls = load_methods(SCHED, ["on_idle", "publish_load_snapshot"], env)
         s = cls()
         snapshots = []
@@ -292,12 +301,19 @@ class TestSourceDrainRetirement(CustomTestCase):
             publish_counter=0, publish_interval=1, write=snapshots.append
         )
         s.maybe_send_health_check_signal = Mock()
+        s.dp_attn_adapter = Mock()
+        s.metrics_reporter = Mock()
+        s.load_publisher = Mock()
+        s._last_stall_publish_ts = 0.0
+        s.enable_hicache_storage = s.enable_lmcache = False
+        s.disaggregation_mode = "null"
         s.is_fully_idle = lambda: False
         state = {"inflight": 46}
         s.load_inquirer = SimpleNamespace(get_loads=lambda: dict(state))
         s.dp_budget_source = SimpleNamespace(attach=lambda *args: None)
         s.on_idle()
         state["inflight"] = 0
+        clock[0] += 1.0
         s.on_idle()
         self.assertEqual(snapshots, [{"inflight": 46}, {"inflight": 0}])
 
