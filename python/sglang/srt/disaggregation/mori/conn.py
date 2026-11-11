@@ -7,7 +7,7 @@ import struct
 import threading
 import time
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -481,46 +481,6 @@ class MoriKVManager(CommonKVManager):
             if status.Failed():
                 return f"KV transfer failed: {status.Message()}"
         return "KV transfer failed due to unknown reason"
-
-    def add_transfer_request(
-        self,
-        bootstrap_room: int,
-        kv_indices: npt.NDArray[np.int32],
-        index_slice: slice,
-        is_last_chunk: bool,
-        aux_index: Optional[int] = None,
-        state_indices: Optional[List] = None,
-        num_kv_tokens: Optional[int] = None,
-        wait_event: Optional[object] = None,
-    ) -> None:
-        assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
-
-        if (
-            bootstrap_room not in self.request_status
-            or self.check_status(bootstrap_room) == KVPoll.Failed
-        ):
-            logger.debug(
-                "Request with bootstrap_room=%s already failed", bootstrap_room
-            )
-            return
-
-        if bootstrap_room not in self.transfer_infos:
-            return
-
-        shard_idx = bootstrap_room % self._num_shards
-        self._transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                wait_event=wait_event,
-            )
-        )
 
     def _connect_threadsafe(self, endpoint: str, is_ipv6: bool = False):
         """Thread-local ZMQ socket cache with shared Context.
