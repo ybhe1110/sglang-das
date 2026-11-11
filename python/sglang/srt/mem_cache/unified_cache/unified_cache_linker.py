@@ -456,103 +456,112 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
-        self._raise_if_cleanup_quarantined()
-        private = self.private_loads.get(req.rid)
-        if private is not None and not private.bound:
-            raise ExternalLinkerCleanupError(
-                f"cannot rematch unbound external KV slots: rid={req.rid}"
-            )
         cache = self.cache
-        key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
         self.hit_markers.pop(req.rid, None)
         prefetched_hit = self.host_prefetch_hits.get(req.rid)
 
         known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
-        if known_hit_len is not None:
-            # PP0's absolute boundary also survives later local L1 rematches.
-            key = key[:known_hit_len]
-        elif cache.pp_size > 1:
-            if cache.pp_rank != 0:
-                # Uniform per stage: every rank of this stage returns here.
-                req.external_cache_hit_length = 0
-                return result
-            # The local device hit is part of PP0's canonical restorable
-            # boundary even when the external tail lookup misses.
-            req.external_cache_hit_length = device_hit_len
+        skip_lookup = False
+        if known_hit_len is None and cache.pp_size > 1:
+            skip_lookup = cache.pp_rank != 0
+            # PP0 owns the absolute boundary, including a complete L1 hit.
+            req.external_cache_hit_length = 0 if skip_lookup else device_hit_len
 
         # Local facts only, with no early return: a full local hit, a missing
         # hash anchor, a component that cannot build a lookup transfer and a
         # reusable prefetch are all rank-local, while every rank of the
         # attention group must reach the collectives below in the same order.
         # The fixed-size preflight carries those facts to the group first.
-        tail_hashes = (
-            self._tail_hashes(key, result, device_hit_len)
-            if device_hit_len < len(key)
-            else []
-        )
+        tail_hashes = []
         lookup_transfers = []
-        local_valid = bool(tail_hashes)
-        if local_valid:
-            for component in self._components:
-                transfer = component.build_external_linker_transfer(
-                    LinkerTransferPhase.LOOKUP, None, tail_hashes
-                )
-                if transfer is None:
-                    local_valid = False
-                    lookup_transfers = []
-                    break
-                lookup_transfers.append(transfer)
-
+        local_valid = False
         reusable = False
-        if prefetched_hit is not None and local_valid:
-            expected_len = (
-                prefetched_hit.device_hit_len + len(prefetched_hit.tail_hashes) * page
+        local_error = False
+        try:
+            self._raise_if_cleanup_quarantined()
+            private = self.private_loads.get(req.rid)
+            if private is not None and not private.bound:
+                raise ExternalLinkerCleanupError(
+                    f"cannot rematch unbound external KV slots: rid={req.rid}"
+                )
+            key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
+            if known_hit_len is not None:
+                key = key[:known_hit_len]
+            tail_hashes = (
+                self._tail_hashes(key, result, device_hit_len)
+                if not skip_lookup and device_hit_len < len(key)
+                else []
             )
-            current_prefix = key[:expected_len]
-            same_prefix = (
-                current_prefix.extra_key == prefetched_hit.prefix_key.extra_key
-                and current_prefix.cache_salt == prefetched_hit.prefix_key.cache_salt
-                and current_prefix.is_bigram == prefetched_hit.prefix_key.is_bigram
-                and current_prefix.raw_token_ids()
-                == prefetched_hit.prefix_key.raw_token_ids()
-            )
-            reusable = (
-                device_hit_len == prefetched_hit.device_hit_len
-                and list(tail_hashes[: len(prefetched_hit.tail_hashes)])
-                == prefetched_hit.tail_hashes
-                and same_prefix
-            )
+            local_valid = bool(tail_hashes)
+            if local_valid:
+                for component in self._components:
+                    transfer = component.build_external_linker_transfer(
+                        LinkerTransferPhase.LOOKUP, None, tail_hashes
+                    )
+                    if transfer is None:
+                        local_valid = False
+                        lookup_transfers = []
+                        break
+                    lookup_transfers.append(transfer)
 
-        if known_hit_len is None:
-            valid, common_tail_pages, reusable = self._match_preflight(
-                req.rid,
-                key_len=len(key),
-                device_hit_len=device_hit_len,
-                tail_pages=len(tail_hashes),
-                local_valid=local_valid,
-                reusable=reusable,
-            )
-            if not valid:
-                if prefetched_hit is not None:
-                    self.cancel_waiting_queue_prefetch(req.rid)
-                return result
-            # Geometry agreed, so this is a no-op; keep the negotiated bound so
-            # a future backend cannot produce different mask lengths.
-            tail_hashes = tail_hashes[:common_tail_pages]
-        elif not local_valid:
-            # A rematch under PP reuses the boundary PP0 agreed on and runs no
-            # collective here, so a local miss is final on this rank.
+            if prefetched_hit is not None and local_valid:
+                expected_len = (
+                    prefetched_hit.device_hit_len
+                    + len(prefetched_hit.tail_hashes) * page
+                )
+                current_prefix = key[:expected_len]
+                same_prefix = (
+                    current_prefix.extra_key == prefetched_hit.prefix_key.extra_key
+                    and current_prefix.cache_salt
+                    == prefetched_hit.prefix_key.cache_salt
+                    and current_prefix.is_bigram == prefetched_hit.prefix_key.is_bigram
+                    and current_prefix.raw_token_ids()
+                    == prefetched_hit.prefix_key.raw_token_ids()
+                )
+                reusable = (
+                    device_hit_len == prefetched_hit.device_hit_len
+                    and list(tail_hashes[: len(prefetched_hit.tail_hashes)])
+                    == prefetched_hit.tail_hashes
+                    and same_prefix
+                    and (
+                        known_hit_len is None
+                        or len(prefetched_hit.tail_hashes) == len(tail_hashes)
+                    )
+                )
+        except Exception:
+            local_error = True
+            logger.exception("External KV match preparation failed: rid=%s", req.rid)
+
+        valid, common_tail_pages, reusable = self._match_preflight(
+            req.rid,
+            key_len=len(key),
+            device_hit_len=device_hit_len,
+            tail_pages=len(tail_hashes),
+            local_valid=local_valid,
+            reusable=reusable,
+            boundary_mode=2 if skip_lookup else int(known_hit_len is not None),
+            prefetch_pages=len(prefetched_hit.tail_hashes) if reusable else 0,
+            local_error=local_error,
+        )
+        if not valid:
             if prefetched_hit is not None:
                 self.cancel_waiting_queue_prefetch(req.rid)
+            if known_hit_len is not None and device_hit_len < len(key):
+                raise _collective_error(
+                    "cannot restore the prefix boundary already agreed by PP0"
+                )
             return result
+        tail_hashes = tail_hashes[:common_tail_pages]
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         if prefetched_hit is not None:
             if reusable:
                 hit_pages = len(prefetched_hit.tail_hashes)
                 hit_tokens = hit_pages * page
+                if cache.pp_size > 1:
+                    req.external_cache_hit_length = device_hit_len + hit_tokens
                 swa_transfer = by_pool.get(PoolName.SWA)
                 self.hit_markers[req.rid] = prefetched_hit
                 return result._replace(
@@ -570,14 +579,25 @@ class UnifiedCacheLinkerWrapper:
                     ),
                 )
 
-            self.cancel_waiting_queue_prefetch(req.rid)
+            if known_hit_len is not None:
+                self.cancel_waiting_queue_prefetch(req.rid)
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         if known_hit_len is None:
+            restorable = []
+            lookup_failed = False
+            try:
+                if prefetched_hit is not None:
+                    self.cancel_waiting_queue_prefetch(req.rid)
+                restorable = list(self.cache_linker.lookup(req.rid, lookup_transfers))
+            except Exception:
+                lookup_failed = True
+                logger.exception("External KV lookup failed: rid=%s", req.rid)
             hit_pages = self._sync_restorable_prefix(
-                self.cache_linker.lookup(req.rid, lookup_transfers),
+                restorable,
                 num_pages=len(tail_hashes),
                 device_hit_pages=0,
+                lookup_failed=lookup_failed,
             )
             if cache.pp_size > 1:
                 req.external_cache_hit_length = device_hit_len + hit_pages * page
@@ -619,17 +639,22 @@ class UnifiedCacheLinkerWrapper:
         tail_pages: int,
         local_valid: bool,
         reusable: bool,
+        boundary_mode: int = 0,
+        prefetch_pages: int = 0,
+        local_error: bool = False,
     ) -> tuple[bool, int, bool]:
         """Agree on the match geometry before any variable-size collective.
 
         One MIN reduction over value/negation pairs yields the group minimum
         and maximum of every field. Geometry (key length, device hit, tail
-        pages) and identity (RID digest, match sequence, phase) must agree: a
-        mismatch means the ranks are matching different prefixes or different
+        pages) and identity (RID digest, match sequence, phase, PP mode) must
+        agree: a mismatch means the ranks are matching different prefixes or different
         requests, and the forward collectives would then consume different KV
         layouts, so it is fatal. Validity and prefetch reuse may differ: the
-        external lookup is then skipped on every rank, costing a recompute.
+        invalid lookups are skipped on every rank, costing a recompute.
+        Non-reusable prefetches fall back to a fresh lookup on every rank.
 
+        Prefetch reuse also requires the same cached tail length on every rank.
         Returns ``(valid, tail_pages, reusable)``, identical on every rank.
         """
         sequence = self._match_sequence
@@ -645,6 +670,9 @@ class UnifiedCacheLinkerWrapper:
             digest_hi,
             sequence,
             _MATCH_PHASE,
+            boundary_mode,
+            prefetch_pages,
+            int(local_error),
         ]
         payload = torch.tensor(
             [item for value in values for item in (value, -value)], dtype=torch.int64
@@ -653,18 +681,19 @@ class UnifiedCacheLinkerWrapper:
         lo = payload[0::2].tolist()
         hi = [-value for value in payload[1::2].tolist()]
 
-        if any(lo[i] != hi[i] for i in (5, 6, 7, 8)):
+        if any(lo[i] != hi[i] for i in (5, 6, 7, 8, 9)):
             logger.error(
-                "External KV match identity mismatch: rid=%s sequence=%d "
-                "min=%s max=%s",
+                "External KV match identity mismatch: rid=%s sequence=%d min=%s max=%s",
                 rid,
                 sequence,
                 lo[5:],
                 hi[5:],
             )
             raise _collective_error(
-                "external KV match RID/sequence/phase differs across ranks"
+                "external KV match RID/sequence/phase/PP mode differs across ranks"
             )
+        if hi[11]:
+            raise _collective_error("external KV match preparation failed on a rank")
         if any(lo[i] != hi[i] for i in (0, 1, 2)):
             logger.error(
                 "External KV match geometry mismatch: rid=%s "
@@ -705,10 +734,15 @@ class UnifiedCacheLinkerWrapper:
                     tail_pages,
                 )
             return False, 0, False
-        return True, lo[2], lo[4] == 1
+        return True, lo[2], lo[4] == 1 and lo[10] == hi[10]
 
     def _sync_restorable_prefix(
-        self, restorable: list[int], *, num_pages: int, device_hit_pages: int
+        self,
+        restorable: list[int],
+        *,
+        num_pages: int,
+        device_hit_pages: int,
+        lookup_failed: bool = False,
     ) -> int:
         """Intersect the per-rank sets of restorable prefix lengths and return the
         longest one, or 0 when the ranks share none beyond the device prefix.
@@ -717,6 +751,29 @@ class UnifiedCacheLinkerWrapper:
         length that only some ranks can restore. On a 0/1 mask MIN is AND, which
         makes the reduction an intersection.
         """
+        # This helper owns the variable-size collective, so validate its shape
+        # here too. Lookup failures must join this fixed-size vote rather than
+        # leave peers waiting in the mask reduction. A mismatch is fatal: a
+        # shorter mask could select KV for different token prefixes.
+        geometry = torch.tensor(
+            [
+                num_pages,
+                -num_pages,
+                device_hit_pages,
+                -device_hit_pages,
+                int(not lookup_failed),
+            ],
+            dtype=torch.int64,
+        )
+        self.cache._all_reduce_attn_groups(geometry, torch.distributed.ReduceOp.MIN)
+        if int(geometry[4]) == 0:
+            raise _collective_error("external KV lookup failed on a rank")
+        if int(geometry[0]) != -int(geometry[1]) or int(geometry[2]) != -int(
+            geometry[3]
+        ):
+            raise _collective_error(
+                "external KV restorable mask geometry differs across ranks"
+            )
         mask = torch.zeros(num_pages + 1, dtype=torch.int)
         for pages in restorable:
             if device_hit_pages < pages <= num_pages:

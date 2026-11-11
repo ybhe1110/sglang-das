@@ -963,7 +963,8 @@ def test_restorable_prefix_intersects_sparse_rank_results():
 
     def intersect_remote_mask(mask, op):
         assert op == torch.distributed.ReduceOp.MIN
-        mask.copy_(torch.minimum(mask, remote_mask))
+        if mask.dtype == torch.int:
+            mask.copy_(torch.minimum(mask, remote_mask))
 
     cache = _cache_for_wrapper(_all_reduce_attn_groups=intersect_remote_mask)
     wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
@@ -1540,8 +1541,8 @@ def _peer_preflight(overrides):
 
     def reduce(tensor, op):
         assert op == torch.distributed.ReduceOp.MIN
-        if tensor.dtype != torch.int64:
-            return  # the restorable mask: peer agrees
+        if tensor.dtype != torch.int64 or tensor.numel() == 5:
+            return  # the restorable geometry/mask: peer agrees
         local = tensor[0::2].tolist()
         peer = [overrides.get(index, value) for index, value in enumerate(local)]
         peer_tensor = torch.tensor(
@@ -1747,7 +1748,7 @@ def test_ambiguous_abort_quarantines_the_linker(full_linker_component):
         )
     assert wrapper.cleanup_quarantine["rid"]["states"] == ("uncertain",)
     assert wrapper.has_pending_operations()
-    with pytest.raises(ExternalLinkerCleanupError, match="quarantined"):
+    with pytest.raises(DisaggregationCollectiveError, match="preparation"):
         wrapper.match(_KEY, req, _empty_match())
     with pytest.raises(ExternalLinkerCleanupError):
         wrapper.reset()  # never retries the free
