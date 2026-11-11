@@ -20,6 +20,7 @@ import torch
 from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.utils import all_reduce_with_timeout
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
@@ -700,7 +701,7 @@ class EncoderPreprocessor:
         # it.  A rank-local decoder error must therefore be agreed globally.
         ok = torch.tensor([0 if local_error else 1], dtype=torch.int32)
         if tp_size > 1:
-            torch.distributed.all_reduce(
+            all_reduce_with_timeout(
                 ok,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_parallel().attn_tp_group.cpu_group,
