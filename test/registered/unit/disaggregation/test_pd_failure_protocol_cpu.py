@@ -900,6 +900,8 @@ def queue(env, mgr, rid="r", ready=False):
     cls = load_methods(
         DECODE,
         [
+            "abort_matching",
+            "_defer_release",
             "_reduce_deferred_flags",
             "_deferred_entry_drained",
             "_is_host_staged_entry",
@@ -1010,6 +1012,104 @@ class TestDecodeReleaseConsensus(CustomTestCase):
             logger=Mock(),
         )
         self.env["all_reduce_with_timeout"] = lambda *a, **kw: None
+
+    def test_transfer_cancel_preserves_generation_until_source_drains(self):
+        """Cancelling twice must not discard early ACKs or reject later ACKs."""
+        self.env["_matches_abort_rid"] = load_methods(
+            DECODE, ["_matches_abort_rid"], {}
+        )._matches_abort_rid
+        for delayed_ack in (False, True):
+            with self.subTest(delayed_ack=delayed_ack):
+                p, d, _, env = wire_managers()
+                clock = [100.0]
+                env["time"] = self.env["time"] = SimpleNamespace(
+                    monotonic=lambda: clock[0]
+                )
+                cls = extract_class(
+                    COMMON,
+                    "CommonKVReceiver",
+                    {
+                        "abort",
+                        "ensure_abort_notified",
+                        "_send_abort_notification",
+                        "retry_abort_notification",
+                        "clear",
+                        "_clear",
+                    },
+                    [],
+                    env,
+                )
+                r = cls()
+                r.kv_mgr = d
+                r.bootstrap_room, r.bootstrap_addr, r.init_time = 7, "prefill", 1.0
+                r._owns_bootstrap_room = True
+                r._lifecycle_lock = threading.RLock()
+                r._transfer_generation = (1 << 96) + 123
+                r._bootstrap_pair_key = "pair-7"
+                r.abort_notified, r._abort_generation = False, None
+                r._last_abort_notification_time = None
+                r.bootstrap_infos = [
+                    {"rank_ip": "prefill", "rank_port": 7000, "prefill_ack_rank": 0}
+                ]
+                r._connect_to_bootstrap_server = lambda info, **kwargs: (
+                    SimpleNamespace(
+                        send_multipart=lambda frames, **kwargs: (
+                            p._handle_abort_notification(frames)
+                        )
+                    ),
+                    threading.Lock(),
+                )
+                d.local_ip, d.rank_port = "decode", 6000
+                d.record_failure = Mock()
+                d.defer_decode_allocation = False
+                d.required_prefill_response_num_table = {}
+                d.prefill_response_tracker = defaultdict(set)
+                d.addr_to_rooms_tracker = defaultdict(set)
+                generation = p._open_source_room(7, "pair-7")
+                p._abort_room_bindings[7] = (
+                    generation,
+                    {("decode", 6000): r._transfer_generation},
+                )
+                chunk = SimpleNamespace(room=7)
+                if delayed_ack:
+                    p._source_drain.publish(chunk, Mock(), lambda: True)
+                    p._source_drain.begin(chunk)
+
+                q, dr = queue(self.env, d)
+                d.clear_deferred_abort_state(7)
+                dr.kv_receiver, dr.metadata_buffer_index = r, 3
+                q.queue, q._deferred_releases = [dr], []
+                q.tp_rank, q.locally_aborted_rids = 0, set()
+                q.deferred_kv_release_timeout = 30.0
+                self.env["release_kv_cache"].reset_mock()
+                cancel = SimpleNamespace(rid=dr.req.rid, abort_all=False)
+                q.abort_matching(cancel)
+                q.abort_matching(cancel)
+                q._defer_release(dr)
+                q.queue = []
+                if delayed_ack:
+                    # A stale ACK and the deadline cannot authorize reuse while
+                    # the original source still owns an in-flight transfer.
+                    d.handle_abort_ack_message(
+                        env["AbortAck"](7, 0, r._transfer_generation - 1).to_zmq()
+                    )
+                    clock[0] += 31.0
+                    q.resolve_deferred_releases()
+                    self.assertEqual(q.num_pending_deferred_releases(), 1)
+                    self.assertEqual(q.metadata_buffers.bootstrap_room[3], 7)
+                    self.env["release_kv_cache"].assert_not_called()
+                    p._source_drain.complete(chunk)
+                    p._maybe_ack_drained_abort(7)
+                q.resolve_deferred_releases()
+                q.resolve_deferred_releases()
+                self.assertEqual(q.num_pending_deferred_releases(), 0)
+                self.assertEqual(q.metadata_buffers.bootstrap_room[3], 0)
+                self.assertNotIn(7, d._deferred_abort_ack_tracker)
+                self.assertIsNone(dr.kv_receiver)
+                self.env["release_kv_cache"].assert_called_once_with(
+                    dr.req, q.tree_cache, checkpoint=False
+                )
+                q.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
 
     def test_timeout_preserves_all_destination_owners(self):
         q, dr = queue(self.env, manager())

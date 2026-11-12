@@ -3349,19 +3349,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if receiver is None:
                 continue
             try:
+                # The receiver arms its generation before sending ABORT. Do not
+                # rearm here: that would replace the generation and discard ACKs.
                 receiver.abort()
             except Exception as e:
                 logger.warning(
                     "kv_receiver.abort failed for transfer rid=%s: %s",
                     decode_req.req.rid,
                     e,
-                )
-            if (
-                receiver.kv_mgr.enable_deferred_decode_kv_release
-                and receiver.abort_notified
-            ):
-                receiver.kv_mgr.register_deferred_abort_room(
-                    decode_req.req.bootstrap_room
                 )
         logger.warning(
             "Abort decode transfer marked Failed; KV release requires consensus and transfer drain. rids=%s tp_rank=%s",
