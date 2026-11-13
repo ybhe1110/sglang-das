@@ -11,9 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from test_collective_timeout import UTILS, load_collective_helpers
-from test_external_kv_abort_drain import PREFILL, load_methods, register_cpu_ci
 import test_pd_failure_protocol_cpu as protocol
+from test_collective_timeout import UTILS
+from test_external_kv_abort_drain import PREFILL, load_methods, register_cpu_ci
 from test_pd_failure_protocol_cpu import (
     COMMON,
     CONN,
@@ -31,7 +31,7 @@ def sender_class(env):
         KVTransferMetric=Mock,
         KVTransferError=lambda room, reason, **kw: RuntimeError(reason),
         TraceNullContext=Mock,
-        get_parallel=lambda: SimpleNamespace(dp_size=1),
+        get_parallel=lambda: SimpleNamespace(num_dp_ranks=1),
         mooncake_trace_func=lambda stage: lambda fn: fn,
         MooncakeRequestStage=SimpleNamespace(MOONCAKE_SEND=0),
     )
@@ -43,6 +43,7 @@ def sender_class(env):
         {
             "__init__",
             "poll",
+            "_poll_with_status",
             "send",
             "failure_exception",
             "_init_trace_ctx",
@@ -86,7 +87,7 @@ def receiver(p, d, env, generation=123):
     return r
 
 
-class TestPairedCancellation(unittest.TestCase):
+class TestPairedCancellation(protocol.CustomTestCase):
     def setUp(self):
         self.p, self.d, self.sent, self.env = wire_managers()
         self.p.is_dummy_cp_rank = self.p.enable_trace = False
@@ -102,9 +103,7 @@ class TestPairedCancellation(unittest.TestCase):
         )
 
     def sender(self, key="cancelled-pair"):
-        return sender_class(self.env)(
-            self.p, "prefill:9000", 7, [0], 0, bootstrap_pair_key=key
-        )
+        return sender_class(self.env)(self.p, "prefill:9000", 7, bootstrap_pair_key=key)
 
     def test_wire_roundtrip_and_malformed_pair_do_not_downgrade(self):
         cls = self.env["AbortNotification"]
@@ -318,10 +317,9 @@ class TestPairedCancellation(unittest.TestCase):
         )
 
     def test_preowner_ack_releases_decode_slots_metadata_and_hidden_once(self):
-        env = load_collective_helpers()
-        env["torch"].uint8 = object()
-        env.update(time=SimpleNamespace(monotonic=lambda: 100), release_kv_cache=Mock())
-        env["all_reduce_with_timeout"] = lambda *a, **kw: None
+        collective_case = protocol.TestDecodeReleaseConsensus()
+        collective_case.setUp()
+        env = collective_case.env
         q, req = queue(env, self.d)
         generation = self.d._deferred_abort_ack_tracker[7].generation
         r = receiver(self.p, self.d, self.env, generation)
@@ -332,7 +330,7 @@ class TestPairedCancellation(unittest.TestCase):
         q.resolve_deferred_releases()
         q.resolve_deferred_releases()
         env["release_kv_cache"].assert_called_once_with(
-            req.req, q.tree_cache, is_insert=False
+            req.req, q.tree_cache, checkpoint=False
         )
         q._release_pd_hidden_rows.assert_called_once_with(req)
         q.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
@@ -343,8 +341,9 @@ class TestPairedCancellation(unittest.TestCase):
         other, _, _, other_env = wire_managers()
         other.is_dummy_cp_rank = other.enable_trace = False
         self.cancel()  # Only one rank has received cancellation so far.
-        collective = load_collective_helpers()
-        collective["torch"].uint8 = object()
+        collective_case = protocol.TestDecodeReleaseConsensus()
+        collective_case.setUp()
+        collective = collective_case.env
         collective["all_reduce_with_timeout"] = PairMin()
         collective["_poll_with_failure_injection"] = lambda pollers: [
             p.poll() for p in pollers
@@ -365,6 +364,7 @@ class TestPairedCancellation(unittest.TestCase):
         for manager, env in ((self.p, self.env), (other, other_env)):
             cls = sender_class(env)
             env.update(
+                _is_hcu=True,
                 TransferBackend=SimpleNamespace(FAKE="fake", MOONCAKE="mooncake"),
                 KVClassType=SimpleNamespace(SENDER=1),
                 FAKE_BOOTSTRAP_HOST="fake",
@@ -390,9 +390,9 @@ class TestPairedCancellation(unittest.TestCase):
             )
             q._check_if_req_exceed_kv_capacity = lambda req: False
             q._aligned_bootstrap_requests = lambda q=q: q.queue
-            q._get_consensus_bootstrap_resource_ready = lambda requests, polls: [
-                True
-            ] * len(polls)
+            q._get_consensus_bootstrap_resource_ready = lambda requests, polls: (
+                [True] * len(polls)
+            )
             req = SimpleNamespace(
                 rid="same-request",
                 bootstrap_host="prefill",
