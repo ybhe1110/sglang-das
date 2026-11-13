@@ -842,6 +842,8 @@ def queue(env, mgr, rid="r", ready=False):
     cls = load_methods(
         DECODE,
         [
+            "abort_matching",
+            "_defer_release",
             "_reduce_deferred_flags",
             "resolve_deferred_releases",
             "_do_release",
