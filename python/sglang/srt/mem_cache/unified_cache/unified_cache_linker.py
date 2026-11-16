@@ -26,12 +26,12 @@ import hashlib
 import logging
 import threading
 import zlib
-from dataclasses import replace
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
 from copy import copy
+from dataclasses import replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -324,8 +324,11 @@ class UnifiedCacheLinkerWrapper:
         self.cache = cache
         self.cache_linker = cache_linker
         swa = cache.components.get(ComponentType.SWA)
-        self._skip_swa = swa is not None and is_swa_req_ring(
-            cache.token_to_kv_pool_allocator
+        pools = getattr(cache_linker, "pools", None)
+        self._skip_swa = swa is not None and (
+            PoolName.SWA not in pools
+            if pools is not None
+            else is_swa_req_ring(cache.token_to_kv_pool_allocator)
         )
         self._components = tuple(
             component
@@ -932,11 +935,29 @@ class UnifiedCacheLinkerWrapper:
         # then fail the async layer-wise session fatally. Re-check existence
         # here so the request degrades to a plain cache miss instead.
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
-        if (
-            not prepared_from_host_prefetch
-            and revalidate is not None
-            and not revalidate([transfer for _, transfer in component_transfers])
-        ):
+        locally_valid = True
+        if not prepared_from_host_prefetch and revalidate is not None:
+            if (
+                getattr(
+                    self.cache_linker, "requires_load_revalidation_consensus", False
+                )
+                is True
+            ):
+                try:
+                    locally_valid = revalidate(
+                        [transfer for _, transfer in component_transfers]
+                    )
+                except Exception:
+                    logger.exception("External linker revalidation failed on this rank")
+                    locally_valid = False
+                verdict = torch.tensor(int(locally_valid), dtype=torch.int)
+                cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+                locally_valid = bool(verdict.item())
+            else:
+                locally_valid = revalidate(
+                    [transfer for _, transfer in component_transfers]
+                )
+        if not locally_valid:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
                 req,
