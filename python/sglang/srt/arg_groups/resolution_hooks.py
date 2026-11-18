@@ -30,6 +30,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_multimodal",
         "handle_ssl_validation",
         "handle_asr_validation",
+        "handle_utility_validation",
         "handle_deprecated_args",
         "handle_prefill_delayer_env_compat",
         "handle_missing_default_values",

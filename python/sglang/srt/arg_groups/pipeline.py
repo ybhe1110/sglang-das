@@ -63,6 +63,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_return_hidden_states_mode,
         handle_ssl_validation,
         handle_tokenizer_batching,
+        handle_utility_validation,
         handle_watermark_config,
     )
 
@@ -121,6 +122,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_multimodal, server_args)
     run_hook(handle_ssl_validation, server_args)
     run_hook(handle_asr_validation, server_args)
+    run_hook(handle_utility_validation, server_args)
 
     run_hook(handle_deprecated_args, server_args)
 

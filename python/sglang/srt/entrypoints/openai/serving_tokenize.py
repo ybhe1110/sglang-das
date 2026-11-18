@@ -1,30 +1,57 @@
+import copy
 import logging
+import os
 from http import HTTPStatus
+from importlib.metadata import PackageNotFoundError, version
+from types import SimpleNamespace
 from typing import List, Optional, Union
 
 from fastapi import Request
-
+from fastapi.responses import ORJSONResponse, Response
+from pydantic import BaseModel
 from sglang.srt.entrypoints.openai.protocol import (
     DetokenizeRequest,
     DetokenizeResponse,
-    ErrorResponse,
     TokenizeRequest,
     TokenizeResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.utility_executor import UtilityError
+from sglang.srt.entrypoints.openai.utility_http import utility_error_response
 
 logger = logging.getLogger(__name__)
 
 
-class OpenAIServingTokenize(OpenAIServingBase):
+class _OpenAIServingUtility(OpenAIServingBase):
+    async def _convert_to_internal_request_async(self, request, raw_request=None):
+        # Utility conversion is an identity; never queue it behind generation
+        # tokenization. The complete synchronous operation runs in our pool.
+        return request, request
+
+    async def _run_utility(self, kind, request, raw_request):
+        ticket = raw_request.scope.get("utility_ticket") if raw_request else None
+        if ticket is None or self.utility_service is None:
+            return utility_error_response(
+                UtilityError("Utility admission is unavailable", 503)
+            )
+        try:
+            return await self.utility_service.run(ticket, kind, request)
+        except UtilityError as error:
+            return utility_error_response(error)
+
+
+class OpenAIServingTokenize(_OpenAIServingUtility):
     """Handler for /v1/tokenize requests"""
 
-    def __init__(self, tokenizer_manager, template_manager=None):
+    def __init__(
+        self, tokenizer_manager, template_manager=None, *, utility_service=None
+    ):
         super().__init__(tokenizer_manager)
+        self.utility_service = utility_service
         self.chat_serving: Optional[OpenAIServingChat] = (
             OpenAIServingChat(tokenizer_manager, template_manager)
-            if template_manager is not None
+            if template_manager is not None and utility_service is None
             else None
         )
 
@@ -41,7 +68,10 @@ class OpenAIServingTokenize(OpenAIServingBase):
         adapted_request: TokenizeRequest,
         request: TokenizeRequest,
         raw_request: Request,
-    ) -> Union[TokenizeResponse, ErrorResponse]:
+    ) -> Response:
+        return await self._run_utility("tokenize", request, raw_request)
+
+    def _run_non_streaming_sync(self, request: TokenizeRequest):
         try:
             tokenizer = self.tokenizer_manager.tokenizer
             max_model_len = getattr(tokenizer, "model_max_length", -1)
@@ -120,8 +150,12 @@ class OpenAIServingTokenize(OpenAIServingBase):
         raise ValueError("Failed to render chat messages into token ids.")
 
 
-class OpenAIServingDetokenize(OpenAIServingBase):
+class OpenAIServingDetokenize(_OpenAIServingUtility):
     """Handler for /v1/detokenize requests"""
+
+    def __init__(self, tokenizer_manager, *, utility_service=None):
+        super().__init__(tokenizer_manager)
+        self.utility_service = utility_service
 
     def _request_id_prefix(self) -> str:
         return "detok-"
@@ -136,7 +170,10 @@ class OpenAIServingDetokenize(OpenAIServingBase):
         adapted_request: DetokenizeRequest,
         request: DetokenizeRequest,
         raw_request: Request,
-    ) -> Union[DetokenizeResponse, ErrorResponse]:
+    ) -> Response:
+        return await self._run_utility("detokenize", request, raw_request)
+
+    def _run_non_streaming_sync(self, request: DetokenizeRequest):
         try:
             tokenizer = self.tokenizer_manager.tokenizer
 
@@ -192,3 +229,100 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+
+
+def _check_utility_items(request, limits):
+    batch = getattr(request, "prompt", None)
+    if batch is None:
+        batch = getattr(request, "messages", None)
+    tokens = getattr(request, "tokens", None)
+    if tokens and isinstance(tokens[0], list):
+        batch = tokens
+    if isinstance(batch, list) and len(batch) > limits.max_batch_size:
+        raise UtilityError("Tokenizer utility batch exceeds item limit", 413)
+    # Count the complete input, including extra Chat template/schema fields.
+    # Iterators avoid another copy of large token arrays or message dictionaries.
+    pending = [iter((request,))]
+    count = 0
+    while pending:
+        try:
+            value = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        count += 1
+        if count > limits.max_input_items:
+            raise UtilityError("Tokenizer utility input exceeds item limit", 413)
+        if isinstance(value, BaseModel):
+            pending.append(iter(value.__dict__.values()))
+            if value.__pydantic_extra__:
+                pending.append(iter(value.__pydantic_extra__.values()))
+        elif isinstance(value, dict):
+            pending.append(iter(value.values()))
+        elif isinstance(value, (list, tuple)):
+            pending.append(iter(value))
+
+
+def make_utility_backend_factory(manager, template_manager, limits):
+    """Capture only text-serving inputs, never manager sockets or GPU state.
+
+    Copy during startup, before generation can mutate the source tokenizer.
+    Each one-thread executor exclusively owns its tokenizer and Chat handler.
+    A non-copyable custom tokenizer fails startup explicitly instead of silently
+    sharing mutable tokenizer state with generation.
+    """
+    tokenizer = manager.tokenizer
+    config = {
+        name: manager.config_value(name)
+        for name in ("tool_call_parser", "reasoning_parser")
+    }
+    metadata = dict(
+        server_args=manager.server_args,
+        model_config=manager.model_config,
+        model_path=manager.model_path,
+        served_model_name=manager.served_model_name,
+        image_token_id=getattr(manager, "image_token_id", None),
+    )
+
+    def factory():
+        try:
+            private_tokenizer = copy.deepcopy(tokenizer)
+            private_template = copy.deepcopy(template_manager)
+        except Exception as exc:
+            raise RuntimeError(
+                "Cannot create a private utility tokenizer/template"
+            ) from exc
+        if tokenizer is not None and private_tokenizer is tokenizer:
+            raise RuntimeError("Utility tokenizer copy must be an independent instance")
+        versions = {}
+        for package in ("transformers", "tokenizers"):
+            try:
+                versions[package] = version(package)
+            except PackageNotFoundError:
+                versions[package] = "not installed"
+        logger.info(
+            "Utility tokenizer initialized: pid=%s class=%s is_fast=%s versions=%s",
+            os.getpid(),
+            type(private_tokenizer).__qualname__,
+            getattr(private_tokenizer, "is_fast", None),
+            versions,
+        )
+        view = SimpleNamespace(
+            **metadata, tokenizer=private_tokenizer, config_value=config.__getitem__
+        )
+        tokenize = OpenAIServingTokenize(view, private_template)
+        detokenize = OpenAIServingDetokenize(view)
+
+        def run(kind, request):
+            _check_utility_items(request, limits)
+            handler = tokenize if kind == "tokenize" else detokenize
+            result = handler._run_non_streaming_sync(request)
+            # Preserve the existing flat errors; successful models are encoded
+            # here too, so FastAPI does not serialize a large token list on-loop.
+            if isinstance(result, Response):
+                return result
+            return ORJSONResponse(result.model_dump())
+
+        return run
+
+    return factory

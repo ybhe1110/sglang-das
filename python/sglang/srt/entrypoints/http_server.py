@@ -112,10 +112,13 @@ from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
+    make_utility_backend_factory,
 )
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
+from sglang.srt.entrypoints.openai.utility_executor import UtilityLimits, UtilityService
+from sglang.srt.entrypoints.openai.utility_http import UtilityHTTPMiddleware
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
@@ -287,6 +290,19 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
+    # Covers early initialization failures as well as normal ASGI shutdown.
+    # Executors are created only in the owning HTTP process, never on import.
+    try:
+        async with _http_lifespan(fast_api_app):
+            yield
+    finally:
+        utility = getattr(fast_api_app.state, "utility_service", None)
+        if utility is not None:
+            await utility.aclose()
+
+
+@asynccontextmanager
+async def _http_lifespan(fast_api_app: FastAPI):
     grpc_handle = None
     sidecar = None
     warmup_thread = None
@@ -352,11 +368,28 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
+    utility_limits = UtilityLimits.from_config(get_serving())
+    utility_metrics = None
+    if get_observability().enable_metrics:
+        from sglang.srt.entrypoints.openai.utility_metrics import UtilityMetrics
+
+        utility_metrics = UtilityMetrics()
+    utility = UtilityService(utility_limits, utility_metrics)
+    fast_api_app.state.utility_service = utility
+    await utility.start(
+        make_utility_backend_factory(
+            _global_state.tokenizer_manager,
+            _global_state.template_manager,
+            utility_limits,
+        )
+    )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        _global_state.tokenizer_manager,
+        _global_state.template_manager,
+        utility_service=utility,
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, utility_service=utility
     )
     fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
         _global_state.tokenizer_manager
@@ -513,13 +546,6 @@ app = FastAPI(
     **fastapi_telemetry_disabled_kwargs(),
 )
 app.router.route_class = ORJSONRoute
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
@@ -527,6 +553,19 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     )
 
     app.add_middleware(RequestDecompressionMiddleware)
+
+# Added after decompression so it wraps it, admitting and bounding utility
+# requests before any body buffering. Other routes retain their existing path.
+app.add_middleware(UtilityHTTPMiddleware)
+
+# CORS also applies to utility admission/timeout responses.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router

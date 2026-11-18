@@ -55,6 +55,37 @@ class Serving(msgspec.Struct):
         int,
         "The worker num of the detokenizer manager.",
     ] = 1
+    # Per HTTP worker, separate from generation tokenization and detokenization.
+    utility_workers: A[int, "Private tokenizer threads per HTTP worker."] = 1
+    utility_max_admitted: A[
+        int, "Maximum utility work items or pending responses per HTTP worker."
+    ] = 8
+    utility_max_input_bytes: A[
+        int, "Maximum uncompressed JSON body bytes per tokenize/detokenize request."
+    ] = 2 * 1024 * 1024
+    utility_max_total_input_bytes: A[
+        int,
+        "Per-worker utility input byte reservations, including cancelled physical work.",
+    ] = 16 * 1024 * 1024
+    utility_max_input_items: A[
+        int, "Maximum utility input values, including token IDs and Chat schema values."
+    ] = 262144
+    utility_max_batch_size: A[
+        int, "Maximum utility batch texts/token lists or Chat messages."
+    ] = 1024
+    utility_max_output_bytes: A[
+        int, "Maximum serialized bytes per utility response."
+    ] = 8 * 1024 * 1024
+    utility_max_total_output_bytes: A[
+        int, "Per-worker utility output reservations, held through ASGI send."
+    ] = 64 * 1024 * 1024
+    utility_timeout: A[
+        float,
+        "Utility HTTP deadline in seconds, including queueing and response sending.",
+    ] = 60.0
+    utility_body_timeout: A[float, "Utility request body read timeout in seconds."] = (
+        15.0
+    )
     skip_tokenizer_init: A[
         bool, "If set, skip init tokenizer and pass input_ids in generate request."
     ] = False

@@ -1,0 +1,164 @@
+# HTTP tokenizer utility isolation
+
+This branch implements P0/P1 of the 2026-11-18 Python HTTP-blocking design on
+`release/20261106_v0.5.22-dsv4.1` (`b55eb27730`). It does not change generation,
+the scheduler, KV ownership, PD/EPD protocols, or GPU kernels.
+
+## Execution and ownership
+
+`/tokenize`, `/v1/tokenize`, `/detokenize`, and `/v1/detokenize` use a dedicated
+per-HTTP-worker service. The identity conversion bypasses generation's tokenizer
+executor. Chat conversion, template rendering, encode/decode, result-model
+construction, and JSON serialization run on a utility thread. Existing helper
+branches and error mappings are preserved. FastAPI still parses/validates the
+bounded JSON request on its event loop and retains its normal validation errors.
+
+Each utility thread owns a deep-copied tokenizer and template manager plus its
+own Chat handler/cache. Copies are created before the HTTP worker serves traffic;
+generation's mutable padding/truncation state is never used by a utility thread.
+A custom tokenizer that cannot be independently copied fails startup explicitly.
+The utility backend captures text-serving metadata, not engine sockets or GPU
+state. Runtime tokenizer/template replacement requires restarting HTTP workers.
+
+ASGI middleware admits requests **before** reading their bodies. Admission
+reserves one work slot, a maximum input byte allowance, one response slot, and a
+maximum output byte allowance. It rejects immediately instead of creating an
+unbounded admission-waiter queue. Input bytes are a conservative cost proxy that
+also covers Chat schemas and extra fields; input values/IDs and batch counts have
+additional limits. Total input-item count is bounded by
+`utility_max_admitted * utility_max_input_items`. These are bounds, not a
+model-calibrated prediction of CPU time or peak Python heap usage.
+
+A cancelled queued entry stays charged until physically dequeued. A cancelled
+running helper stays charged until it returns. The pool's Future is deliberately
+not cancelled, since cancellation alone does not remove its physical queue item.
+Work slots return on physical completion. Input reservations also cover FastAPI's
+request retention through response send. Output reservations shrink to serialized
+size at completion and remain charged until ASGI send completes/fails or the
+response is discarded. Output size is checked after serialization, so temporary
+encoder/output-model allocations still depend on the bounded input and tokenizer.
+
+The middleware is the sole transport receive owner after buffering the body.
+Disconnect cancels the application task; it does not pretend to interrupt native
+encode/decode. Shutdown stops admission, cancels pending replies, waits for real
+worker completion and HTTP owners, then joins executors off the event loop.
+An indefinitely stuck native call still requires process-level operational
+recovery; the implementation does not kill a shared thread.
+
+## Configuration and new HTTP policies
+
+All limits are **per HTTP worker**, registered in the `serving` configuration
+namespace and checked during server-argument resolution.
+
+| CLI parameter | Default |
+| --- | ---: |
+| `--utility-workers` | 1 |
+| `--utility-max-admitted` | 8 |
+| `--utility-max-input-bytes` | 2097152 (2 MiB per request) |
+| `--utility-max-total-input-bytes` | 16777216 (16 MiB) |
+| `--utility-max-input-items` | 262144 (includes JSON values and token IDs) |
+| `--utility-max-batch-size` | 1024 (texts, token lists, or messages) |
+| `--utility-max-output-bytes` | 8388608 (8 MiB per response) |
+| `--utility-max-total-output-bytes` | 67108864 (64 MiB) |
+| `--utility-timeout` | 60 seconds, including body, queue, work, and send |
+| `--utility-body-timeout` | 15 seconds |
+
+Worst-case reservations can reject a small request even when actual bytes in
+flight are lower than the configured ceiling. This is intentional conservative
+admission. Input limits do not depend on `Content-Length`; chunked bodies are
+counted as received. Overload returns a flat 429 error with `Retry-After: 1`;
+size/item limits return 413; unavailable/shutting-down service returns 503;
+deadline expiry before headers returns 504. An expired send after headers is
+cancelled without appending a second response. Disconnect sends no synthetic 499.
+Error sends have a separate bounded wait of at most `utility_body_timeout`.
+The output limit must be at least 256 bytes to accommodate bounded error envelopes.
+Admission rejection sends have a one-second timeout and never retain a request body.
+
+**New compatibility policy:** compressed bodies (`x-body-compressed` or a
+non-identity `Content-Encoding`) are rejected with 415 on utility endpoints.
+The existing optional global decompressor can allocate an unbounded expanded
+body before routing, so it must not run ahead of utility admission. Other
+endpoints retain their existing compression behavior. Clients of utilities
+should send uncompressed JSON and adjust large-request limits explicitly.
+
+## Multi-worker rollout and metrics
+
+Start with one HTTP worker, then use the existing `--tokenizer-worker-num 2` (and
+later higher values within measured CPU/RSS budgets). Each HTTP process creates
+its service inside lifespan; no executor is inherited from the parent. Existing
+API-key, native-gRPC, HTTP/2, and topology restrictions still apply. Extra HTTP
+workers do not create extra model ranks. Allow CPU for generation tokenization,
+tokenizer internal parallelism, and scheduler processes in addition to utilities.
+
+With `--enable-metrics`, `sglang:utility_*` metrics carry `worker_pid`: work/input
+reservations, pending responses/output bytes, cancelled work, rejection/deadline
+counters, queue/execution time histograms, and HTTP loop lag. Startup logs report
+the tokenizer class, `is_fast`, PID, and actual transformers/tokenizers versions.
+
+Threads remove the direct synchronous HTTP-loop call, but do not guarantee a
+latency ceiling for Python-heavy or GIL-holding native code. A separate Utility
+process backend, short/long scheduling, aging, and tenant quotas are conditional
+or future phases, not implemented here. Measure real model encode/decode/template
+behavior before deciding whether process isolation is necessary.
+
+## Validation
+
+In an installed SGLang test environment, run each file in its own process:
+
+```bash
+python test/registered/unit/entrypoints/test_utility_executor.py
+python test/registered/unit/entrypoints/test_serving_tokenize_utility.py
+```
+
+Tests exercise physical-queue cancellation, running failures, completion/cancel
+races, response ownership under slow/failed sends, disconnects, input limits,
+deadlines, shutdown, aliases, unchanged error/shape semantics, Chat argument
+forwarding, private tokenizer state, and a real locally constructed HF fast
+tokenizer without downloading weights. The template spy checks utility argument
+forwarding; it does not replace a deployment test of the target model's templates.
+
+`http_mixed_probe.py` is the supplied design's probe, copied without behavioral
+changes. Use independent baseline and modified deployments, identical model,
+CPU budget, text/IDs, and generation settings. Prepare legal model-specific
+payloads before the measurement window:
+
+```bash
+python benchmark/http_utility/http_mixed_probe.py \
+  --base-url http://127.0.0.1:30000 \
+  --tool-path /v1/tokenize --tool-body long.json --short-body short.json \
+  --stream-path /v1/chat/completions --stream-body stream.json \
+  --inject-after-events 10 --tool-count 3 --tool-concurrency 3 \
+  --duration 20 --interval-ms 20 --output utility_fixed.jsonl
+```
+
+Repeat for detokenize and Chat tools, one/multiple HTTP workers, and sustained
+overload; use at least five warmed rounds. Compare per-PID loop lag, p99 probe
+latency, SSE gaps, TTFT, generation throughput, CPU/RSS, refusals, and budget return
+to baseline. The probe's client dispatch lag/skips must be included in analysis.
+No GPU/DCU mixed-load latency or full production model compatibility is claimed
+by the CPU unit tests. Roll back by deploying the parent release version; never
+replay a generation request that has already streamed output.
+
+### Local validation (2026-11-18)
+
+All 22 tests passed in an isolated Windows CPU harness: 17 executor/ASGI lifecycle
+tests and 5 serving/HTTP/tokenizer tests. The real HF tokenizer checks used the
+repository-pinned `transformers==5.19.0` and `tokenizers==0.23.2`. No weights were
+downloaded. CLI field registration and parsing, Prometheus metric creation and
+budget return, and Python syntax/static checks were also verified. An AST
+comparison confirmed that both original synchronous utility method bodies were
+preserved; a regression probe confirmed execution moved from the event-loop
+thread to a worker thread.
+
+The local environment lacks PyTorch and the complete SGLang runtime. Temporary
+harnesses bypassed heavyweight package initialization and substituted the test
+base and unused engine imports; they loaded the real protocol, serving base,
+utility handlers, executor, middleware, and tokenizer implementations. Chat
+argument forwarding used a template spy. These results do **not** constitute a
+full application startup, target-model Chat-template compatibility test, or
+HCU mixed-load acceptance run. Run the commands and deployment probes above in
+the complete serving environment before rollout.
+
+Static review also found the pre-existing duplicate
+`validation_exception_handler` function name in `http_server.py` (Ruff F811).
+This unrelated baseline issue was left unchanged.

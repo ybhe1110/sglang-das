@@ -129,6 +129,12 @@ def handle_asr_validation(server_args: Any):
         )
 
 
+def handle_utility_validation(server_args: Any):
+    from sglang.srt.entrypoints.openai.utility_executor import UtilityLimits
+
+    UtilityLimits.from_config(resolving_view(server_args))
+
+
 def handle_multimodal(server_args: Any):
     """Validate mm_process_config structure before model loading."""
     cfg = resolving_view(server_args)
