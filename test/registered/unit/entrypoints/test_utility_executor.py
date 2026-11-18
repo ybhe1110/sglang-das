@@ -4,7 +4,7 @@ import asyncio
 import json
 import threading
 import unittest
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints.openai.utility_executor import (
@@ -122,7 +122,7 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         ticket = service.admit()
         await service.run(ticket, "tokenize", "x")
         self.assertEqual(service.work_used, 0)
-        self.assertEqual(service.output_bytes, 2)
+        self.assertEqual(service.output_bytes, 256)
         self.assertEqual(service.response_used, 1)
         with self.assertRaises(UtilityError):
             service.admit()
@@ -195,7 +195,9 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         await asyncio.wait_for(closing, 5)
         self.assert_empty(service)
 
-    async def http(self, service, *, path="/v1/tokenize", chunks=None, send=None):
+    async def http(
+        self, service, *, path="/v1/tokenize", chunks=None, send=None, app=None
+    ):
         incoming = asyncio.Queue()
         for chunk, more in chunks or [(b"{}", False)]:
             incoming.put_nowait(
@@ -226,7 +228,9 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
             "app": SimpleNamespace(state=SimpleNamespace(utility_service=service)),
         }
         task = asyncio.create_task(
-            UtilityHTTPMiddleware(downstream)(scope, incoming.get, send or record)
+            UtilityHTTPMiddleware(app or downstream)(
+                scope, incoming.get, send or record
+            )
         )
         return task, incoming, sent
 
@@ -258,7 +262,7 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         task, _, _ = await self.http(service, send=send)
         await asyncio.wait_for(sending.wait(), 2)
         self.assertEqual(service.work_used, 0)
-        self.assertEqual(service.output_bytes, 2)
+        self.assertEqual(service.output_bytes, 256)
         with self.assertRaises(UtilityError):
             service.admit()
         health, _, sent = await self.http(service, path="/health")
@@ -369,6 +373,110 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         self.assertEqual(sent[0]["status"], 413)
         self.assert_empty(service)
 
+    async def test_shutdown_deadline_retains_native_work_until_late_completion(self):
+        """A stuck native call must not make the shutdown coroutine wait forever."""
+        backend, started, gate, _ = self.blocking_backend()
+        service = await self.service(backend, shutdown_timeout=0.03)
+        task, _, _ = await self.http(service)
+        await asyncio.wait_for(started.wait(), 2)
+        with self.assertRaisesRegex(TimeoutError, "grace period expired"):
+            await asyncio.wait_for(service.aclose(), 1)
+        self.assertEqual(service.work_used, 1)
+        self.assertEqual(service.response_used, 1)
+        with self.assertRaises(UtilityError):
+            service.admit()
+        await asyncio.gather(task, return_exceptions=True)
+        gate.set()
+        await self.settle(service)
+        await service.aclose()
+        self.assert_empty(service)
+
+    async def test_shutdown_deadline_does_not_clear_uncooperative_sender(self):
+        """A sender delaying cancellation keeps its lease after shutdown failure."""
+        service = await self.service(shutdown_timeout=0.03)
+        sending, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                sending.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    await release.wait()
+
+        task, _, _ = await self.http(service, send=send)
+        try:
+            await asyncio.wait_for(sending.wait(), 2)
+            with self.assertRaisesRegex(TimeoutError, "grace period expired"):
+                await asyncio.wait_for(service.aclose(), 1)
+            await asyncio.wait_for(cancelled.wait(), 2)
+            self.assertEqual(service.response_used, 1)
+            self.assertGreaterEqual(service.output_bytes, 256)
+            self.assertFalse(task.done())
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+        await service.aclose()
+        self.assert_empty(service)
+
+    async def test_preheader_timeout_error_fits_shrunken_reservation(self):
+        """Replacing a tiny completed result with 504 must stay within its lease."""
+        service = await self.service(timeout=0.03, max_output_bytes=256)
+        sent = []
+
+        async def downstream(scope, receive, send):
+            await service.run(scope["utility_ticket"], "tokenize", b"{}")
+            await asyncio.Event().wait()
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                self.assertLessEqual(len(message["body"]), service.output_bytes)
+            sent.append(message)
+
+        task, _, _ = await self.http(service, app=downstream, send=send)
+        await asyncio.wait_for(task, 2)
+        self.assertEqual(sent[0]["status"], 504)
+        self.assert_empty(service)
+        error = utility_error_response(UtilityError("x" * 4096, 413))
+        self.assertLessEqual(len(error.body), 256)
+        self.assertEqual(error.status_code, 413)
+
+    async def test_duplicate_response_start_is_rejected_before_and_after_headers(self):
+        """A second start must never silently replace or repeat response headers."""
+        for first_body in (False, True):
+            with self.subTest(first_body=first_body):
+                service = await self.service()
+                sent = []
+
+                async def downstream(scope, receive, send):
+                    await send(
+                        {"type": "http.response.start", "status": 200, "headers": []}
+                    )
+                    if first_body:
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": b"x",
+                                "more_body": True,
+                            }
+                        )
+                    await send(
+                        {"type": "http.response.start", "status": 201, "headers": []}
+                    )
+
+                async def send(message):
+                    sent.append(message)
+
+                task, _, _ = await self.http(service, app=downstream, send=send)
+                with self.assertRaisesRegex(RuntimeError, "Duplicate utility"):
+                    await asyncio.wait_for(task, 2)
+                starts = [
+                    m["status"] for m in sent if m["type"] == "http.response.start"
+                ]
+                self.assertEqual(starts, [200] if first_body else [])
+                self.assert_empty(service)
+
     def test_invalid_limits_fail_before_startup(self):
         for values in (
             {"workers": 0},
@@ -378,6 +486,22 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         ):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 UtilityLimits(**values)
+
+    def test_limit_types_reject_bool_and_fractional_integer_settings(self):
+        """Programmatic configuration must obey the same types as CLI fields."""
+        durations = {"timeout", "body_timeout", "shutdown_timeout"}
+        for field in fields(UtilityLimits):
+            bad_values = (True, "2", None)
+            if field.name not in durations:
+                bad_values += (1.5, 2.0)
+            else:
+                bad_values += (float("inf"), float("nan"))
+            for value in bad_values:
+                with (
+                    self.subTest(field=field.name, value=value),
+                    self.assertRaises(ValueError),
+                ):
+                    UtilityLimits(**{field.name: value})
 
 
 if __name__ == "__main__":

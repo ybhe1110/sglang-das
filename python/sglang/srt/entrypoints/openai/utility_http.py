@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 
-from sglang.srt.entrypoints.openai.utility_executor import UtilityError
+from sglang.srt.entrypoints.openai.utility_executor import (
+    ERROR_RESPONSE_BYTES,
+    UtilityError,
+)
 from starlette.responses import JSONResponse
 
 UTILITY_PATHS = frozenset(
@@ -13,7 +16,7 @@ UTILITY_PATHS = frozenset(
 
 
 def utility_error_response(error: UtilityError):
-    return JSONResponse(
+    response = JSONResponse(
         {
             "object": "error",
             "message": str(error),
@@ -24,6 +27,11 @@ def utility_error_response(error: UtilityError):
         status_code=error.status,
         headers={"Retry-After": "1"} if error.status == 429 else None,
     )
+    if len(response.body) > ERROR_RESPONSE_BYTES:
+        return utility_error_response(
+            UtilityError("Tokenizer utility request failed", error.status)
+        )
+    return response
 
 
 class UtilityHTTPMiddleware:
@@ -47,6 +55,7 @@ class UtilityHTTPMiddleware:
             if service is None:
                 raise UtilityError("Tokenizer utility service is unavailable", 503)
             ticket = service.admit()
+            ticket.http_owner = asyncio.current_task()
         except UtilityError as error:
             try:
                 await asyncio.wait_for(
@@ -61,9 +70,14 @@ class UtilityHTTPMiddleware:
 
         async def send_error(error):
             # Even rejection/timeout responses need a finite slow-client wait.
+            response = utility_error_response(error)
+            if len(response.body) > min(
+                ticket.output_bytes, service.limits.max_output_bytes
+            ):
+                raise RuntimeError("Utility error response exceeds reserved output")
             try:
                 await asyncio.wait_for(
-                    utility_error_response(error)(scope, receive, send),
+                    response(scope, receive, send),
                     service.limits.body_timeout,
                 )
             except TimeoutError:
@@ -138,6 +152,8 @@ class UtilityHTTPMiddleware:
             async def send_response(message):
                 nonlocal response_started, pending_start, sent_bytes
                 if message["type"] == "http.response.start":
+                    if pending_start is not None or response_started:
+                        raise RuntimeError("Duplicate utility http.response.start")
                     pending_start = message
                     return
                 if message["type"] == "http.response.body":

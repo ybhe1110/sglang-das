@@ -8,12 +8,16 @@ response reservations until it has actually returned (or been dequeued).
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
 from typing import Callable
+
+logger = logging.getLogger(__name__)
+ERROR_RESPONSE_BYTES = 256
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,7 @@ class UtilityLimits:
     max_total_output_bytes: int = 64 * 1024 * 1024
     timeout: float = 60.0
     body_timeout: float = 15.0
+    shutdown_timeout: float = 10.0
 
     @classmethod
     def from_config(cls, config):
@@ -38,13 +43,21 @@ class UtilityLimits:
     def __post_init__(self):
         for f in fields(self):
             value = getattr(self, f.name)
-            if not math.isfinite(value) or value <= 0:
+            is_duration = f.name in {"timeout", "body_timeout", "shutdown_timeout"}
+            valid_type = (
+                type(value) in (int, float) if is_duration else type(value) is int
+            )
+            if (
+                not valid_type
+                or value <= 0
+                or (is_duration and not math.isfinite(value))
+            ):
                 raise ValueError(
                     f"--utility-{f.name.replace('_', '-')} must be positive"
                 )
         if self.workers > self.max_admitted:
             raise ValueError("--utility-workers must not exceed --utility-max-admitted")
-        if self.max_output_bytes < 256:
+        if self.max_output_bytes < ERROR_RESPONSE_BYTES:
             raise ValueError(
                 "--utility-max-output-bytes must be at least 256 for errors"
             )
@@ -76,12 +89,14 @@ class UtilityTicket:
         self.output_bytes = service.limits.max_output_bytes
         self.admitted_at = time.monotonic()
         self.started_at = None
+        self.http_owner = None
 
     def close(self):
         """Called by the ASGI owner on send completion, disconnect or error."""
         if self.http_done:
             return
         self.http_done = True
+        self.http_owner = None
         self.cancelled.set()
         if self.reply is not None:
             if self.reply.done() and not self.reply.cancelled():
@@ -219,7 +234,8 @@ class UtilityService:
         else:
             if reply is not None and not reply.done():
                 if result is not None:
-                    size = len(result.body)
+                    # A pre-header deadline can replace this result with an error.
+                    size = max(ERROR_RESPONSE_BYTES, len(result.body))
                     self.output_bytes -= ticket.output_bytes - size
                     ticket.output_bytes = size
                 reply.set_result(result)
@@ -274,13 +290,39 @@ class UtilityService:
             ticket.cancelled.set()
             if ticket.reply is not None and not ticket.reply.done():
                 ticket.reply.cancel()
-        await self._empty.wait()
+        # Stop executor admission without cancelling physical queue entries.
+        # Their completion callbacks must still account for actual work.
         for pool, _ in self._workers:
-            # wait=True must never block the serving event loop.
-            await asyncio.to_thread(pool.shutdown, wait=True)
-        self._workers.clear()
-        if self._lag_task is not None:
-            self._lag_task.cancel()
-            await asyncio.gather(self._lag_task, return_exceptions=True)
-            self._lag_task = None
-        self._observe()
+            pool.shutdown(wait=False)
+
+        async def drain():
+            await self._empty.wait()
+            # All submitted work has physically returned; joining is now safe.
+            for pool, _ in self._workers:
+                await asyncio.to_thread(pool.shutdown, wait=True)
+
+        try:
+            await asyncio.wait_for(drain(), self.limits.shutdown_timeout)
+            self._workers.clear()
+        except TimeoutError:
+            for ticket in list(self.tickets):
+                owner = ticket.http_owner
+                if owner is not None and owner is not asyncio.current_task():
+                    owner.cancel()
+            logger.error(
+                "Utility shutdown exceeded %.3fs: %s; reservations retained. "
+                "Process supervisor must enforce the final termination deadline "
+                "if native work or HTTP cancellation does not complete.",
+                self.limits.shutdown_timeout,
+                self.snapshot(),
+            )
+            # Do not clear tickets: late HTTP cleanup and _settle remain valid.
+            raise TimeoutError(
+                "Tokenizer utility shutdown grace period expired"
+            ) from None
+        finally:
+            if self._lag_task is not None:
+                self._lag_task.cancel()
+                await asyncio.gather(self._lag_task, return_exceptions=True)
+                self._lag_task = None
+            self._observe()

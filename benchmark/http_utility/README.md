@@ -34,16 +34,34 @@ running helper stays charged until it returns. The pool's Future is deliberately
 not cancelled, since cancellation alone does not remove its physical queue item.
 Work slots return on physical completion. Input reservations also cover FastAPI's
 request retention through response send. Output reservations shrink to serialized
-size at completion and remain charged until ASGI send completes/fails or the
+size (with a 256-byte error-response floor) at completion and remain charged until ASGI send completes/fails or the
 response is discarded. Output size is checked after serialization, so temporary
 encoder/output-model allocations still depend on the bounded input and tokenizer.
 
 The middleware is the sole transport receive owner after buffering the body.
 Disconnect cancels the application task; it does not pretend to interrupt native
-encode/decode. Shutdown stops admission, cancels pending replies, waits for real
-worker completion and HTTP owners, then joins executors off the event loop.
-An indefinitely stuck native call still requires process-level operational
-recovery; the implementation does not kill a shared thread.
+encode/decode. Shutdown follows the bounded drain policy below.
+
+### Shutdown policy
+
+1. Stop service/executor admission and cancel pending replies. Keep physical
+   queue entries and their reservations until they actually complete.
+2. Allow `utility_shutdown_timeout` seconds (default 10) for HTTP owners and
+   physical work to finish and executors to join off the event loop.
+3. If the grace period expires, request cancellation of remaining HTTP owners,
+   log the outstanding work/input/response/output budgets, and raise `TimeoutError`
+   from `aclose()` into lifespan shutdown. Stop loop-lag sampling on either path.
+   Do not clear tickets, force counters to zero, or report successful shutdown.
+4. While the event loop remains alive, late HTTP cleanup and worker completion
+   still release reservations exactly once. A later `aclose()` can finish draining.
+
+This bounds the service's cooperative drain wait, not the lifetime of a stuck
+native thread or a cancellation-resistant ASGI task. `shutdown(wait=False)` does
+not terminate running threads, and the ASGI server's own pre-lifespan drain has
+its own timing. Deployment supervision must enforce a final process termination
+deadline, allowing time for both the ASGI drain and this grace period. The library
+does not call `os._exit()` or kill the shared serving process. Full server/supervisor
+shutdown behavior remains a deployment acceptance test.
 
 ## Configuration and new HTTP policies
 
@@ -62,6 +80,7 @@ namespace and checked during server-argument resolution.
 | `--utility-max-total-output-bytes` | 67108864 (64 MiB) |
 | `--utility-timeout` | 60 seconds, including body, queue, work, and send |
 | `--utility-body-timeout` | 15 seconds |
+| `--utility-shutdown-timeout` | 10 seconds |
 
 Worst-case reservations can reject a small request even when actual bytes in
 flight are lower than the configured ceiling. This is intentional conservative
@@ -72,7 +91,14 @@ deadline expiry before headers returns 504. An expired send after headers is
 cancelled without appending a second response. Disconnect sends no synthetic 499.
 Error sends have a separate bounded wait of at most `utility_body_timeout`.
 The output limit must be at least 256 bytes to accommodate bounded error envelopes.
+Utility error messages that would exceed that envelope use a short fallback while
+preserving the status code. Error sends check the remaining reservation explicitly;
+they do not reuse the interrupted success response's buffered headers/byte count.
+Duplicate `http.response.start` messages raise a protocol error, both before and
+after the first headers have been forwarded.
 Admission rejection sends have a one-second timeout and never retain a request body.
+Capacity fields require positive integers (not booleans or floats). Duration
+fields accept positive finite integers/floats, but reject booleans and strings.
 
 **New compatibility policy:** compressed bodies (`x-body-compressed` or a
 non-identity `Content-Encoding`) are rejected with 415 on utility endpoints.
@@ -141,7 +167,7 @@ replay a generation request that has already streamed output.
 
 ### Local validation (2026-11-18)
 
-All 22 tests passed in an isolated Windows CPU harness: 17 executor/ASGI lifecycle
+The initial 22 tests passed in an isolated Windows CPU harness: 17 executor/ASGI lifecycle
 tests and 5 serving/HTTP/tokenizer tests. The real HF tokenizer checks used the
 repository-pinned `transformers==5.19.0` and `tokenizers==0.23.2`. No weights were
 downloaded. CLI field registration and parsing, Prometheus metric creation and
@@ -162,3 +188,11 @@ the complete serving environment before rollout.
 Static review also found the pre-existing duplicate
 `validation_exception_handler` function name in `http_server.py` (Ruff F811).
 This unrelated baseline issue was left unchanged.
+
+The review follow-up passed all 27 CPU tests (22 executor/ASGI plus 5 serving
+tests). Added coverage exercises shutdown grace expiry with blocked native work
+and a sender delaying cancellation, late cleanup after shutdown failure, a 504
+replacing a tiny success response, invalid configuration types, and duplicate
+response starts before/after headers. The response-budget, type-validation and
+duplicate-start regressions were also run against the pre-fix implementations
+and failed there. The same isolated-harness limitations above apply.

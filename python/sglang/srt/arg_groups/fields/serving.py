@@ -86,6 +86,9 @@ class Serving(msgspec.Struct):
     utility_body_timeout: A[float, "Utility request body read timeout in seconds."] = (
         15.0
     )
+    utility_shutdown_timeout: A[
+        float, "Utility shutdown grace period in seconds before reporting failure."
+    ] = 10.0
     skip_tokenizer_init: A[
         bool, "If set, skip init tokenizer and pass input_ids in generate request."
     ] = False
