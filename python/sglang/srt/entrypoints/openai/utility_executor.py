@@ -90,6 +90,7 @@ class UtilityTicket:
         self.admitted_at = time.monotonic()
         self.started_at = None
         self.http_owner = None
+        self.http_cleanup = None
 
     def close(self):
         """Called by the ASGI owner on send completion, disconnect or error."""
@@ -168,7 +169,7 @@ class UtilityService:
         self._observe()
         return ticket
 
-    async def run(self, ticket: UtilityTicket, kind: str, request):
+    async def run(self, ticket: UtilityTicket, kind: str, request, *, before_run=None):
         if ticket.service is not self or ticket.submitted or ticket.http_done:
             raise RuntimeError("Utility ticket is not available for submission")
         if not self.accepting:
@@ -190,6 +191,8 @@ class UtilityService:
                     ticket.started_at - ticket.admitted_at
                 )
             try:
+                if before_run is not None:
+                    before_run()
                 result = backend(kind, request)
                 if len(result.body) > self.limits.max_output_bytes:
                     raise UtilityError(

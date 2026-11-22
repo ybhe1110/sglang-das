@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
@@ -10,7 +9,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
-
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -85,9 +83,7 @@ class OpenAIServingBase(ABC):
                 return self.create_error_response(error_msg)
 
             # Log the raw OpenAI request payload before conversion to tokenized form.
-            request_logger = self.tokenizer_manager.request_logger
-            if request_logger.log_requests and request_logger.log_requests_level >= 2:
-                request_logger.log_openai_received_request(request, request=raw_request)
+            self._log_received_request(request, raw_request)
 
             # Convert to internal format
             (
@@ -132,6 +128,11 @@ class OpenAIServingBase(ABC):
                 err_type="InternalServerError",
                 status_code=500,
             )
+
+    def _log_received_request(self, request, raw_request):
+        request_logger = self.tokenizer_manager.request_logger
+        if request_logger.log_requests and request_logger.log_requests_level >= 2:
+            request_logger.log_openai_received_request(request, request=raw_request)
 
     @abstractmethod
     def _request_id_prefix(self) -> str:

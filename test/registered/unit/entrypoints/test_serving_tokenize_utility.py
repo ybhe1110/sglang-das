@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+import logging
 import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +18,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 )
 from sglang.srt.entrypoints.openai.utility_executor import UtilityLimits, UtilityService
 from sglang.srt.entrypoints.openai.utility_http import UtilityHTTPMiddleware
+from sglang.srt.utils.request_logger import RequestLogger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -87,6 +90,73 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
             return response.status_code, json.loads(response.body)
         finally:
             ticket.close()
+
+    async def test_detailed_logging_uses_admitted_worker_and_preserves_headers(self):
+        """Slow sinks and payload dumps must not execute on the HTTP loop."""
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        for fmt, level, handler, request in (
+            ("text", 2, self.tokenize, TokenizeRequest(prompt="hello")),
+            ("json", 3, self.detokenize, DetokenizeRequest(tokens=[67, 68])),
+        ):
+            with self.subTest(format=fmt, level=level):
+                entered, gate = asyncio.Event(), threading.Event()
+                messages, sink_threads, dump_threads = [], [], []
+
+                class Sink(logging.Handler):
+                    def emit(self, record):
+                        sink_threads.append(threading.get_ident())
+                        messages.append(record.getMessage())
+                        loop.call_soon_threadsafe(entered.set)
+                        # On broken code, fail the thread assertion rather than
+                        # deadlocking the test's own event loop.
+                        if threading.get_ident() != loop_thread:
+                            if not gate.wait(5):
+                                raise TimeoutError("Test did not release log sink")
+
+                logger = RequestLogger(True, level, fmt, None)
+                target = logging.Logger("utility-test", level=logging.INFO)
+                target.addHandler(Sink())
+                logger.targets = [target]
+                self.manager.request_logger = logger
+                model = type(request)
+                original_dump = model.model_dump
+
+                def dump(instance, *args, **kwargs):
+                    dump_threads.append(threading.get_ident())
+                    return original_dump(instance, *args, **kwargs)
+
+                ticket = self.service.admit()
+                raw = Request(
+                    {
+                        "type": "http",
+                        "headers": [
+                            (b"x-smg-routing-key", b"route-a"),
+                            (b"authorization", b"secret"),
+                        ],
+                        "utility_ticket": ticket,
+                    }
+                )
+                with patch.object(model, "model_dump", dump):
+                    task = asyncio.create_task(handler.handle_request(request, raw))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 2)
+                        self.assertTrue(dump_threads)
+                        self.assertTrue(
+                            all(t != loop_thread for t in dump_threads + sink_threads)
+                        )
+                        self.assertEqual(self.service.work_used, 1)
+                        await asyncio.sleep(0)
+                        self.assertFalse(task.done())
+                    finally:
+                        gate.set()
+                        response = await asyncio.wait_for(task, 2)
+                        ticket.close()
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(len(messages), 1)
+                self.assertIn("route-a", messages[0])
+                self.assertNotIn("secret", messages[0])
+                self.assertEqual(self.service.response_used, 0)
 
     async def test_prompt_branches_and_special_tokens_match_original(self):
         for prompt in ("", "中文🙂", ["hello", "中文", ""], []):

@@ -23,7 +23,6 @@ from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
     import fastapi
-
     from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 
 logger = logging.getLogger(__name__)
@@ -133,11 +132,14 @@ class RequestLogger:
         self,
         obj: Any,
         request: Optional[fastapi.Request] = None,
+        *,
+        headers: Optional[Dict[str, str]] = None,
     ) -> None:
         """Log the raw OpenAI request payload before request adaptation/tokenization."""
         max_length, _, _ = self.metadata
         max_length = max_length if max_length is not None else 2048
-        headers = _extract_whitelisted_headers(request)
+        if headers is None:
+            headers = _extract_whitelisted_headers(request)
 
         if hasattr(obj, "model_dump"):
             obj_to_log = obj.model_dump(exclude_none=True)

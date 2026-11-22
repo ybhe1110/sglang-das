@@ -13,6 +13,14 @@ construction, and JSON serialization run on a utility thread. Existing helper
 branches and error mappings are preserved. FastAPI still parses/validates the
 bounded JSON request on its event loop and retains its normal validation errors.
 
+Detailed utility request logging (levels 2/3) also runs in the admitted work
+item, before tokenization. Only whitelisted request headers and a shallow logger
+configuration snapshot are captured on the loop; payload dumping, formatting,
+redaction and sink writes execute on the utility thread. Slow sinks retain the
+same work/input/response reservations and no separate logging queue is created.
+Work cancelled before execution skips logging as well as tokenization. Logging
+for generation endpoints continues through the base handler's existing path.
+
 Each utility thread owns a deep-copied tokenizer and template manager plus its
 own Chat handler/cache. Copies are created before the HTTP worker serves traffic;
 generation's mutable padding/truncation state is never used by a utility thread.
@@ -41,6 +49,11 @@ encoder/output-model allocations still depend on the bounded input and tokenizer
 The middleware is the sole transport receive owner after buffering the body.
 Disconnect cancels the application task; it does not pretend to interrupt native
 encode/decode. Shutdown follows the bounded drain policy below.
+
+Child-task cleanup is retained by the ticket and shielded from repeated HTTP
+owner cancellation. If the owner exits while cleanup is still pending, a completion
+callback closes the ticket only after both application and disconnect watcher
+finish. This prevents orphaned leases without releasing live response buffers.
 
 ### Shutdown policy
 
@@ -196,3 +209,14 @@ replacing a tiny success response, invalid configuration types, and duplicate
 response starts before/after headers. The response-budget, type-validation and
 duplicate-start regressions were also run against the pre-fix implementations
 and failed there. The same isolated-harness limitations above apply.
+
+The 2026-11-22 follow-up passed 29 CPU tests (23 executor/ASGI plus 6 serving
+tests). New regressions cover shutdown cancellation during disconnect cleanup,
+eventual budget return after the HTTP owner exits, and level-2 text / level-3 JSON
+logging with a blocked sink, worker-thread payload dumps, whitelisted headers,
+and exclusion of unapproved headers. Both regressions fail against the previous
+commit. The local harness loads the actual request logger and formatting code;
+it substitutes the unavailable distributed runtime and unused watermark config
+types while loading the redaction function from repository source. Full HCU
+serving, model-specific Chat initialization and mixed-load latency remain outside
+these CPU checks.

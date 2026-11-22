@@ -66,7 +66,16 @@ class UtilityHTTPMiddleware:
             return
 
         tasks = []
+        cleanup = None
         response_started = False
+
+        def cancel_children():
+            nonlocal cleanup
+            if cleanup is None:
+                for task in tasks:
+                    task.cancel()
+                cleanup = asyncio.gather(*tasks, return_exceptions=True)
+            return cleanup
 
         async def send_error(error):
             # Even rejection/timeout responses need a finite slow-client wait.
@@ -190,9 +199,7 @@ class UtilityHTTPMiddleware:
                 service.metrics.timed_out.inc()
             if not response_started:
                 # Stop the handler before starting a timeout response.
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.shield(cancel_children())
                 await send_error(
                     UtilityError("Tokenizer utility deadline exceeded", 504)
                 )
@@ -200,7 +207,17 @@ class UtilityHTTPMiddleware:
             if not response_started:
                 await send_error(error)
         finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            ticket.close()
+            # A second owner cancellation must neither cancel the drain nor
+            # lose the lease. The ticket retains the drain until both children
+            # really finish, even if this middleware task has already exited.
+            pending = ticket.http_cleanup = cancel_children()
+
+            def finish_cleanup(_):
+                ticket.http_cleanup = None
+                ticket.close()
+
+            if pending.done():
+                finish_cleanup(pending)
+            else:
+                pending.add_done_callback(finish_cleanup)
+            await asyncio.shield(pending)

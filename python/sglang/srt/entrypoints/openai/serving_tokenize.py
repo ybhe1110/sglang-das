@@ -1,6 +1,7 @@
 import copy
 import logging
 import os
+from functools import partial
 from http import HTTPStatus
 from importlib.metadata import PackageNotFoundError, version
 from types import SimpleNamespace
@@ -19,11 +20,17 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.utility_executor import UtilityError
 from sglang.srt.entrypoints.openai.utility_http import utility_error_response
+from sglang.srt.utils.request_logger import _extract_whitelisted_headers
 
 logger = logging.getLogger(__name__)
 
 
 class _OpenAIServingUtility(OpenAIServingBase):
+    def _log_received_request(self, request, raw_request):
+        # Log inside the admitted utility work item, before conversion. The base
+        # hook must not dump/format the payload or write to a sink on the loop.
+        pass
+
     async def _convert_to_internal_request_async(self, request, raw_request=None):
         # Utility conversion is an identity; never queue it behind generation
         # tokenization. The complete synchronous operation runs in our pool.
@@ -36,7 +43,19 @@ class _OpenAIServingUtility(OpenAIServingBase):
                 UtilityError("Utility admission is unavailable", 503)
             )
         try:
-            return await self.utility_service.run(ticket, kind, request)
+            before_run = None
+            request_logger = self.tokenizer_manager.request_logger
+            if request_logger.log_requests and request_logger.log_requests_level >= 2:
+                # Snapshot configuration and whitelisted headers, not the body
+                # or ASGI Request. No separate unbounded logging queue is used.
+                before_run = partial(
+                    copy.copy(request_logger).log_openai_received_request,
+                    request,
+                    headers=_extract_whitelisted_headers(raw_request),
+                )
+            return await self.utility_service.run(
+                ticket, kind, request, before_run=before_run
+            )
         except UtilityError as error:
             return utility_error_response(error)
 

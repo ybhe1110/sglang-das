@@ -420,6 +420,41 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         await service.aclose()
         self.assert_empty(service)
 
+    async def test_shutdown_cancellation_during_disconnect_cleanup_releases_late(self):
+        """A second cancellation cannot orphan a lease or release a live sender."""
+        service = await self.service(shutdown_timeout=0.03, max_admitted=1)
+        entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def downstream(scope, receive, send):
+            await service.run(scope["utility_ticket"], "tokenize", b"{}")
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await release.wait()
+
+        owner, incoming, _ = await self.http(service, app=downstream)
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            incoming.put_nowait({"type": "http.disconnect"})
+            await asyncio.wait_for(cleaning.wait(), 2)
+            with self.assertRaisesRegex(TimeoutError, "grace period expired"):
+                await service.aclose()
+            await asyncio.gather(owner, return_exceptions=True)
+            self.assertTrue(owner.done())
+            self.assertEqual(service.work_used, 0)
+            self.assertEqual(service.response_used, 1)
+            ticket = next(iter(service.tickets))
+            self.assertFalse(ticket.http_done)
+        finally:
+            release.set()
+            await asyncio.gather(owner, return_exceptions=True)
+        await asyncio.wait_for(service._empty.wait(), 2)
+        self.assert_empty(service)
+        service.limits = replace(service.limits, shutdown_timeout=2)
+        await service.aclose()
+
     async def test_preheader_timeout_error_fits_shrunken_reservation(self):
         """Replacing a tiny completed result with 504 must stay within its lease."""
         service = await self.service(timeout=0.03, max_output_bytes=256)
