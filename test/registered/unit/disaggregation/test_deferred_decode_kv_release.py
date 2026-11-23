@@ -674,11 +674,13 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.scheduler = SimpleNamespace(
+        enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=enable_metrics),
         metrics_collector=SimpleNamespace(
             observe_decode_deferred_kv_release=MagicMock()
         ),
     )
+    q._clean_hicache_prefetch_resources = MagicMock()
     return q
 
 

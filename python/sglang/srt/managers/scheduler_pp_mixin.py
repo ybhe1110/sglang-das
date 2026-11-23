@@ -479,7 +479,7 @@ class SchedulerPPMixin:
         tmbs = [None] * self.pp_loop_size
         consensus_retract_rids: Optional[List[str]] = None
         consensus_prealloc_rids: Optional[List[str]] = None
-        release_rids: Optional[List[str]] = None  # consensus transferred rids
+        release_rids: Optional[PPReleasePayload] = None
         send_retract_work = []
         send_prealloc_work = []
         send_transfer_work = []
@@ -2118,7 +2118,7 @@ class SchedulerPPMixin:
         return None
 
     def process_decode_transfer_queue(
-        self: Scheduler, release_rids: Optional[List[str]]
+        self: Scheduler, release_rids: Optional[PPReleasePayload]
     ):
         # Resolve held deferred releases every call, independent of release_rids,
         # so ack/timeout-driven releases still fire when no rids are being polled.
@@ -2145,32 +2145,18 @@ class SchedulerPPMixin:
         else:
             success_rids, failed_rids = list(release_rids), []
         if failed_rids:
-            failed_set = set(failed_rids)
-            poll_failed = []
-            force_drop = []
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if decode_req.req.rid not in failed_set:
-                    continue
-                poll = (
-                    int(decode_req.kv_receiver.poll())
-                    if decode_req.kv_receiver is not None
-                    else int(KVPoll.Failed)
-                )
-                if poll == int(KVPoll.Failed):
-                    poll_failed.append(decode_req.req.rid)
-                else:
-                    force_drop.append(decode_req.req.rid)
             self.disagg_decode_transfer_queue.drop_by_rids(
-                poll_failed, stream_error=True
+                failed_rids, stream_error=None
             )
-            self.disagg_decode_transfer_queue.drop_by_rids(
-                force_drop, stream_error=False
+            self.disagg_decode_transfer_queue.locally_aborted_rids.difference_update(
+                failed_rids
             )
-            for rid in failed_rids:
-                self.disagg_decode_transfer_queue.locally_aborted_rids.discard(rid)
         released_reqs = self.disagg_decode_transfer_queue.pop_transferred(success_rids)
         if self.enable_hisparse:
             for req in released_reqs:
                 self.hisparse_coordinator.admit_request_direct(req)
         self.waiting_queue.extend(released_reqs)
-        return [req.rid for req in released_reqs]
+        released_rids = [req.rid for req in released_reqs]
+        # Every downstream stage still needs the failure consensus, even if
+        # this stage already retired that RID on an earlier microbatch.
+        return (released_rids, failed_rids) if failed_rids else released_rids

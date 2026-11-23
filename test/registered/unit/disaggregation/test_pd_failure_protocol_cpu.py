@@ -14,6 +14,7 @@ import unittest
 import zlib
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from http import HTTPStatus
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import Mock
@@ -896,24 +897,29 @@ class TestGenerationAndNativeDrain(CustomTestCase):
                 r._global_lock.release()
 
 
-def queue(env, mgr, rid="r", ready=False):
-    cls = load_methods(
+def empty_transfer_queue(env):
+    cls = extract_class(
         DECODE,
-        [
+        "DecodeTransferQueue",
+        {
             "abort_matching",
+            "drop_by_rids",
+            "_drop_uncommitted",
+            "_free_metadata_buffer",
             "_defer_release",
             "_reduce_deferred_flags",
             "_deferred_entry_drained",
             "_is_host_staged_entry",
             "_release_request",
+            "_clean_failed_transfer_caches",
             "resolve_deferred_releases",
             "_do_release",
             "has_pending_deferred_releases",
             "num_pending_deferred_releases",
             "release_memory_occupation",
-        ],
+        },
+        [],
         env,
-        class_name="DecodeTransferQueue",
     )
     q = cls()
     q.gloo_group = object()
@@ -921,11 +927,20 @@ def queue(env, mgr, rid="r", ready=False):
     q.enable_staging = False
     q.enable_host_receive = False
     q.tree_cache = object()
+    q.scheduler = SimpleNamespace(enable_hisparse=False)
+    q._clean_hicache_prefetch_resources = Mock()
     q._release_pd_hidden_rows = Mock()
     q.req_to_metadata_buffer_idx_allocator = Mock()
-    q.metadata_buffers = SimpleNamespace(bootstrap_room={3: 7})
+    q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q._observe_deferred_kv_release = Mock()
     q._deferred_release_quarantine = {}
+    q._deferred_releases = []
+    return q
+
+
+def queue(env, mgr, rid="r", ready=False):
+    q = empty_transfer_queue(env)
+    q.metadata_buffers.bootstrap_room[3] = 7
     generation = mgr.register_deferred_abort_room(7)
     if ready:
         mgr.note_abort_ack(7, 0, generation)
@@ -1044,6 +1059,7 @@ class TestDecodeReleaseConsensus(CustomTestCase):
                 r.bootstrap_room, r.bootstrap_addr, r.init_time = 7, "prefill", 1.0
                 r._owns_bootstrap_room = True
                 r._lifecycle_lock = threading.RLock()
+                r._discard_failure_on_clear = False
                 r._transfer_generation = (1 << 96) + 123
                 r._bootstrap_pair_key = "pair-7"
                 r.abort_notified, r._abort_generation = False, None
@@ -1110,6 +1126,190 @@ class TestDecodeReleaseConsensus(CustomTestCase):
                     dr.req, q.tree_cache, checkpoint=False
                 )
                 q.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+
+    def _pp_failure_stage(self, polls):
+        _, mgr, _, env = wire_managers()
+        mgr.local_ip, mgr.rank_port = "decode", 6000
+        mgr.defer_decode_allocation = False
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr.record_failure = lambda room, reason: mgr.failure_records.update(
+            {room: reason}
+        )
+        mgr.required_prefill_response_num_table = {}
+        mgr.prefill_response_tracker = defaultdict(set)
+        mgr.addr_to_rooms_tracker = defaultdict(set)
+        receiver_cls = extract_class(
+            COMMON,
+            "CommonKVReceiver",
+            {
+                "abort",
+                "abort_for_drain",
+                "ensure_abort_notified",
+                "_send_abort_notification",
+                "retry_abort_notification",
+                "clear",
+                "_clear",
+            },
+            [],
+            env,
+        )
+        self.env.update(
+            KVPoll=KVPoll, HTTPStatus=HTTPStatus, prepare_abort=Mock(), _is_hcu=True
+        )
+        stage = load_methods(
+            ROOT / "python/sglang/srt/managers/scheduler_pp_mixin.py",
+            ["process_decode_transfer_queue", "_pp_pd_send_consensus_release_ids"],
+            self.env,
+        )()
+        q = empty_transfer_queue(self.env)
+        q.deferred_kv_release_timeout = 1.0
+        q.tp_rank, q.locally_aborted_rids = 0, set()
+        q.enable_deferred_kv_release = True
+        q.enable_staging = True
+        q.staging_handler = Mock()
+        q.staging_handler.is_staging_room.return_value = True
+        q.scheduler = stage
+        q.pop_transferred = Mock(return_value=[])
+        stage.enable_hisparse = True
+        stage.hisparse_coordinator = Mock()
+        stage.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        stage.output_streamer = Mock()
+        stage.waiting_queue = []
+        stage.disagg_decode_transfer_queue = q
+        transfers = []
+        for idx, poll in enumerate(polls):
+            room = 7 + idx
+            req = SimpleNamespace(
+                rid=f"r{room}",
+                bootstrap_room=room,
+                return_logprob=False,
+                kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
+            )
+            r = receiver_cls()
+            r.bootstrap_room, r.bootstrap_addr = room, "prefill"
+            r.kv_mgr, r._owns_bootstrap_room = mgr, True
+            r._lifecycle_lock = threading.RLock()
+            r._transfer_generation = (1 << 100) + room
+            # A partial publish can fail before init_time is set.
+            r.init_time = None if poll == KVPoll.Failed else 1.0
+            r._abort_generation, r.abort_notified = None, False
+            r.poll = Mock(return_value=poll)
+            r.bootstrap_infos = [
+                {
+                    "rank_ip": "prefill",
+                    "rank_port": 7000 + rank,
+                    "prefill_ack_rank": rank,
+                }
+                for rank in (0, 1)
+            ]
+            r._connect_to_bootstrap_server = Mock(
+                return_value=(Mock(), threading.Lock())
+            )
+            r.clear = Mock(wraps=r.clear)
+            # Mooncake's failure_exception clears staging before raising.
+            r.failure_exception = Mock(side_effect=r.clear)
+            mgr.request_status[room] = poll
+            if poll == KVPoll.Failed:
+                mgr.failure_records[room] = "transfer failed on this stage"
+            dr = SimpleNamespace(
+                req=req, kv_receiver=r, host_staged=False, metadata_buffer_index=idx
+            )
+            q.metadata_buffers.bootstrap_room[idx] = room
+            q.queue.append(dr)
+            transfers.append((dr, r))
+        return stage, transfers, env
+
+    def test_pp_failed_consensus_holds_each_destination_until_matching_ack(self):
+        """Both local and peer failures keep live destinations across timeout and repeated consensus."""
+        for poll in (KVPoll.Failed, KVPoll.Transferring):
+            with self.subTest(poll=poll):
+                self.env["release_kv_cache"].reset_mock()
+                stage, [(dr, receiver)], wire = self._pp_failure_stage([poll])
+                q = stage.disagg_decode_transfer_queue
+                mgr = receiver.kv_mgr
+                decision = ([], [dr.req.rid])
+                stage.process_decode_transfer_queue(decision)
+                self.assertEqual(q.queue, [])
+                self.assertIs(dr.kv_receiver, receiver)
+                receiver.clear.assert_not_called()
+                generation = receiver._transfer_generation
+                self.assertEqual(
+                    mgr._deferred_abort_ack_tracker[7].generation, generation
+                )
+                self.assertTrue(receiver.abort_notified)
+                send = receiver._connect_to_bootstrap_server.return_value[
+                    0
+                ].send_multipart
+                self.assertEqual(send.call_count, 2)
+                for sent in send.call_args_list:
+                    notification = wire["AbortNotification"].from_zmq(sent.args[0])
+                    self.assertEqual(
+                        (notification.room, notification.generation), (7, generation)
+                    )
+                ack = wire["AbortAck"]
+                mgr.handle_abort_ack_message(ack(7, 0, generation - 1).to_zmq())
+                mgr.handle_abort_ack_message(ack(7, 1, generation).to_zmq())
+                with unittest.mock.patch.object(
+                    self.env["time"], "monotonic", return_value=1000
+                ):
+                    stage.process_decode_transfer_queue(decision)
+                self.assertEqual(q.num_pending_deferred_releases(), 1)
+                self.assertEqual(q.metadata_buffers.bootstrap_room[0], 7)
+                self.env["release_kv_cache"].assert_not_called()
+                q._clean_hicache_prefetch_resources.assert_not_called()
+                stage.hisparse_coordinator.request_finished.assert_not_called()
+                q._release_pd_hidden_rows.assert_not_called()
+                q.staging_handler.unregister_decode_req.assert_not_called()
+                q.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+                self.assertEqual(
+                    stage.output_streamer.stream_output.call_count,
+                    int(poll == KVPoll.Failed),
+                )
+                if poll == KVPoll.Failed:
+                    self.assertIn(
+                        "transfer failed on this stage",
+                        self.env["prepare_abort"].call_args.args[1],
+                    )
+                mgr.handle_abort_ack_message(ack(7, 0, generation).to_zmq())
+                stage.process_decode_transfer_queue(decision)
+                stage.process_decode_transfer_queue(decision)
+                self.assertEqual(q.num_pending_deferred_releases(), 0)
+                self.assertEqual(q.metadata_buffers.bootstrap_room[0], 0)
+                self.assertIsNone(dr.kv_receiver)
+                self.assertNotIn(7, mgr._deferred_abort_ack_tracker)
+                self.assertNotIn(7, mgr.failure_records)
+                receiver.clear.assert_called_once()
+                q._clean_hicache_prefetch_resources.assert_called_once_with(dr)
+                stage.hisparse_coordinator.request_finished.assert_called_once_with(
+                    dr.req
+                )
+                self.env["release_kv_cache"].assert_called_once_with(
+                    dr.req, q.tree_cache, checkpoint=False
+                )
+                q._release_pd_hidden_rows.assert_called_once_with(dr)
+                q.staging_handler.unregister_decode_req.assert_called_once_with(7)
+                q.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(0)
+
+    def test_pp_relays_failed_rids_and_keeps_deferred_queue_order(self):
+        """A stage forwards the failed set even when its own local polls differ."""
+        first, _, _ = self._pp_failure_stage([KVPoll.Transferring, KVPoll.Failed])
+        next_stage, _, _ = self._pp_failure_stage([KVPoll.Failed, KVPoll.Transferring])
+        failed = ["r7", "r8"]
+        forwarded = first.process_decode_transfer_queue(([], failed))
+        first.pp_group = SimpleNamespace(is_last_rank=False)
+        first._pp_send_pyobj_to_next_stage = Mock()
+        first._pp_pd_send_consensus_release_ids([None], 0, forwarded, None)
+        (payload,) = first._pp_send_pyobj_to_next_stage.call_args.args
+        self.assertEqual(payload, ([], failed))
+        next_stage.process_decode_transfer_queue(payload)
+        # A repeated consensus must relay even after this stage emptied its queue.
+        self.assertEqual(first.process_decode_transfer_queue(payload), payload)
+        for stage in (first, next_stage):
+            q = stage.disagg_decode_transfer_queue
+            self.assertEqual(
+                [entry[0].req.rid for entry in q._deferred_releases], failed
+            )
 
     def test_timeout_preserves_all_destination_owners(self):
         q, dr = queue(self.env, manager())
