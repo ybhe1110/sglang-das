@@ -2804,7 +2804,6 @@ class CommonKVReceiver(BaseKVReceiver):
     _prefill_wait_start: Optional[float] = None
     _owns_bootstrap_room: bool = True
     _lifecycle_lock = nullcontext()
-    _discard_failure_on_clear = False
 
     _ctx = zmq.Context()
     _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
@@ -3200,10 +3199,6 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification()
             self.abort_notified = True
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if self._discard_failure_on_clear:
-            with self.kv_mgr.failure_lock:
-                self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
-            self._discard_failure_on_clear = False
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
@@ -3223,17 +3218,6 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
         self.ensure_abort_notified()
-
-    def abort_for_drain(self) -> Optional[str]:
-        """Notify writers without clearing staging or overwriting the original failure."""
-        self.conclude_state = KVPoll.Failed
-        if not self._owns_bootstrap_room:
-            return None
-        self._discard_failure_on_clear = True
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self.ensure_abort_notified(force_arm=True)
-        with self.kv_mgr.failure_lock:
-            return self.kv_mgr.failure_records.get(self.bootstrap_room)
 
     def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
         """Notify the prefill ranks (and arm drain-ack accounting) exactly once.

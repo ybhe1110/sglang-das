@@ -3266,19 +3266,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     ) -> None:
         rid = decode_req.req.rid
         receiver = decode_req.kv_receiver
-        wait_for_drain = receiver is not None and (
-            (self.enable_host_receive and decode_req.host_staged)
-            or (
-                self.enable_deferred_kv_release
-                and receiver.kv_mgr.enable_deferred_decode_kv_release
-            )
-        )
-        failure_reason = None
-        if wait_for_drain:
-            # A peer can fail while this stage is still publishing its destination.
-            # Keep the receiver for retries and the generation-specific drain vote.
-            failure_reason = receiver.abort_for_drain()
-        elif receiver is not None:
+        if receiver is not None:
             try:
                 receiver.abort()
             except Exception as e:
@@ -3288,10 +3276,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 f"{error_prefix} for request rank={self.tp_rank} {rid=} "
                 f"{decode_req.req.bootstrap_room=}"
             )
-            is_propagated = wait_for_drain and failure_reason is None
-            if failure_reason is not None:
-                error_message += f": {failure_reason}"
-            elif not wait_for_drain and receiver is not None:
+            is_propagated = False
+            if receiver is not None:
                 try:
                     receiver.failure_exception()
                 except Exception as e:
@@ -3309,12 +3295,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.scheduler.output_streamer.stream_output(
                 [decode_req.req], decode_req.req.return_logprob
             )
+            if self.scheduler.enable_hisparse:
+                self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
             if self.scheduler.metrics_reporter.enable_metrics:
                 self.scheduler.metrics_collector.increment_transfer_failed_reqs()
-        if wait_for_drain:
+        self._clean_hicache_prefetch_resources(decode_req)
+        if (
+            stream_error
+            and self.enable_deferred_kv_release
+            and receiver is not None
+            and receiver.abort_notified
+        ):
             self._defer_release(decode_req)
+            if receiver is not None:
+                decode_req.kv_receiver = None
             return
-        self._clean_failed_transfer_caches(decode_req)
         if receiver is not None:
             try:
                 receiver.clear()
@@ -3331,9 +3326,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self,
         rids: List[str],
         *,
-        stream_error: Optional[bool] = False,
+        stream_error: bool = False,
     ) -> List[str]:
-        """Drop in queue order. None reports only failures observed on this stage."""
         rid_set = set(rids)
         if not rid_set:
             return []
@@ -3341,11 +3335,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         remaining: List[DecodeRequest] = []
         for decode_req in self.queue:
             if decode_req.req.rid in rid_set:
-                report_error = stream_error
-                if report_error is None:
-                    receiver = decode_req.kv_receiver
-                    report_error = receiver is None or receiver.poll() == KVPoll.Failed
-                self._drop_uncommitted(decode_req, stream_error=report_error)
+                self._drop_uncommitted(decode_req, stream_error=stream_error)
                 dropped.append(decode_req.req.rid)
             else:
                 remaining.append(decode_req)
@@ -3768,11 +3758,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 return
         release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
 
-    def _clean_failed_transfer_caches(self, decode_req: DecodeRequest) -> None:
-        self._clean_hicache_prefetch_resources(decode_req)
-        if self.scheduler.enable_hisparse:
-            self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-
     def _record_transfer_failure(self, failure_reason: str) -> None:
         if self.scheduler.metrics_reporter.enable_metrics:
             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -3873,6 +3858,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if decode_req.hicache_restore_status == HiCacheRestoreResult.FAILED:
                     is_propagated = False
                     error_message += " (HiCache local restore failed on this rank)"
+                self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -3887,6 +3873,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
+                if self.scheduler.enable_hisparse:
+                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 requires_host_drain = (
                     self.enable_host_receive and decode_req.host_staged
                 )
@@ -3911,7 +3899,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     indices_to_remove.add(i)
                 else:
                     # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                    self._clean_failed_transfer_caches(decode_req)
                     self._release_request(decode_req)
                     self._release_pd_hidden_rows(decode_req)
                     decode_req.kv_receiver.clear()
@@ -4018,7 +4005,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        self._clean_failed_transfer_caches(decode_req)
         self._release_request(decode_req)
         self._release_pd_hidden_rows(decode_req)
         self.metadata_buffers.bootstrap_room[idx] = 0

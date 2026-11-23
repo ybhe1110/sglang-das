@@ -294,11 +294,6 @@ class BaseKVReceiver(ABC):
         """
         raise NotImplementedError
 
-    def abort_for_drain(self) -> Optional[str]:
-        """Stop a failed transfer, retaining its destinations until drain is confirmed."""
-        self.abort()
-        return None
-
     @abstractmethod
     def __init__(
         self,

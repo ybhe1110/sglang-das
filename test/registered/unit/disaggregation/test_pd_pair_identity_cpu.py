@@ -418,7 +418,6 @@ class TestParallelPairIdentity(protocol.CustomTestCase):
             )
             receiver._owns_bootstrap_room = True
             receiver._lifecycle_lock = threading.RLock()
-            receiver._discard_failure_on_clear = False
             receiver._transfer_generation = (1 << 96) + index
             receiver._bootstrap_pair_key = d_req.bootstrap_pair_key
             receiver.abort_notified, receiver._abort_generation = False, None
