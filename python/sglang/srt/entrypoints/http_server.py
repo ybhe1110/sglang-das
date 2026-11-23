@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from functools import partial
 from http import HTTPStatus
 from typing import (
@@ -118,7 +118,10 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.openai.utility_executor import UtilityLimits, UtilityService
-from sglang.srt.entrypoints.openai.utility_http import UtilityHTTPMiddleware
+from sglang.srt.entrypoints.openai.utility_http import (
+    UtilityHTTPMiddleware,
+    utility_validation_error_response,
+)
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
@@ -292,17 +295,13 @@ async def init_multi_tokenizer() -> ServerArgs:
 async def lifespan(fast_api_app: FastAPI):
     # Covers early initialization failures as well as normal ASGI shutdown.
     # Executors are created only in the owning HTTP process, never on import.
-    try:
-        async with _http_lifespan(fast_api_app):
+    async with AsyncExitStack() as cleanup:
+        async with _http_lifespan(fast_api_app, cleanup):
             yield
-    finally:
-        utility = getattr(fast_api_app.state, "utility_service", None)
-        if utility is not None:
-            await utility.aclose()
 
 
 @asynccontextmanager
-async def _http_lifespan(fast_api_app: FastAPI):
+async def _http_lifespan(fast_api_app: FastAPI, cleanup: AsyncExitStack):
     grpc_handle = None
     sidecar = None
     warmup_thread = None
@@ -335,6 +334,9 @@ async def _http_lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
+    await cleanup.enter_async_context(
+        _global_state.tokenizer_manager.request_logger.background_writes()
+    )
     _global_state.tokenizer_manager.auto_create_handle_loop()
     wait_for_assignment = getattr(
         _global_state.tokenizer_manager, "wait_for_warmup_assignment", None
@@ -375,6 +377,7 @@ async def _http_lifespan(fast_api_app: FastAPI):
 
         utility_metrics = UtilityMetrics()
     utility = UtilityService(utility_limits, utility_metrics)
+    cleanup.push_async_callback(utility.aclose)
     fast_api_app.state.utility_service = utility
     await utility.start(
         make_utility_backend_factory(
@@ -694,6 +697,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     /v1/systemone, keep the 422 detail list that the System One API documents.
     Otherwise use the legacy ErrorResponse shape.
     """
+    if "utility_ticket" in request.scope:
+        return utility_validation_error_response(exc.errors())
+
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,

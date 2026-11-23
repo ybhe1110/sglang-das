@@ -13,16 +13,22 @@
 # ==============================================================================
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
+import sys
+import threading
+from collections import deque
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.utils.log_utils import create_log_targets, log_json
+from sglang.srt.utils.log_utils import create_log_targets, format_json_log
 
 if TYPE_CHECKING:
     import fastapi
+
     from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 
 logger = logging.getLogger(__name__)
@@ -39,6 +45,74 @@ def _extract_whitelisted_headers(
     if request is None:
         return None
     return {h: v for h in WHITELISTED_HEADERS if (v := request.headers.get(h))}
+
+
+class _RequestLogWriter:
+    """One FIFO per HTTP process. Only the writer thread takes sink locks."""
+
+    MAX_RECORDS = 128
+    MAX_BYTES = 8 * 1024 * 1024
+
+    def __init__(self):
+        self._ready = threading.Condition()
+        self._queue = deque()
+        self._bytes = 0
+        self._closing = False
+        self.dropped = 0
+        self._thread = threading.Thread(
+            target=self._run, name="sgl-request-log", daemon=True
+        )
+        self._thread.start()
+
+    def write(self, targets, message, wait):
+        size = sys.getsizeof(message)
+        with self._ready:
+            if (
+                self._closing
+                or len(self._queue) >= self.MAX_RECORDS
+                or self._bytes + size > self.MAX_BYTES
+            ):
+                self.dropped += 1
+                return
+            done = threading.Event() if wait else None
+            self._bytes += size
+            self._queue.append((targets, message, size, done))
+            self._ready.notify()
+        if done is not None:
+            done.wait()
+
+    def _run(self):
+        reported = 0
+        while True:
+            with self._ready:
+                self._ready.wait_for(lambda: self._queue or self._closing)
+                if not self._queue:
+                    break
+                targets, message, size, done = self._queue.popleft()
+            try:
+                for target in targets:
+                    target.info(message)
+            except Exception:
+                logger.exception("Failed to write request log")
+            finally:
+                with self._ready:
+                    self._bytes -= size
+                    dropped = self.dropped
+                if done is not None:
+                    done.set()
+            if dropped > reported:
+                logger.warning("Dropped %d request log records", dropped - reported)
+                reported = dropped
+            # Release the last message before waiting for another record.
+            del targets, message
+        if self.dropped > reported:
+            logger.warning("Dropped %d request log records", self.dropped - reported)
+
+    def close(self):
+        with self._ready:
+            self._closing = True
+            self._ready.notify()
+        self._thread.join(timeout=1.0)
 
 
 class RequestLogger:
@@ -58,6 +132,7 @@ class RequestLogger:
             self._compute_metadata()
         )
         self.targets = self._setup_targets()
+        self._writer = None
 
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
 
@@ -65,6 +140,17 @@ class RequestLogger:
         return create_log_targets(
             targets=self.log_requests_target, name_prefix=__name__
         )
+
+    @asynccontextmanager
+    async def background_writes(self):
+        writer = self._writer = _RequestLogWriter()
+        try:
+            yield writer
+        finally:
+            try:
+                await asyncio.to_thread(writer.close)
+            finally:
+                self._writer = None
 
     def configure(
         self,
@@ -103,7 +189,7 @@ class RequestLogger:
             }
             if headers:
                 log_data["headers"] = headers
-            log_json(self.targets, "request.received", log_data)
+            self._log(format_json_log("request.received", log_data))
         else:
             headers_str = f", headers={headers}" if headers else ""
             self._log(
@@ -134,6 +220,7 @@ class RequestLogger:
         request: Optional[fastapi.Request] = None,
         *,
         headers: Optional[Dict[str, str]] = None,
+        wait_for_write: bool = False,
     ) -> None:
         """Log the raw OpenAI request payload before request adaptation/tokenization."""
         max_length, _, _ = self.metadata
@@ -152,12 +239,11 @@ class RequestLogger:
             }
             if headers:
                 log_data["headers"] = headers
-            log_json(self.targets, "request.received.openai", log_data)
+            message = format_json_log("request.received.openai", log_data)
         else:
             headers_str = f", headers={headers}" if headers else ""
-            self._log(
-                f"Receive OpenAI: obj={_dataclass_to_string_truncated(obj_to_log, max_length)}{headers_str}"
-            )
+            message = f"Receive OpenAI: obj={_dataclass_to_string_truncated(obj_to_log, max_length)}{headers_str}"
+        self._log(message, wait_for_write=wait_for_write)
 
     def log_finished_request(
         self,
@@ -184,7 +270,7 @@ class RequestLogger:
             log_data["out"] = _transform_data_for_logging(
                 out, max_length, out_skip_names
             )
-            log_json(self.targets, "request.finished", log_data)
+            self._log(format_json_log("request.finished", log_data))
         else:
             obj_str = _dataclass_to_string_truncated(
                 obj, max_length, skip_names=skip_names
@@ -235,9 +321,13 @@ class RequestLogger:
                 )
         return max_length, skip_names, out_skip_names
 
-    def _log(self, msg: str) -> None:
-        for target in self.targets:
-            target.info(msg)
+    def _log(self, msg: str, *, wait_for_write: bool = False) -> None:
+        writer = self._writer
+        if writer is not None:
+            writer.write(self.targets, msg, wait_for_write)
+        else:
+            for target in self.targets:
+                target.info(msg)
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough

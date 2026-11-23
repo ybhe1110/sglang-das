@@ -4,15 +4,43 @@ from __future__ import annotations
 
 import asyncio
 
+from starlette.responses import JSONResponse
+
 from sglang.srt.entrypoints.openai.utility_executor import (
     ERROR_RESPONSE_BYTES,
     UtilityError,
 )
-from starlette.responses import JSONResponse
 
 UTILITY_PATHS = frozenset(
     {"/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize"}
 )
+
+
+def utility_validation_error_response(errors):
+    # FastAPI already materialized this sequence. Inspect a bounded part of
+    # the first diagnostic; input, ctx and the remaining items can be large.
+    summary = "Invalid tokenizer request"
+    if len(errors) > 1:
+        summary += f" ({len(errors)} validation errors)"
+    first = errors[0] if errors else {}
+    location = ".".join(
+        part[:24] for part in first.get("loc", ())[:3] if isinstance(part, str)
+    )
+    reason = first.get("msg", "")
+    detail = " ".join(filter(None, (location, reason[:80])))
+    payload = {
+        "object": "error",
+        "message": f"{summary}: {detail}" if detail else summary,
+        "type": "Bad Request",
+        "param": None,
+        "code": 400,
+    }
+    response = JSONResponse(payload, status_code=400)
+    if len(response.body) > ERROR_RESPONSE_BYTES:
+        # JSON escaping and UTF-8 can expand even a short diagnostic.
+        payload["message"] = summary
+        response = JSONResponse(payload, status_code=400)
+    return response
 
 
 def utility_error_response(error: UtilityError):

@@ -177,6 +177,54 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         ticket.close()
         self.assert_empty(service)
 
+    async def test_next_waiting_request_uses_first_free_worker(self):
+        """A short request can release its worker while an earlier long request is still running."""
+        service = UtilityService(UtilityLimits(workers=2, max_admitted=3))
+        self.services.append(service)
+        loop = asyncio.get_running_loop()
+        started = {name: asyncio.Event() for name in ("long", "short")}
+        gates = {name: threading.Event() for name in started}
+
+        def factory():
+            owner = threading.get_ident()
+
+            def backend(kind, name):
+                self.assertEqual(threading.get_ident(), owner)
+                if name in started:
+                    loop.call_soon_threadsafe(started[name].set)
+                    if not gates[name].wait(5):
+                        raise TimeoutError("Test did not release worker")
+                return Response(str(owner))
+
+            return backend
+
+        await service.start(factory)
+
+        async def run(name):
+            ticket = service.admit()
+            try:
+                return (await service.run(ticket, "tokenize", name)).body
+            finally:
+                ticket.close()
+
+        tasks = []
+        try:
+            for name, event in started.items():
+                tasks.append(asyncio.create_task(run(name)))
+                await asyncio.wait_for(event.wait(), 2)
+            tasks.append(asyncio.create_task(run("next")))
+            await asyncio.sleep(0)
+            self.assertEqual(service.work_used, 3)
+            gates["short"].set()
+            short, next_worker = await asyncio.wait_for(asyncio.gather(*tasks[1:]), 2)
+            self.assertEqual(short, next_worker)
+            self.assertFalse(tasks[0].done())
+        finally:
+            for gate in gates.values():
+                gate.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assert_empty(service)
+
     async def test_initializer_failure_joins_workers_and_refuses_requests(self):
         service = UtilityService(UtilityLimits())
         self.services.append(service)
@@ -422,6 +470,9 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         await asyncio.gather(task, return_exceptions=True)
         gate.set()
         await self.settle(service)
+        # The 30 ms deadline above tests the stuck call. The clean retry also
+        # needs to schedule an executor join, which may take longer on CI.
+        service.limits = replace(service.limits, shutdown_timeout=2)
         await service.aclose()
         self.assert_empty(service)
 
@@ -451,6 +502,7 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         finally:
             release.set()
             await asyncio.gather(task, return_exceptions=True)
+        service.limits = replace(service.limits, shutdown_timeout=2)
         await service.aclose()
         self.assert_empty(service)
 

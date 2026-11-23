@@ -11,13 +11,21 @@ per-HTTP-worker service. The identity conversion bypasses generation's tokenizer
 executor. Chat conversion, template rendering, encode/decode, result-model
 construction, and JSON serialization run on a utility thread. Existing helper
 branches and error mappings are preserved. FastAPI still parses/validates the
-bounded JSON request on its event loop and retains its normal validation errors.
+bounded JSON request on its event loop. On validation failure the four utility
+routes return HTTP 400 with a flat error body of at most 256 bytes. The summary
+uses the first diagnostic and the error count, omitting input and context objects.
 
 Detailed utility request logging (levels 2/3) also runs in the admitted work
 item, before tokenization. Only whitelisted request headers and a shallow logger
-configuration snapshot are captured on the loop; payload dumping, formatting,
-redaction and sink writes execute on the utility thread. Slow sinks retain the
-same work/input/response reservations and no separate logging queue is created.
+configuration snapshot are captured on the loop. Payload dumping, formatting
+and redaction run on the utility thread. A dedicated writer in each HTTP process
+writes request logs for both generation and utilities to their configured sinks.
+Generation enqueues a formatted record and continues. The utility worker waits
+for an accepted record to finish writing and retains its request reservations.
+The FIFO holds up to 128 waiting records and 8 MiB of Python message strings,
+including the active write in the byte limit. On overflow the writer drops the
+new record and counts the loss. Shutdown drains accepted records with a one-second
+join budget. A sink still blocked at process exit can leave records unwritten.
 Work cancelled before execution skips logging as well as tokenization. If a
 request is cancelled during logging, the worker skips tokenization when the
 log sink returns.
@@ -39,7 +47,9 @@ additional limits. Total input-item count is bounded by
 `utility_max_admitted * utility_max_input_items`. These are bounds, not a
 model-calibrated prediction of CPU time or peak Python heap usage.
 
-A cancelled queued entry stays charged until physically dequeued. A cancelled
+All admitted requests wait in one FIFO. When a worker becomes free it takes
+the oldest waiting request and executes it with its own backend. A cancelled
+queued entry stays charged until physically dequeued. A cancelled
 running helper stays charged until it returns. The pool's Future is deliberately
 not cancelled, since cancellation alone does not remove its physical queue item.
 Work slots return on physical completion. Input reservations also cover FastAPI's

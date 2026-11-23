@@ -49,11 +49,12 @@ class _OpenAIServingUtility(OpenAIServingBase):
             request_logger = self.tokenizer_manager.request_logger
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 # Snapshot configuration and whitelisted headers, not the body
-                # or ASGI Request. No separate unbounded logging queue is used.
+                # or ASGI Request. Only this admitted worker waits for its log.
                 before_run = partial(
                     copy.copy(request_logger).log_openai_received_request,
                     request,
                     headers=_extract_whitelisted_headers(raw_request),
+                    wait_for_write=True,
                 )
             return await self.utility_service.run(
                 ticket, kind, request, before_run=before_run

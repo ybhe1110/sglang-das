@@ -57,16 +57,19 @@ def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.
     return logger
 
 
-def log_json(
-    loggers: Union[logging.Logger, List[logging.Logger]], event: str, data: dict
-) -> None:
+def format_json_log(event: str, data: dict) -> str:
     log_data = {
         "timestamp": datetime.now().isoformat(),
         "event": event,
         **data,
     }
-    msg = json.dumps(log_data, ensure_ascii=False)
+    return json.dumps(log_data, ensure_ascii=False)
 
+
+def log_json(
+    loggers: Union[logging.Logger, List[logging.Logger]], event: str, data: dict
+) -> None:
+    msg = format_json_log(event, data)
     if not isinstance(loggers, list):
         loggers = [loggers]
 

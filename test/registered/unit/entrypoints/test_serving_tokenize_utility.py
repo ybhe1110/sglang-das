@@ -12,16 +12,25 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
-from sglang.srt.entrypoints.openai.protocol import DetokenizeRequest, TokenizeRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    DetokenizeRequest,
+    TokenizeRequest,
+)
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
     make_utility_backend_factory,
 )
 from sglang.srt.entrypoints.openai.utility_executor import UtilityLimits, UtilityService
-from sglang.srt.entrypoints.openai.utility_http import UtilityHTTPMiddleware
+from sglang.srt.entrypoints.openai.utility_http import (
+    UTILITY_PATHS,
+    UtilityHTTPMiddleware,
+)
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -119,6 +128,7 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                                 raise TimeoutError("Test did not release log sink")
 
                 logger = RequestLogger(True, level, fmt, None)
+                await self.enterAsyncContext(logger.background_writes())
                 target = logging.Logger("utility-test", level=logging.INFO)
                 target.addHandler(Sink())
                 logger.targets = [target]
@@ -161,6 +171,80 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                 self.assertIn("route-a", messages[0])
                 self.assertNotIn("secret", messages[0])
                 self.assertEqual(self.service.response_used, 0)
+
+    async def test_generation_logging_progresses_while_utility_holds_sink(self):
+        """A slow utility log must not block the generation hook or grow its queue."""
+        loop = asyncio.get_running_loop()
+        entered, release = asyncio.Event(), threading.Event()
+        sink_timed_out = threading.Event()
+        records = []
+
+        class Sink(logging.Handler):
+            def emit(self, record):
+                if not records:
+                    loop.call_soon_threadsafe(entered.set)
+                    if not release.wait(2):
+                        sink_timed_out.set()
+                records.append(record.getMessage())
+
+        logger = self.manager.request_logger = RequestLogger(True, 2, "text", None)
+        target = logging.Logger("mixed-requests")
+        target.addHandler(Sink())
+        logger.targets = [target]
+        async with logger.background_writes() as writer:
+            with patch.object(writer, "MAX_RECORDS", 1):
+                tool = asyncio.create_task(
+                    self.call(self.tokenize, TokenizeRequest(prompt="utility"))
+                )
+                try:
+                    await asyncio.wait_for(entered.wait(), 2)
+                    for text in ("generation-accepted", "generation-dropped"):
+                        request = ChatCompletionRequest(
+                            messages=[{"role": "user", "content": text}]
+                        )
+                        OpenAIServingBase._log_received_request(
+                            self.tokenize, request, None
+                        )
+                    self.assertFalse(sink_timed_out.is_set())
+                    self.assertEqual(writer.dropped, 1)
+                    self.assertFalse(tool.done())
+                finally:
+                    release.set()
+                    await asyncio.wait_for(tool, 2)
+        self.assertEqual(len(records), 2)
+        self.assertIn("utility", records[0])
+        self.assertIn("generation-accepted", records[1])
+
+    async def test_blocked_log_write_retains_bytes_and_allows_shutdown(self):
+        """A blocked sink stays charged and cannot indefinitely delay HTTP shutdown."""
+        loop = asyncio.get_running_loop()
+        entered, finished = asyncio.Event(), asyncio.Event()
+        release = threading.Event()
+        records = []
+
+        class Sink(logging.Handler):
+            def emit(self, record):
+                loop.call_soon_threadsafe(entered.set)
+                release.wait(5)
+                records.append(record.getMessage())
+                loop.call_soon_threadsafe(finished.set)
+
+        logger = RequestLogger(True, 2, "text", None)
+        target = logging.Logger("blocked-sink")
+        target.addHandler(Sink())
+        logger.targets = [target]
+        try:
+            async with logger.background_writes() as writer:
+                with patch.object(writer, "MAX_BYTES", 800):
+                    logger._log("x" * 512)
+                    await asyncio.wait_for(entered.wait(), 2)
+                    logger._log("y" * 512)
+                    self.assertEqual(writer.dropped, 1)
+            self.assertEqual(records, [])
+        finally:
+            release.set()
+            await asyncio.wait_for(finished.wait(), 2)
+        self.assertEqual(records, ["x" * 512])
 
     async def test_prompt_branches_and_special_tokens_match_original(self):
         for prompt in ("", "中文🙂", ["hello", "中文", ""], []):
@@ -464,22 +548,26 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                 self.assertEqual(actual, status)
 
     async def test_fastapi_validation_aliases_and_budget_policy(self):
+        """Production validation errors must fit the utility budget without echoing inputs."""
         import httpx
 
+        from sglang.srt.entrypoints.http_server import app as production_app
+
         app = FastAPI()
+        app.router.routes.extend(
+            route
+            for route in production_app.routes
+            if getattr(route, "path", None) in UTILITY_PATHS
+        )
+        app.add_exception_handler(
+            RequestValidationError,
+            production_app.exception_handlers[RequestValidationError],
+        )
         app.state.utility_service = self.service
+        app.state.openai_serving_tokenize = self.tokenize
+        app.state.openai_serving_detokenize = self.detokenize
         app.add_middleware(UtilityHTTPMiddleware)
         app.add_middleware(CORSMiddleware, allow_origins=["*"])
-
-        @app.post("/v1/tokenize")
-        @app.post("/tokenize")
-        async def tokenize(request: TokenizeRequest, raw_request: Request):
-            return await self.tokenize.handle_request(request, raw_request)
-
-        @app.post("/v1/detokenize")
-        @app.post("/detokenize")
-        async def detokenize(request: DetokenizeRequest, raw_request: Request):
-            return await self.detokenize.handle_request(request, raw_request)
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -488,12 +576,25 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                 response = await client.post(path, json={"prompt": "中文"})
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.json()["count"], 3)
-                response = await client.post(path, json={"prompt": "x", "messages": []})
-                self.assertEqual(response.status_code, 422)
+                response = await client.post(
+                    path, json={"prompt": "private prompt", "messages": []}
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json()["type"], "Bad Request")
+                self.assertNotIn("private prompt", response.text)
+                self.assertLessEqual(len(response.content), 256)
             for path in ("/v1/detokenize", "/detokenize"):
                 response = await client.post(path, json={"tokens": []})
                 self.assertEqual(response.json(), {"text": ""})
                 self.assertEqual(response.status_code, 200)
+                with patch.object(
+                    RequestValidationError, "__str__", side_effect=AssertionError
+                ):
+                    response = await client.post(path, json={"tokens": ["invalid"] * 8})
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json()["code"], 400)
+                self.assertIn("tokens", response.json()["message"])
+                self.assertLessEqual(len(response.content), 256)
             response = await client.post(
                 "/tokenize",
                 content=b"{}",

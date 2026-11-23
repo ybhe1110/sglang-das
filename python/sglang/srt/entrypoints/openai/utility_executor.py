@@ -12,8 +12,10 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
+from functools import partial
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -123,7 +125,8 @@ class UtilityService:
         self.response_used = 0
         self.output_bytes = 0
         self._workers = []
-        self._pending = []
+        self._idle = []
+        self._waiting = deque()
         self._lag_task = None
         self._empty = asyncio.Event()
         self._empty.set()
@@ -135,10 +138,9 @@ class UtilityService:
                 pool = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="sgl-utility"
                 )
-                self._workers.append((pool, None))
+                self._workers.append(pool)
                 backend = await self.loop.run_in_executor(pool, backend_factory)
-                self._workers[-1] = (pool, backend)
-                self._pending.append(0)
+                self._idle.append((pool, backend))
             self.accepting = True
             if self.metrics:
                 self._lag_task = asyncio.create_task(self._observe_loop_lag())
@@ -178,11 +180,8 @@ class UtilityService:
         # No deepcopy/model_dump of a large payload on the HTTP loop.
         ticket.submitted = True
         reply = ticket.reply = self.loop.create_future()
-        index = min(range(len(self._pending)), key=self._pending.__getitem__)
-        self._pending[index] += 1
-        pool, backend = self._workers[index]
 
-        def invoke():
+        def invoke(backend):
             if ticket.cancelled.is_set():
                 return None
             ticket.started_at = time.monotonic()
@@ -207,17 +206,9 @@ class UtilityService:
                         time.monotonic() - ticket.started_at
                     )
 
-        try:
-            future = pool.submit(invoke)
-        except BaseException:
-            self._pending[index] -= 1
-            self._release_work(ticket)
-            raise
-        future.add_done_callback(
-            lambda done: self.loop.call_soon_threadsafe(
-                self._settle, ticket, index, done
-            )
-        )
+        # Every queued item owns an admission slot, including after cancellation.
+        self._waiting.append((ticket, invoke))
+        self._dispatch()
         try:
             return await asyncio.shield(reply)
         except asyncio.CancelledError:
@@ -228,16 +219,40 @@ class UtilityService:
             self._observe()
             raise
 
-    def _settle(self, ticket, index, future):
-        self._pending[index] -= 1
-        reply = ticket.reply
+    def _dispatch(self):
+        while self._idle and self._waiting:
+            ticket, invoke = self._waiting.popleft()
+            if ticket.cancelled.is_set():
+                self._finish(ticket)
+                continue
+            worker = self._idle[-1]
+            pool, backend = worker
+            try:
+                future = pool.submit(invoke, backend)
+            except Exception as exc:
+                self._finish(ticket, error=exc)
+                continue
+            self._idle.pop()
+            future.add_done_callback(
+                partial(self.loop.call_soon_threadsafe, self._settle, ticket, worker)
+            )
+
+    def _settle(self, ticket, worker, future):
         try:
             result = future.result()  # Always consume the backend exception.
         except BaseException as exc:
-            if reply is not None and not reply.done():
-                reply.set_exception(exc)
+            self._finish(ticket, error=exc)
         else:
-            if reply is not None and not reply.done():
+            self._finish(ticket, result=result)
+        self._idle.append(worker)
+        self._dispatch()
+
+    def _finish(self, ticket, *, result=None, error=None):
+        reply = ticket.reply
+        if reply is not None and not reply.done():
+            if error is not None:
+                reply.set_exception(error)
+            else:
                 if result is not None:
                     # A pre-header deadline can replace this result with an error.
                     size = max(ERROR_RESPONSE_BYTES, len(result.body))
@@ -297,18 +312,19 @@ class UtilityService:
                 ticket.reply.cancel()
         # Stop executor admission without cancelling physical queue entries.
         # Their completion callbacks must still account for actual work.
-        for pool, _ in self._workers:
+        for pool in self._workers:
             pool.shutdown(wait=False)
 
         async def drain():
             await self._empty.wait()
             # All submitted work has physically returned; joining is now safe.
-            for pool, _ in self._workers:
+            for pool in self._workers:
                 await asyncio.to_thread(pool.shutdown, wait=True)
 
         try:
             await asyncio.wait_for(drain(), self.limits.shutdown_timeout)
             self._workers.clear()
+            self._idle.clear()
         except TimeoutError:
             for ticket in list(self.tickets):
                 owner = ticket.http_owner
