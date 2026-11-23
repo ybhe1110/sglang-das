@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use axum::extract::Request;
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
+    extract::State,
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -25,6 +26,7 @@ use dynamo_protocols::types::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
+use serde_json::Value;
 use sglang_processor::{
     ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
     tool_call_stream,
@@ -54,48 +56,134 @@ pub(super) struct ChatRequest {
     #[serde(flatten)]
     pub(super) request: CreateChatCompletionRequest,
     pub(super) chat_template_kwargs: Option<ChatTemplateKwargs>,
+    #[serde(default)]
+    min_tokens: i64,
+    #[serde(default)]
+    ignore_eos: bool,
+    #[serde(alias = "request_id")]
+    rid: Option<String>,
+    bootstrap_pair_key: Option<String>,
+    decode_tp_size: Option<i64>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
 
-async fn chat_completions(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<ChatRequest>, JsonRejection>,
-) -> Response {
+async fn chat_completions(State(state): State<Arc<AppState>>, body: Request) -> Response {
+    let prepare_state = state.clone();
+    let prepared = state
+        .workers
+        .generation
+        .run(body, move |bytes, _lease, _| {
+            let raw: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| openai_error(StatusCode::BAD_REQUEST, e.to_string(), false))?;
+            prepare_chat(&prepare_state, raw)
+        })
+        .await;
+    let (requests, reply) = match prepared {
+        Ok(Ok(result)) => result,
+        Ok(Err(response)) => return response,
+        Err(error) => return openai_error(error.0, error.1, false),
+    };
+    let mut submitted = Vec::with_capacity(requests.len());
+    for (index, native) in requests.into_iter().enumerate() {
+        match submit_generation(&state, native, reply.stream).await {
+            Ok(call) => submitted.push((index, call)),
+            Err(response) => return response,
+        }
+    }
+    reply.respond(submitted).await
+}
+
+/// The native encoder consumes the original body. Adapt only the copy Dynamo
+/// uses for sampling, response options and tool definitions: Python accepts
+/// additional tool-history and effort shapes that its OpenAI structs cannot read.
+pub(super) fn parse_chat(state: &AppState, body: &Value) -> Result<ChatRequest, String> {
+    let mut options = body.clone();
+    if matches!(state.chat_formatter, Some(ChatFormatter::DeepSeek(_))) {
+        if options["reasoning_effort"].is_number()
+            || options["reasoning_effort"]
+                .as_str()
+                .is_some_and(|s| s.parse::<f64>().is_ok())
+        {
+            options.as_object_mut().unwrap().remove("reasoning_effort");
+        }
+        if let Some(tools) = options.get_mut("tools").and_then(Value::as_array_mut) {
+            for tool in tools {
+                if tool.get("type").is_none_or(|kind| kind == "function") {
+                    *tool = sglang_processor::deepseek_tool_payload(tool)?;
+                }
+            }
+        }
+        if let Some(messages) = options.get_mut("messages").and_then(Value::as_array_mut) {
+            for message in messages {
+                if message["role"] == "tool"
+                    && (message["content"].is_null() || message["content"].is_array())
+                {
+                    // Only the native renderer consumes tool-result content.
+                    message["content"] = Value::String(String::new());
+                }
+                if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                    for call in calls {
+                        if let Some(function) =
+                            call.get_mut("function").and_then(Value::as_object_mut)
+                            && function.get("arguments").is_none_or(Value::is_null)
+                        {
+                            function.insert("arguments".into(), Value::String("{}".into()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    serde_json::from_value(options).map_err(|e| e.to_string())
+}
+
+pub(super) fn prepare_chat(
+    state: &AppState,
+    raw: Value,
+) -> Result<(Vec<GenerateRequest>, ChatReply), Response> {
     let ChatRequest {
         request,
         chat_template_kwargs,
         routing,
-    } = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
-    };
+        min_tokens,
+        ignore_eos,
+        rid,
+        bootstrap_pair_key,
+        decode_tp_size,
+    } = parse_chat(state, &raw).map_err(|e| openai_error(StatusCode::BAD_REQUEST, e, false))?;
     if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
-        return openai_error(StatusCode::BAD_REQUEST, message, false);
+        return Err(openai_error(StatusCode::BAD_REQUEST, message, false));
     }
     if request.messages.is_empty() {
-        return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
+        return Err(openai_error(
+            StatusCode::BAD_REQUEST,
+            "messages cannot be empty",
+            false,
+        ));
     }
-    if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return openai_error(
+    if contains_media(&raw["messages"]) {
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "image, audio, video, and file message content is not supported",
             false,
-        );
+        ));
     }
     if request.n == Some(0) {
-        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
+        return Err(openai_error(
+            StatusCode::BAD_REQUEST,
+            "n must be at least 1",
+            false,
+        ));
     }
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
     if max_tokens == Some(0) {
-        return openai_error(
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "max_completion_tokens must be positive",
             false,
-        );
+        ));
     }
     if request.modalities.as_ref().is_some_and(|modalities| {
         serde_json::to_value(modalities).is_ok_and(|value| value.to_string().contains("\"audio\""))
@@ -104,19 +192,19 @@ async fn chat_completions(
         || request.web_search_options.is_some()
         || request.mm_processor_kwargs.is_some()
     {
-        return openai_error(
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "audio, prediction, web search, and multimodal inputs are not supported",
             false,
-        );
+        ));
     }
     #[allow(deprecated)]
     if request.function_call.is_some() || request.functions.is_some() {
-        return openai_error(
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "deprecated function_call/functions are not supported; use tools and tool_choice",
             false,
-        );
+        ));
     }
 
     let tool_choice = dynamo_tool_choice(&request.tool_choice);
@@ -125,18 +213,24 @@ async fn chat_completions(
         &request.messages,
     ) {
         Ok(tools) => tools,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+        Err(error) => {
+            return Err(openai_error(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                false,
+            ));
+        }
     };
     let tools_enabled = !tools.is_empty() && tool_choice != DynamoToolChoice::None;
     let parser = tools_enabled
         .then(|| state.server_args.tool_call_parser.clone())
         .flatten();
     if tools_enabled && parser.is_none() {
-        return openai_error(
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "tool calls require --tool-call-parser",
             false,
-        );
+        ));
     }
     // Python gates the split on `request.separate_reasoning` (default true);
     // the Dynamo request type has no such field, so it is always on when the
@@ -145,13 +239,19 @@ async fn chat_completions(
     let tools = (!tools.is_empty()).then_some(tools);
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) =
-        match prepare_chat_request(&state, request, chat_template_kwargs.as_ref()).await {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
+    let mut request = request;
+    let formatter = state.chat_formatter.as_ref().ok_or_else(|| {
+        openai_error(
+            StatusCode::BAD_REQUEST,
+            "this model has no usable chat template",
+            false,
+        )
+    })?;
+    merge_template_stops(&mut request, formatter);
+    let (prompt, ids) = prepare_prompt(state, raw, &request, chat_template_kwargs)
+        .map_err(|e| openai_error(StatusCode::BAD_REQUEST, e, false))?;
 
-    let sampling = match chat_sampling(
+    let mut sampling = match chat_sampling(
         &request,
         SamplingDefaults::CHAT,
         parser.as_deref(),
@@ -159,24 +259,80 @@ async fn chat_completions(
         tools_slice,
         request.parallel_tool_calls,
         &state.server_args,
+        min_tokens,
+        ignore_eos,
     ) {
         Ok(sampling) => sampling,
         Err(message) => {
-            return openai_error(StatusCode::BAD_REQUEST, message, false);
+            return Err(openai_error(StatusCode::BAD_REQUEST, message, false));
         }
     };
 
+    if ids.is_some()
+        && let Some(codec) = &state.codec
+        && let Some(window) = sampling
+            .stop_strs
+            .iter()
+            .map(|s| codec.encode(s, true).map_or(s.len(), |ids| ids.len()))
+            .max()
+    {
+        sampling.stop_str_max_len = window;
+    }
     let stream = request.stream.unwrap_or(false);
     let prompt_count = 1;
     let choices_per_prompt = request.n.unwrap_or(1) as usize;
     let routing = match routing.normalize(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+        Err(error) => {
+            return Err(openai_error(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                false,
+            ));
+        }
     };
     // Chat normalizes one prompt, so each bootstrap column has one entry.
     let bootstrap_host = &routing.bootstrap.bootstrap_hosts[0];
     let bootstrap_port = routing.bootstrap.bootstrap_ports[0];
     let bootstrap_room = routing.bootstrap.bootstrap_rooms[0];
+    let pd = state.server_args.is_disaggregation()
+        || bootstrap_host.is_some()
+        || bootstrap_room.is_some()
+        || bootstrap_pair_key.is_some()
+        || bootstrap_port.is_some();
+    if pd
+        && (choices_per_prompt != 1
+            || bootstrap_host.as_ref().is_none_or(|s| s.trim().is_empty())
+            || bootstrap_room.is_none_or(|r| r < 0))
+    {
+        return Err(openai_error(
+            StatusCode::BAD_REQUEST,
+            "PD chat requires one choice, bootstrap_host and a nonnegative bootstrap_room",
+            false,
+        ));
+    }
+    if bootstrap_pair_key
+        .as_ref()
+        .is_some_and(|s| s.is_empty() || s.len() > 128 || !s.is_ascii())
+        || decode_tp_size.is_some_and(|n| n <= 0)
+        || bootstrap_port.is_some_and(|n| !(1..=65535).contains(&n))
+    {
+        return Err(openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid PD bootstrap metadata",
+            false,
+        ));
+    }
+    state
+        .server_args
+        .check_ingress_rank(routing.routed_dp_rank)
+        .map_err(|e| openai_error(StatusCode::BAD_REQUEST, e, false))?;
+    crate::message::request::check_broadcast_budget(
+        ids.as_ref().map_or(prompt.len(), |v| v.len() * 8),
+        choices_per_prompt,
+        "chat prompt",
+    )
+    .map_err(|e| openai_error(StatusCode::BAD_REQUEST, e.to_string(), false))?;
     let want_logprobs = request.logprobs.unwrap_or(false);
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let stream_tool_choice = request.tool_choice.clone();
@@ -189,23 +345,27 @@ async fn chat_completions(
         .stream_options
         .is_some_and(|options| options.include_usage)
         || state.server_args.stream_response_default_include_usage;
-    let mut submitted = Vec::with_capacity(choices_per_prompt);
+    let mut requests = Vec::with_capacity(choices_per_prompt);
 
     let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &prompt);
-    let mut prompt = Some(prompt);
+    let mut input = Some((ids.is_none().then_some(prompt), ids));
     for index in 0..choices_per_prompt {
-        let rid = Rid::from_client(&format!("{response_id}-{index}"));
-        let choice_prompt = if index + 1 == choices_per_prompt {
-            prompt.take().expect("last chat choice owns the prompt")
+        let rid = match &rid {
+            Some(rid) if choices_per_prompt == 1 => Rid::from_client(rid),
+            _ => Rid::from_client(&format!(
+                "{}-{index}",
+                rid.as_deref().unwrap_or(&response_id)
+            )),
+        };
+        let (text, input_ids) = if index + 1 == choices_per_prompt {
+            input.take().unwrap()
         } else {
-            prompt
-                .as_ref()
-                .expect("chat prompt exists until the last choice")
-                .clone()
+            input.as_ref().unwrap().clone()
         };
         let native = GenerateRequest {
-            rid: rid.clone(),
-            text: Some(choice_prompt),
+            rid,
+            text,
+            input_ids,
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
             skip_special_tokens: true,
@@ -216,22 +376,20 @@ async fn chat_completions(
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
             bootstrap_host: bootstrap_host.clone(),
+            bootstrap_pair_key: bootstrap_pair_key.clone(),
+            decode_tp_size,
             bootstrap_port,
             bootstrap_room,
             routed_dp_rank: routing.routed_dp_rank,
             disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
             ..Default::default()
         };
-        let call = match submit_generation(&state, native, stream).await {
-            Ok(call) => call,
-            Err(response) => return response,
-        };
-        submitted.push((index, call));
+        requests.push(native);
     }
-
-    if stream {
-        let event_stream = chat_event_stream(
-            submitted,
+    Ok((
+        requests,
+        ChatReply {
+            stream,
             response_id,
             model,
             created,
@@ -245,56 +403,129 @@ async fn chat_completions(
             uses_tool_call_structural_tag,
             parallel_tool_calls,
             service_tier,
-        )
-        .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(event_stream).into_response()
-    } else {
-        unary_chat(
-            submitted,
+        },
+    ))
+}
+
+pub(super) struct ChatReply {
+    stream: bool,
+    response_id: String,
+    model: String,
+    created: u32,
+    want_logprobs: bool,
+    include_usage: bool,
+    parser: Option<String>,
+    reasoning_parser: Option<String>,
+    starts_in_reasoning: bool,
+    tools: Option<Vec<ToolDefinition>>,
+    stream_tool_choice: Option<ChatCompletionToolChoiceOption>,
+    uses_tool_call_structural_tag: bool,
+    parallel_tool_calls: bool,
+    service_tier: Option<ChatServiceTier>,
+}
+
+impl ChatReply {
+    async fn respond(self, submitted: Vec<(usize, CoreCall)>) -> Response {
+        let Self {
+            stream,
             response_id,
             model,
             created,
             want_logprobs,
+            include_usage,
             parser,
             reasoning_parser,
             starts_in_reasoning,
             tools,
+            stream_tool_choice,
+            uses_tool_call_structural_tag,
             parallel_tool_calls,
             service_tier,
-        )
-        .await
+        } = self;
+        if stream {
+            let event_stream = chat_event_stream(
+                submitted,
+                response_id,
+                model,
+                created,
+                want_logprobs,
+                include_usage,
+                parser,
+                reasoning_parser,
+                starts_in_reasoning,
+                tools,
+                stream_tool_choice,
+                uses_tool_call_structural_tag,
+                parallel_tool_calls,
+                service_tier,
+            )
+            .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
+            Sse::new(event_stream).into_response()
+        } else {
+            unary_chat(
+                submitted,
+                response_id,
+                model,
+                created,
+                want_logprobs,
+                parser,
+                reasoning_parser,
+                starts_in_reasoning,
+                tools,
+                parallel_tool_calls,
+                service_tier,
+            )
+            .await
+        }
     }
 }
 
-/// Render the chat template for an OpenAI request, mapping a missing
-/// formatter or a render failure to the standard 400. The rendered prompt is
-/// submitted as text — the tokenizer pool encodes it (with
-/// `skip_special_tokens`, since the template owns its special tokens).
-pub(super) async fn prepare_chat_request(
+/// Both generation and AIgate's count endpoint use this exact prompt preparation.
+/// Native DeepSeek renders the original request, including message-level tools.
+/// Python appends a continuation encoded separately, removing at most one BOS.
+pub(super) fn prepare_prompt(
     state: &AppState,
-    mut request: CreateChatCompletionRequest,
-    kwargs: Option<&ChatTemplateKwargs>,
-) -> Result<(CreateChatCompletionRequest, String), Response> {
-    let Some(formatter) = state.chat_formatter.clone() else {
-        return Err(openai_error(
-            StatusCode::BAD_REQUEST,
-            "this model has no usable chat template",
-            false,
-        ));
-    };
-    // Template stops first, then the request's own — Python
-    // `_apply_conversation_template` (`conv.stop_str` + `request.stop`). A
-    // token-id stop cannot be merged into the string list (Python has no such
-    // field), so it is kept alone.
-    merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request, kwargs).map_err(|error| {
-        openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("chat template render failed: {error}"),
-            false,
-        )
-    })?;
-    Ok((request, prompt))
+    raw: Value,
+    request: &CreateChatCompletionRequest,
+    kwargs: Option<ChatTemplateKwargs>,
+) -> Result<(String, Option<Vec<i64>>), String> {
+    let formatter = state
+        .chat_formatter
+        .as_ref()
+        .ok_or("this model has no usable chat template")?;
+    let defaults = &state.server_args.default_chat_template_kwargs;
+    if let ChatFormatter::DeepSeek(native) = formatter {
+        let (prompt, suffix) = native
+            .render_request(raw, defaults)
+            .map_err(|e| e.to_string())?;
+        let text = prompt.into_text();
+        let codec = state
+            .codec
+            .as_ref()
+            .ok_or("tokenization is unavailable when skip_tokenizer_init=True")?;
+        let mut ids = codec.encode(&text, true)?;
+        if !suffix.is_empty() {
+            let extra = codec.encode(&suffix, true)?;
+            let skip = usize::from(
+                extra
+                    .first()
+                    .is_some_and(|id| Some(*id) == state.server_args.bos_token_id),
+            );
+            ids.extend_from_slice(&extra[skip..]);
+        }
+        return Ok((text, Some(ids)));
+    }
+    let mut merged = defaults.clone();
+    merged.extend(kwargs.into_iter().flatten());
+    let text = formatter
+        .render(request, (!merged.is_empty()).then_some(&merged))
+        .map_err(|e| format!("chat template render failed: {e}"))?;
+    let ids = state
+        .codec
+        .as_ref()
+        .map(|codec| codec.encode(&text, false))
+        .transpose()?;
+    Ok((text, ids))
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
@@ -309,11 +540,15 @@ pub(super) fn chat_sampling(
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
     server_args: &ServerArgs,
+    min_tokens: i64,
+    ignore_eos: bool,
 ) -> Result<SamplingParams, String> {
     let mut sampling = chat_sampling_params(
         request,
         &defaults.with_model_defaults(&server_args.model_config.default_sampling_params),
     )?;
+    sampling.min_new_tokens = min_tokens;
+    sampling.ignore_eos = ignore_eos;
     apply_tool_constraint(
         &mut sampling,
         parser,
@@ -1256,6 +1491,8 @@ mod tests {
                 core,
                 generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
                 server_args: args,
+                workers: Default::default(),
+                codec: None,
                 chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter)),
             });
             let responder = tokio::spawn(async move {

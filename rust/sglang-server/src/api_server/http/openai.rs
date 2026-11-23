@@ -50,6 +50,32 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
     }
+    if server_args
+        .model_config
+        .model_type
+        .as_deref()
+        .is_some_and(|t| t.starts_with("deepseek_v4"))
+        && server_args.chat_template.is_none()
+    {
+        let (formatter, error) =
+            sglang_processor::select_chat_formatter(&sglang_processor::ChatFormatterOptions {
+                tokenizer_path: server_args.tokenizer_path.clone(),
+                model_path: server_args.model_path.clone(),
+                revision: server_args.revision.clone(),
+                chat_template: None,
+            });
+        match formatter {
+            Some(
+                f @ (sglang_processor::ChatFormatter::DeepSeekV4(_)
+                | sglang_processor::ChatFormatter::DeepSeekV41),
+            ) => return Some(ChatFormatter::DeepSeek(f)),
+            None => {
+                tracing::warn!(?error, "DeepSeek formatter unavailable");
+                return None;
+            }
+            _ => {}
+        }
+    }
     let config_file = tokenizer::resolve_model_file(
         &server_args.tokenizer_path,
         server_args.revision.as_deref(),
@@ -151,9 +177,9 @@ async fn submit_generation(
         // Same `error_response` rule: a committed stream gets 200 plus an
         // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
         // error shape, since this is the OpenAI frontend.
-        Err(CoreError::Unavailable) => Err(openai_error(
+        Err(error @ (CoreError::Unavailable | CoreError::Overloaded(_))) => Err(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "service unavailable",
+            error.to_string(),
             stream,
         )),
         Err(error) => Err(openai_error(

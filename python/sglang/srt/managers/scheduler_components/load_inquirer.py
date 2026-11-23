@@ -13,8 +13,9 @@ from sglang.srt.managers.load_snapshot import (
     MemoryMetrics,
     QueueMetrics,
     SpeculativeMetrics,
+    load_snapshot_dp_rank,
 )
-from sglang.srt.runtime_context import get_lora, get_parallel
+from sglang.srt.runtime_context import get_lora
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -213,9 +214,7 @@ class SchedulerLoadInquirer:
         decode_moments = list(totals) if totals[0] > 0 else None
 
         return LoadSnapshot(
-            dp_rank=int(get_parallel().dp_rank)
-            if get_parallel().dp_rank is not None
-            else 0,
+            dp_rank=load_snapshot_dp_rank(),
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,

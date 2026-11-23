@@ -111,6 +111,8 @@ pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
         core,
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
         server_args,
+        workers: Default::default(),
+        codec: None,
         chat_formatter: None,
     })
 }
@@ -164,6 +166,8 @@ fn answering_app_state() -> Arc<super::AppState> {
         core,
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
         server_args,
+        workers: Default::default(),
+        codec: None,
         chat_formatter: Some(super::ChatFormatter::Legacy(Box::new(
             super::template::LegacyFormatter {
                 spec: super::template::builtin_template("chatml").unwrap(),

@@ -45,7 +45,14 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     })
     .await;
     match collected {
-        Ok(Ok(text)) => ([(header::CONTENT_TYPE, CONTENT_TYPE)], text).into_response(),
+        Ok(Ok(mut text)) => {
+            text.push_str(
+                &state
+                    .workers
+                    .metrics(state.server_args.deployment_info.dp_rank.unwrap_or(0)),
+            );
+            ([(header::CONTENT_TYPE, CONTENT_TYPE)], text).into_response()
+        }
         Ok(Err(error)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("reading {}: {error}", config.multiproc_dir),
@@ -85,6 +92,8 @@ mod tests {
                 server_args.as_ref(),
             ),
             server_args,
+            workers: Default::default(),
+            codec: None,
             chat_formatter: None,
         });
         routes().with_state(state)
@@ -141,7 +150,11 @@ mod tests {
             let (status, content_type, body) = get(app(Some(config.clone())), uri).await;
             assert_eq!(status, StatusCode::OK, "{uri}");
             assert_eq!(content_type, CONTENT_TYPE);
-            assert_eq!(body, expected);
+            assert!(body.starts_with(expected));
+            assert!(
+                body.lines()
+                    .any(|line| line == r#"sglang:rust_http_in_flight{lane="long",dp_rank="0"} 0"#)
+            );
         }
         std::fs::remove_dir_all(&dir).unwrap();
         let (status, _, _) = get(app(Some(config)), "/metrics").await;

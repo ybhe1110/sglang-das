@@ -203,7 +203,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
     sock_send,
 )
-from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
+from sglang.srt.managers.load_snapshot import (
+    create_load_snapshot_writer,
+    load_snapshot_dp_rank,
+)
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
@@ -899,7 +902,7 @@ class Scheduler(
             return
 
         self.recv_from_tokenizer = self.ipc_channels.recv_from_tokenizer
-        dp_rank = get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
+        dp_rank = load_snapshot_dp_rank()
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
                 port_args,
@@ -908,6 +911,10 @@ class Scheduler(
                 publish_interval=get_observability().load_snapshot_publish_interval,
             )
         except Exception as e:
+            if envs.SGLANG_RUST_SERVER.get():
+                raise RuntimeError(
+                    "Rust ingress requires a local load snapshot writer"
+                ) from e
             logger.warning("load snapshot writer init failed: %s", e)
 
     def init_idle_sleeper(self) -> None:

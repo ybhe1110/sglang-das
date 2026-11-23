@@ -36,6 +36,7 @@ pub(super) struct CorePlan {
     pub(super) tok: Vec<CoreId>,
     pub(super) detok: Vec<CoreId>,
     pub(super) tm: Vec<CoreId>,
+    pub(super) utility: Vec<CoreId>,
 }
 
 pub(super) fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
@@ -62,7 +63,7 @@ pub(super) fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
         .by_ref()
         .take(cfg.rust_server_args.http_api_worker_num)
         .collect();
-    let tok = it
+    let tok: Vec<CoreId> = it
         .by_ref()
         .take(cfg.server_args.tokenizer_worker_num)
         .collect();
@@ -77,7 +78,12 @@ pub(super) fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
     if tm.is_empty() {
         tm = api.clone();
     }
+    let mut utility: Vec<_> = it.collect();
+    if utility.is_empty() {
+        utility = tok.clone();
+    }
     Some(CorePlan {
+        utility,
         api,
         tok,
         detok,

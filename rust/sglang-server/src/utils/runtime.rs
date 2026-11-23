@@ -198,6 +198,42 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         None => None,
     };
 
+    let bootstrap_listener = if cfg.server_args.enable_pd_bootstrap()
+        && cfg.server_args.deployment_info.dp_rank.unwrap_or(0) == 0
+    {
+        cfg.server_args
+            .deployment_info
+            .disaggregation_bootstrap_port
+            .filter(|&p| p != http_addr.port())
+            .map(|port| {
+                bind_tcp_listener(std::net::SocketAddr::new(http_addr.ip(), port))
+                    .map_err(|e| format!("binding PD bootstrap port {port}: {e}"))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let codec = if let Some(with_specials) = &dyn_tokenizer {
+        let without_specials = sglang_processor::load_tokenizer(
+            Some(&cfg.server_args.tokenizer_path),
+            cfg.server_args.revision.as_deref(),
+            false,
+        )?;
+        Some(Arc::new(api_server::http::work::DynamoCodec::new(
+            with_specials.clone(),
+            without_specials,
+        )) as Arc<dyn api_server::http::work::Codec>)
+    } else {
+        None
+    };
+    let workers = api_server::http::work::HttpWorkers::new(
+        &cfg.server_args,
+        plan.as_ref().map_or(&[], |p| p.utility.as_slice()),
+        plan.as_ref().map_or(&[], |p| p.tok.as_slice()),
+        &mut threads,
+    )
+    .map_err(|e| format!("starting HTTP preparation workers: {e}"))?;
+
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
         // Default: a real tokenizer decodes to text. `None` (→ `Skip`, raw
@@ -351,6 +387,9 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         cfg.rust_server_args.metrics_listener,
                         http_layer,
                         shutdown_rx.clone(),
+                        workers,
+                        codec,
+                        bootstrap_listener,
                     );
                     if let Some((listener, service)) = grpc_server {
                         tokio::join!(

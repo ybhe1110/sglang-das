@@ -154,7 +154,20 @@ struct LoadsQuery {
 }
 
 async fn loads(State(state): State<Arc<AppState>>, Query(query): Query<LoadsQuery>) -> Response {
-    let args = &state.server_args;
+    // A writer may hold the SHM flock. Waiting or reading it on an I/O worker
+    // stalls unrelated SSE connections on the same executor.
+    tokio::task::spawn_blocking(move || render_loads(&state.server_args, query))
+        .await
+        .unwrap_or_else(|_| {
+            native_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "load snapshot reader stopped",
+                false,
+            )
+        })
+}
+
+fn render_loads(args: &crate::message::config::ServerArgs, query: LoadsQuery) -> Response {
     let Some(path) = args.load_snapshot_path.as_deref() else {
         return native_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -191,6 +204,14 @@ async fn loads(State(state): State<Arc<AppState>>, Query(query): Query<LoadsQuer
             .into_response();
     }
     let mut body = Map::new();
+    body.insert(
+        "global_dp_rank".into(),
+        args.deployment_info.dp_rank.unwrap_or(0).into(),
+    );
+    body.insert(
+        "global_dp_size".into(),
+        args.deployment_info.dp_size.max(1).into(),
+    );
     body.insert("timestamp".into(), Value::from(utc_now_isoformat()));
     body.insert("version".into(), Value::from(args.version.as_str()));
     body.insert("accelerator".into(), args.accelerator.clone().into());
@@ -237,7 +258,7 @@ fn read_snapshots(path: &Path, dp_size: usize, ranks: &[usize]) -> Vec<rmpv::Val
     let Ok(file) = File::open(path) else {
         return Vec::new();
     };
-    if flock(&file, FlockOperation::LockShared).is_err() {
+    if flock(&file, FlockOperation::NonBlockingLockShared).is_err() {
         return Vec::new();
     }
     let mut header = [0u8; HEADER_LEN as usize];
@@ -478,6 +499,8 @@ mod tests {
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
             server_args: Arc::new(server_args),
+            workers: Default::default(),
+            codec: None,
             chat_formatter: None,
         });
         let query = Query::try_from_uri(&format!("/v1/loads?{query}").parse().unwrap()).unwrap();
@@ -502,6 +525,11 @@ mod tests {
             version: "1.2.3".into(),
             accelerator: Some("GPU".into()),
             num_accelerators: 4,
+            deployment_info: crate::message::config::DeploymentInfo {
+                dp_rank: Some(dp_rank as u32),
+                dp_size: dp_size as u32,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let json = |body: &str| serde_json::from_str::<Value>(body).unwrap();
@@ -514,6 +542,8 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "global_dp_rank",
+                "global_dp_size",
                 "timestamp",
                 "version",
                 "accelerator",
@@ -538,6 +568,8 @@ mod tests {
         let mut rank1 = expected["to_dict"]["all"][1].clone();
         rank1["dp_rank"] = json!(0);
         assert_eq!(json(&body)["loads"], json!([rank1]));
+        assert_eq!(json(&body)["global_dp_rank"], 1);
+        assert_eq!(json(&body)["global_dp_size"], 2);
 
         let ranks = |body: &str| json(body)["loads"].as_array().unwrap().len();
         assert_eq!(ranks(&get(args(&file.0, 2, 1), "dp_rank=1").await.1), 0);

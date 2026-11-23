@@ -177,6 +177,10 @@ pub struct ServerArgs {
     /// `model_max_length` (`-1` when it has none), or the context length when
     /// that is not a 64-bit integer.
     pub tokenizer_model_max_length: i64,
+    pub bos_token_id: Option<i64>,
+    pub default_chat_template_kwargs: std::collections::HashMap<String, serde_json::Value>,
+    pub utility_workers: usize,
+    pub utility_capacity: usize,
     /// Launch-time stamps (not `server_args` fields): sglang package version
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
@@ -236,6 +240,7 @@ impl ServerArgs {
         enable_return_hidden_states,
         num_reserved_tokens,
         tokenizer_model_max_length,
+        bos_token_id, default_chat_template_kwargs, utility_workers, utility_capacity,
         version,
         max_total_num_tokens,
         deployment_info,
@@ -283,6 +288,10 @@ impl ServerArgs {
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
         tokenizer_model_max_length: i64,
+        bos_token_id: Option<i64>,
+        default_chat_template_kwargs: &str,
+        utility_workers: usize,
+        utility_capacity: usize,
         version: String,
         max_total_num_tokens: u64,
         deployment_info: DeploymentInfo,
@@ -293,8 +302,8 @@ impl ServerArgs {
         accelerator: Option<String>,
         num_accelerators: u32,
         metrics: Option<MetricsConfig>,
-    ) -> Self {
-        Self {
+    ) -> pyo3::PyResult<Self> {
+        Ok(Self {
             model_path,
             served_model_name,
             tokenizer_path,
@@ -328,6 +337,15 @@ impl ServerArgs {
             enable_return_hidden_states,
             num_reserved_tokens,
             tokenizer_model_max_length,
+            bos_token_id,
+            default_chat_template_kwargs: serde_json::from_str(default_chat_template_kwargs)
+                .map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid default_chat_template_kwargs: {e}"
+                    ))
+                })?,
+            utility_workers,
+            utility_capacity,
             version,
             max_total_num_tokens,
             deployment_info,
@@ -338,7 +356,7 @@ impl ServerArgs {
             accelerator,
             num_accelerators,
             metrics,
-        }
+        })
     }
 }
 
@@ -381,6 +399,10 @@ impl Default for ServerArgs {
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,
             tokenizer_model_max_length: -1,
+            bos_token_id: None,
+            default_chat_template_kwargs: Default::default(),
+            utility_workers: 1,
+            utility_capacity: 8,
             version: String::new(),
             max_total_num_tokens: 0,
             deployment_info: DeploymentInfo::default(),
@@ -743,6 +765,12 @@ impl ServerArgs {
         if self.served_model_name.is_empty() {
             return Err("empty 'served_model_name' in server_args".into());
         }
+        if !(1..=64).contains(&self.utility_workers) || !(1..=1024).contains(&self.utility_capacity)
+        {
+            return Err(
+                "utility_workers must be in [1,64] and utility_capacity in [1,1024]".into(),
+            );
+        }
         for (name, value) in &self.health_generate_headers {
             if http::HeaderName::from_bytes(name.as_bytes()).is_err()
                 || http::HeaderValue::from_str(value).is_err()
@@ -779,12 +807,18 @@ impl ServerArgs {
         self.disaggregation_mode != DisaggregationMode::Null
     }
 
-    /// Serve the PD KV bootstrap registry on the api listener: every prefill
-    /// rust server hosts it, unconditionally — no extra topology gating. KV
-    /// managers and decode nodes reach the registry at the resolved
-    /// `disaggregation_bootstrap_port`, which rust-server mode aliases to the
-    /// api port, so whichever prefill server that port names is the one that
-    /// receives the registrations.
+    /// AIgate supplies a global rank even when the listener port is node-local.
+    pub(crate) fn check_ingress_rank(&self, rank: Option<i64>) -> Result<(), String> {
+        let own = i64::from(self.deployment_info.dp_rank.unwrap_or(0));
+        if rank.is_some_and(|rank| rank != own) {
+            return Err(format!(
+                "routed_dp_rank {rank:?} does not match ingress rank {own}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prefill listeners host the registry. Rank zero also binds its configured bootstrap port.
     pub fn enable_pd_bootstrap(&self) -> bool {
         self.disaggregation_mode == DisaggregationMode::Prefill
     }

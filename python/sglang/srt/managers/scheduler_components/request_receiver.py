@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -22,6 +22,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    GetInternalStateReq,
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -72,6 +73,12 @@ class SchedulerRequestReceiver:
     ingress_tp_cpu_group: Any = None
     ingress_attn_tp_cpu_group: Any = None
     ingress_attn_cp_cpu_group: Any = None
+    _global_control_pending: torch.Tensor = field(
+        default_factory=lambda: torch.empty(1, dtype=torch.int32, device="cpu"),
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     @staticmethod
     def _local_control_broadcast() -> bool:
@@ -90,6 +97,19 @@ class SchedulerRequestReceiver:
 
     def ingress_sync_groups(self) -> List[Any]:
         parallel = get_parallel()
+        if parallel.attn_dp_enabled and envs.SGLANG_RUST_SERVER.get():
+            groups = [
+                self._cpu_group(kind)
+                for kind in ("attn_cp", "attn_tp")
+                if getattr(parallel, kind + "_size") > 1
+            ]
+            if (
+                parallel.pp_rank == 0
+                and parallel.tp_size > 1
+                and not self._local_control_broadcast()
+            ):
+                groups.append(self._cpu_group("tp"))
+            return groups
         if parallel.attn_dp_enabled and self._local_control_broadcast():
             return [
                 self._cpu_group(kind)
@@ -210,6 +230,8 @@ class SchedulerRequestReceiver:
         """
         local_reqs = local_reqs or []
         if get_parallel().attn_dp_enabled:
+            if envs.SGLANG_RUST_SERVER.get():
+                return self._broadcast_rust_dp_reqs(recv_reqs, local_reqs)
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
                 work_reqs.extend(local_reqs)
@@ -251,6 +273,44 @@ class SchedulerRequestReceiver:
                     src=tp_group.ranks[0],
                 )
         return recv_reqs
+
+    def _broadcast_rust_dp_reqs(self, recv_reqs, local_reqs):
+        """Independent HTTP listeners each own a queue, aborts and status queries."""
+        parallel = get_parallel()
+        work, global_controls = None, []
+        if parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0:
+            work, controls = self._split_work_and_control_reqs(recv_reqs or [])
+            work.extend(local_reqs)
+            for req in controls:
+                if (
+                    parallel.pp_rank > 0
+                    or self._local_control_broadcast()
+                    or isinstance(req, GetInternalStateReq)
+                    or (isinstance(req, AbortReq) and not req.abort_all)
+                ):
+                    work.append(req)
+                else:
+                    global_controls.append(req)
+        work = self._broadcast_attn(work)
+        if (
+            parallel.pp_rank == 0
+            and parallel.tp_size > 1
+            and not self._local_control_broadcast()
+        ):
+            # Every leader may receive a global control. Later PP stages
+            # already receive this fan-out from their own first-stage peer.
+            # Empty polls are the hot path. Exchange one reusable CPU integer
+            # and serialize Python objects only when some listener has work
+            # for the whole TP group.
+            group = self._cpu_group("tp")
+            self._global_control_pending.fill_(bool(global_controls))
+            all_reduce(self._global_control_pending, op=ReduceOp.MAX, group=group)
+            if not self._global_control_pending.item():
+                return work
+            gathered = [None] * parallel.tp_size
+            torch.distributed.all_gather_object(gathered, global_controls, group=group)
+            global_controls = [req for batch in gathered for req in batch]
+        return work + global_controls
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
         if not recv_reqs:

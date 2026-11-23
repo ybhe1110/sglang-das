@@ -2332,6 +2332,8 @@ class Envs:
     # Rust server
     # ===================================================================
     SGLANG_RUST_SERVER = EnvBool(False)
+    SGLANG_RUST_UTILITY_WORKERS = EnvInt(1)  # Per short/long lane and listener
+    SGLANG_RUST_UTILITY_CAPACITY = EnvInt(8)  # In-flight bodies per lane
     # Build a missing Rust extension from source (auto), require a bundled or
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")

@@ -44,6 +44,7 @@ import logging
 import mmap
 import os
 import struct
+import time
 from contextlib import contextmanager
 from typing import Optional
 
@@ -423,6 +424,65 @@ class ZmqLoadSnapshotWriter:
         self._socket.close()
 
 
+class MirroredLoadSnapshotWriter(ShmLoadSnapshotWriter):
+    """Publish locally for an embedded Rust listener and remotely for DPC.
+
+    The mirror has a separate path: the central ZMQ collector must never
+    overwrite a listener's newer local snapshot with a delayed remote copy.
+    SHM is local to each node, not shared across the cluster.
+    """
+
+    def __init__(self, path, endpoint, dp_size, dp_rank, publish_interval=1):
+        super().__init__(path, dp_size, dp_rank, publish_interval)
+        self._remote_args = (endpoint, dp_size, dp_rank, publish_interval)
+        self._remote_retry_at = 0.0
+        self._remote_log_at = float("-inf")
+        self.remote_publish_errors = 0
+        try:
+            self.remote = ZmqLoadSnapshotWriter(
+                endpoint, dp_size, dp_rank, publish_interval
+            )
+        except BaseException:
+            super().close()
+            raise
+
+    def write(self, snapshot: LoadSnapshot) -> None:
+        import zmq
+
+        super().write(snapshot)
+        now = time.monotonic()
+        if self.remote is None and now < self._remote_retry_at:
+            return
+        try:
+            if self.remote is None:
+                self.remote = ZmqLoadSnapshotWriter(*self._remote_args)
+            self.remote.write(snapshot)
+        except zmq.ZMQError as exc:
+            # Local publication has succeeded. Recreate a broken transport on
+            # a later step, without blocking the scheduler or queueing history.
+            self.remote_publish_errors += 1
+            if self.remote is not None:
+                try:
+                    self.remote.close()
+                except zmq.ZMQError:
+                    pass
+            self.remote = None
+            self._remote_retry_at = now + 5.0
+            if now - self._remote_log_at >= 30.0:
+                logger.warning(
+                    "remote load publication failed; local SHM remains available: %s",
+                    exc,
+                )
+                self._remote_log_at = now
+
+    def close(self) -> None:
+        try:
+            if self.remote is not None:
+                self.remote.close()
+        finally:
+            super().close()
+
+
 # ---------------------------------------------------------------------------
 # Readers
 # ---------------------------------------------------------------------------
@@ -640,6 +700,13 @@ def _zmq_addr_for(port_args) -> str:
     return f"ipc:///tmp/sglang_load_collector_{safe}_{digest}.sock"
 
 
+def load_snapshot_dp_rank() -> int:
+    parallel = get_parallel()
+    if envs.SGLANG_RUST_SERVER.get() and parallel.attn_dp_size > 1:
+        return parallel.attn_dp_rank
+    return parallel.dp_rank or 0
+
+
 def create_load_snapshot_writer(
     port_args,
     dp_size: int,
@@ -648,6 +715,14 @@ def create_load_snapshot_writer(
 ):
     """Return a SHM or ZMQ writer based on server configuration."""
     if should_use_zmq():
+        if envs.SGLANG_RUST_SERVER.get():
+            return MirroredLoadSnapshotWriter(
+                f"{shm_path_for(port_args.instance_id)}.rust-{dp_rank}",
+                _zmq_addr_for(port_args),
+                dp_size,
+                dp_rank,
+                publish_interval,
+            )
         return ZmqLoadSnapshotWriter(
             _zmq_addr_for(port_args), dp_size, dp_rank, publish_interval
         )

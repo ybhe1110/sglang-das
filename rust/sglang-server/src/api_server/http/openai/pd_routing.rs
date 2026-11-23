@@ -17,6 +17,7 @@ pub(super) struct PDRoutingFields {
     bootstrap_host: Option<StringOrList>,
     bootstrap_port: Option<OptionalInt64OrList>,
     bootstrap_room: Option<Int64OrList>,
+    #[serde(alias = "data_parallel_rank")]
     routed_dp_rank: Option<i64>,
     disagg_prefill_dp_rank: Option<i64>,
 }

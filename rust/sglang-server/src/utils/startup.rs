@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use pyo3::PyErr;
 use pyo3::exceptions::PyValueError;
 
-use crate::message::config::{DisaggregationMode, ServerArgs};
+use crate::message::config::ServerArgs;
 
 /// A `ValueError` for a boot-time failure, as `"{context}: {err}"`.
 pub(crate) fn value_error(context: &str, err: impl std::fmt::Display) -> PyErr {
@@ -55,17 +55,14 @@ pub(crate) fn advertise_listener_ports(
 ) -> ServerArgs {
     server_args.port = http_addr.port();
     server_args.grpc_port = grpc_addr.map(|addr| addr.port());
-    // Rust-mode prefill serves the PD bootstrap registry on its API port; on
-    // decode the field names the prefill peer's port and must stay unchanged.
-    if server_args.disaggregation_mode == DisaggregationMode::Prefill {
-        server_args.deployment_info.disaggregation_bootstrap_port = Some(http_addr.port());
-    }
+    // All P/D listeners rendezvous on the configured prefill bootstrap port.
     server_args
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::config::DisaggregationMode;
 
     #[test]
     fn listen_addr_uses_server_host_and_port_offset() {
@@ -108,8 +105,7 @@ mod tests {
         );
     }
 
-    /// A DP listener at a nonzero offset must not advertise rank 0's ports:
-    /// decode would rendezvous with the wrong prefill bootstrap registry.
+    /// HTTP/gRPC ports use the node-local offset. The bootstrap registry is shared.
     #[test]
     fn dp_listener_advertises_its_own_ports() {
         let base = ServerArgs {
@@ -123,13 +119,13 @@ mod tests {
 
         let mut prefill = base.clone();
         prefill.disaggregation_mode = DisaggregationMode::Prefill;
-        prefill.deployment_info.disaggregation_bootstrap_port = Some(30_000);
+        prefill.deployment_info.disaggregation_bootstrap_port = Some(8_998);
         let prefill = advertise_listener_ports(prefill, http, grpc);
         assert_eq!(prefill.port, 30_002);
         assert_eq!(prefill.grpc_port, Some(50_053));
         assert_eq!(
             prefill.deployment_info.disaggregation_bootstrap_port,
-            Some(30_002)
+            Some(8_998)
         );
 
         let mut decode = base;

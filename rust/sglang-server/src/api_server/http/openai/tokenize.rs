@@ -1,25 +1,23 @@
 //! `/v1/tokenize` and `/v1/detokenize` (+ the unversioned aliases), Python's
 //! `OpenAIServingTokenize` / `OpenAIServingDetokenize`: the same request and
 //! response shapes and the same flat error body. Encoding runs on the
-//! tokenizer pool and decoding on a detok shard, never on these I/O threads.
+//! dedicated HTTP utility workers, including rendering, JSON parsing and serialization.
 
-use std::sync::Arc;
-
+use super::chat::{parse_chat, prepare_prompt};
+use super::{AppState, contains_media};
+use crate::api_server::http::work::{RESPONSE_BYTES, leased_body};
+use crate::message::types::{OneOrMany, TokenIds};
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
+    extract::{Request, State},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
-use futures::future::try_join_all;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-
-use super::chat::ChatRequest;
-use super::{AppState, contains_media};
-use crate::api_server::core::CoreError;
-use crate::message::types::{OneOrMany, TokenIds};
+use std::io::{self, Write};
+use std::sync::Arc;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -68,152 +66,212 @@ fn error_body(status: StatusCode, error_type: &str, message: impl Into<String>) 
     (status, Json(body)).into_response()
 }
 
-/// A body that fails schema validation: what Python's
-/// `validation_exception_handler` answers for a pydantic error.
-fn invalid_body(message: impl Into<String>) -> Response {
-    error_body(StatusCode::BAD_REQUEST, "Bad Request", message)
-}
-
-fn bad_request(message: impl Into<String>) -> Response {
-    error_body(StatusCode::BAD_REQUEST, "BadRequestError", message)
-}
-
-/// A failed core operation: a rejected input is the client's 400; anything
-/// else is the 500 Python's catch-all returns.
-fn core_error(error: CoreError, operation: &str) -> Response {
-    match error {
-        CoreError::InvalidArgument(message) => bad_request(message),
-        other => error_body(
+struct Failure(StatusCode, &'static str, String);
+impl Failure {
+    fn invalid(e: impl ToString) -> Self {
+        Self(StatusCode::BAD_REQUEST, "Bad Request", e.to_string())
+    }
+    fn bad(e: impl ToString) -> Self {
+        Self(StatusCode::BAD_REQUEST, "BadRequestError", e.to_string())
+    }
+    fn large() -> Self {
+        Self(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "PayloadTooLarge",
+            "utility batch or result exceeds its limit".into(),
+        )
+    }
+    fn internal(e: impl ToString) -> Self {
+        Self(
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalServerError",
-            format!("Internal server error during {operation}: {other}"),
+            e.to_string(),
+        )
+    }
+}
+
+/// Serialize one item at a time so a batch of expanding decodes never builds
+/// an unbounded intermediate array of strings or JSON values.
+#[derive(Default)]
+struct Output(Vec<u8>);
+impl Write for Output {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() > RESPONSE_BYTES - self.0.len() {
+            return Err(io::Error::other("response too large"));
+        }
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+impl Output {
+    fn json(&mut self, v: &impl Serialize) -> Result<(), Failure> {
+        serde_json::to_writer(self, v).map_err(|_| Failure::large())
+    }
+    fn push(&mut self, bytes: &[u8]) -> Result<(), Failure> {
+        self.write_all(bytes).map_err(|_| Failure::large())
+    }
+}
+
+async fn tokenize(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    utility(state, req, true).await
+}
+async fn detokenize(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    utility(state, req, false).await
+}
+async fn utility(state: Arc<AppState>, req: Request, encode: bool) -> Response {
+    let worker_state = state.clone();
+    let result = state.workers.utility(&req).run(req, move |bytes, lease, reply| {
+        let result = if encode { encode_body(&worker_state, &bytes, || reply.is_closed()) }
+                     else { decode_body(&worker_state, &bytes, || reply.is_closed()) };
+        let (status, data) = match result {
+            Ok(out) => (StatusCode::OK, out.0),
+            Err(Failure(status, typ, mut msg)) => {
+                // Some serde errors contain the entire offending string.
+                if msg.len() > 2048 { msg.truncate(msg.floor_char_boundary(2048)); }
+                (status, serde_json::to_vec(&json!({"object":"error","message":msg,"type":typ,"param":null,"code":status.as_u16()})).unwrap())
+            }
+        };
+        (status, [(header::CONTENT_TYPE, "application/json")], leased_body(data, lease)).into_response()
+    }).await;
+    match result {
+        Ok(response) => response,
+        Err(error) => error_body(
+            error.0,
+            error.0.canonical_reason().unwrap_or("Error"),
+            error.1,
         ),
     }
 }
 
-async fn tokenize(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<Value>, JsonRejection>,
-) -> Response {
-    let body = match body {
-        Ok(Json(body)) => body,
-        Err(rejection) => return invalid_body(rejection.body_text()),
-    };
-    let body: TokenizeBody = match serde_json::from_value(body) {
-        Ok(body) => body,
-        Err(error) => return invalid_body(error.to_string()),
-    };
-    let (texts, add_special_tokens) = match (body.prompt, body.messages) {
-        (Some(prompt), None) => (prompt, body.add_special_tokens),
-        // The rendered template owns its special tokens, as on the chat path
-        // (Python encodes it with `add_special_tokens=False`).
-        (None, Some(messages)) => match render_chat_prompt(&state, messages, body.rest) {
-            Ok(prompt) => (OneOrMany::One(prompt), false /* add_special_tokens */),
-            Err((error_type, message)) => {
-                return error_body(StatusCode::BAD_REQUEST, error_type, message);
-            }
-        },
-        _ => return invalid_body("Exactly one of 'prompt' or 'messages' must be provided."),
-    };
-    let max_model_len = state.server_args.tokenizer_model_max_length;
-    let response = match texts {
-        OneOrMany::One(text) => match state.core.tokenize(text, add_special_tokens).await {
-            Ok(tokens) => json!({
-                "tokens": tokens,
-                "count": tokens.len(),
-                "max_model_len": max_model_len,
-            }),
-            Err(error) => return core_error(error, "tokenization"),
-        },
-        OneOrMany::Many(texts) => {
-            let calls = texts
-                .into_iter()
-                .map(|text| state.core.tokenize(text, add_special_tokens));
-            match try_join_all(calls).await {
-                Ok(tokens) => {
-                    let count: Vec<usize> = tokens.iter().map(Vec::len).collect();
-                    json!({ "tokens": tokens, "count": count, "max_model_len": max_model_len })
-                }
-                Err(error) => return core_error(error, "tokenization"),
-            }
-        }
-    };
-    Json(response).into_response()
-}
-
-/// Render `messages` through the chat template, like Python's
-/// `TokenizeRequest.to_chat_completion_request`: every other tokenize field
-/// except `prompt` and `add_special_tokens` carries over to the chat request.
-/// A failure is a 400, returned as its error type and message.
-fn render_chat_prompt(
+fn encode_body(
     state: &AppState,
-    messages: Value,
-    mut fields: Map<String, Value>,
-) -> Result<String, (&'static str, String)> {
-    const INVALID_BODY: &str = "Bad Request";
-    const BAD_REQUEST: &str = "BadRequestError";
-    fields.insert("messages".into(), messages);
-    // Python's `TokenizeRequest.model` default; the chat request requires one.
-    fields
-        .entry("model")
-        .or_insert_with(|| Value::from("default"));
-    let ChatRequest {
-        request,
-        chat_template_kwargs,
-        ..
-    } = serde_json::from_value(Value::Object(fields))
-        .map_err(|error| (INVALID_BODY, error.to_string()))?;
-    if request.messages.is_empty() {
-        return Err((BAD_REQUEST, "messages cannot be empty".into()));
-    }
-    if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return Err((
-            BAD_REQUEST,
-            "image, audio, video, and file message content is not supported".into(),
-        ));
-    }
-    let Some(formatter) = &state.chat_formatter else {
-        return Err((BAD_REQUEST, "this model has no usable chat template".into()));
+    bytes: &[u8],
+    cancelled: impl Fn() -> bool,
+) -> Result<Output, Failure> {
+    let body: TokenizeBody = serde_json::from_slice(bytes).map_err(Failure::invalid)?;
+    let codec = || {
+        state.codec.as_ref().ok_or_else(|| {
+            Failure::bad("tokenization is unavailable when skip_tokenizer_init=True")
+        })
     };
-    formatter
-        .render(&request, chat_template_kwargs.as_ref())
-        .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
+    let encode = |text: &str, specials| codec()?.encode(text, specials).map_err(Failure::internal);
+    let mut out = Output::default();
+    out.push(br#"{"tokens":"#)?;
+    match (body.prompt, body.messages) {
+        (Some(OneOrMany::Many(texts)), None) => {
+            if texts.len() > 1024 {
+                return Err(Failure::large());
+            }
+            let mut counts = Vec::with_capacity(texts.len());
+            out.push(b"[")?;
+            for text in texts {
+                if cancelled() {
+                    return Err(Failure::bad("request cancelled"));
+                }
+                let ids = encode(&text, body.add_special_tokens)?;
+                if !counts.is_empty() {
+                    out.push(b",")?;
+                }
+                counts.push(ids.len());
+                out.json(&ids)?;
+            }
+            out.push(br#"],"count":"#)?;
+            out.json(&counts)?;
+        }
+        (prompt, messages) => {
+            let ids = match (prompt, messages) {
+                (Some(OneOrMany::One(text)), None) => encode(&text, body.add_special_tokens)?,
+                (None, Some(messages)) => {
+                    let mut fields = body.rest;
+                    fields.insert("messages".into(), messages);
+                    fields
+                        .entry("model")
+                        .or_insert_with(|| Value::from("default"));
+                    let raw = Value::Object(fields);
+                    let chat = parse_chat(state, &raw).map_err(Failure::invalid)?;
+                    if chat.request.messages.is_empty() {
+                        return Err(Failure::bad("messages cannot be empty"));
+                    }
+                    if contains_media(&raw["messages"]) {
+                        return Err(Failure::bad(
+                            "image, audio, video, and file message content is not supported",
+                        ));
+                    }
+                    let (text, ids) =
+                        prepare_prompt(state, raw, &chat.request, chat.chat_template_kwargs)
+                            .map_err(Failure::bad)?;
+                    match ids {
+                        Some(ids) => ids,
+                        None => encode(&text, false)?,
+                    }
+                }
+                _ => {
+                    return Err(Failure::invalid(
+                        "Exactly one of 'prompt' or 'messages' must be provided.",
+                    ));
+                }
+            };
+            out.json(&ids)?;
+            out.push(br#","count":"#)?;
+            out.json(&ids.len())?;
+        }
+    }
+    out.push(br#","max_model_len":"#)?;
+    out.json(&state.server_args.tokenizer_model_max_length)?;
+    out.push(b"}")?;
+    Ok(out)
 }
 
-async fn detokenize(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<Value>, JsonRejection>,
-) -> Response {
-    let body = match body {
-        Ok(Json(body)) => body,
-        Err(rejection) => return invalid_body(rejection.body_text()),
+fn decode_body(
+    state: &AppState,
+    bytes: &[u8],
+    cancelled: impl Fn() -> bool,
+) -> Result<Output, Failure> {
+    let body: DetokenizeBody = serde_json::from_slice(bytes).map_err(Failure::invalid)?;
+    let decode = |tokens: TokenIds| {
+        let ids = tokens
+            .into_iter()
+            .map(|id| {
+                u32::try_from(id)
+                    .map_err(|_| Failure::bad(format!("Token ID {id} is out of range")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        state
+            .codec
+            .as_ref()
+            .ok_or_else(|| {
+                Failure::bad("detokenization is unavailable when skip_tokenizer_init=True")
+            })?
+            .decode(&ids, body.skip_special_tokens)
+            .map_err(Failure::internal)
     };
-    let body: DetokenizeBody = match serde_json::from_value(body) {
-        Ok(body) => body,
-        Err(error) => return invalid_body(error.to_string()),
-    };
-    let text = match body.tokens {
-        // Python answers an empty list without decoding.
-        OneOrMany::One(tokens) if tokens.is_empty() => Value::from(""),
-        OneOrMany::One(tokens) => match state
-            .core
-            .detokenize(tokens, body.skip_special_tokens)
-            .await
-        {
-            Ok(text) => Value::from(text),
-            Err(error) => return core_error(error, "detokenization"),
-        },
+    let mut out = Output::default();
+    out.push(br#"{"text":"#)?;
+    match body.tokens {
+        OneOrMany::One(tokens) if tokens.is_empty() => out.json(&"")?,
+        OneOrMany::One(tokens) => out.json(&decode(tokens)?)?,
         OneOrMany::Many(lists) => {
-            let calls = lists
-                .into_iter()
-                .map(|tokens| state.core.detokenize(tokens, body.skip_special_tokens));
-            match try_join_all(calls).await {
-                Ok(texts) => Value::from(texts),
-                Err(error) => return core_error(error, "detokenization"),
+            if lists.len() > 1024 {
+                return Err(Failure::large());
             }
+            out.push(b"[")?;
+            for (i, list) in lists.into_iter().enumerate() {
+                if cancelled() {
+                    return Err(Failure::bad("request cancelled"));
+                }
+                if i > 0 {
+                    out.push(b",")?;
+                }
+                out.json(&decode(list)?)?;
+            }
+            out.push(b"]")?;
         }
-    };
-    Json(json!({ "text": text })).into_response()
+    }
+    out.push(b"}")?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -225,37 +283,24 @@ mod tests {
     use super::super::test_utils::{body_json, post_json};
     use super::*;
     use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+    use crate::api_server::http::work::Codec;
     use crate::message::config::ServerArgs;
-    use crate::message::request::RequestKind;
-    use crate::message::response::ResponseItem;
-    use crate::tokenizer_manager::wiring::TmEvent;
-
-    /// A core whose runtime answers tokenize with `[0?, len(word)...]` (the 0
-    /// standing in for an auto-added BOS) and detokenize with a description
-    /// of what it was asked, so the tests see exactly what reached it.
+    struct Words;
+    impl Codec for Words {
+        fn encode(&self, text: &str, specials: bool) -> Result<Vec<i64>, String> {
+            Ok(specials
+                .then_some(0)
+                .into_iter()
+                .chain(text.split_whitespace().map(|w| w.len() as i64))
+                .collect())
+        }
+        fn decode(&self, ids: &[u32], skip: bool) -> Result<String, String> {
+            Ok(format!("{ids:?} {skip}"))
+        }
+    }
     fn answering_state() -> Arc<AppState> {
-        let (intake_tx, intake_rx) = flume::unbounded::<TmEvent>();
-        tokio::spawn(async move {
-            while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
-                assert!(admission.try_accept());
-                let item = match &request.kind {
-                    RequestKind::Tokenize {
-                        text,
-                        add_special_tokens,
-                    } => {
-                        let bos = add_special_tokens.then_some(0);
-                        let words = text.split_whitespace().map(|w| w.len() as i64);
-                        ResponseItem::TokenIds(bos.into_iter().chain(words).collect())
-                    }
-                    RequestKind::Detokenize {
-                        token_ids,
-                        skip_special_tokens,
-                    } => ResponseItem::Data(format!("{token_ids:?} {skip_special_tokens}").into()),
-                    _ => panic!("unexpected request kind"),
-                };
-                request.sink.try_send(item).unwrap();
-            }
-        });
+        // No intake receiver: routing either utility through generation fails this test.
+        let intake_tx = flume::unbounded().0;
         let server_args = Arc::new(ServerArgs {
             tokenizer_model_max_length: 131072,
             ..Default::default()
@@ -277,6 +322,8 @@ mod tests {
                 server_args.as_ref(),
             ),
             server_args,
+            workers: Default::default(),
+            codec: Some(Arc::new(Words)),
             chat_formatter: Some(
                 load_chat_formatter(
                     None,           /* config_file */
@@ -367,5 +414,68 @@ mod tests {
         let (status, error) = call("/v1/tokenize", json!({"messages": []})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error["type"], "BadRequestError");
+    }
+    #[tokio::test]
+    async fn aigate_count_and_pd_chat_use_identical_native_prompt_ids() {
+        use super::super::chat::prepare_chat;
+        let mut state = answering_state();
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.chat_formatter = Some(super::super::ChatFormatter::DeepSeek(
+            sglang_processor::ChatFormatter::DeepSeekV41,
+        ));
+        let args = Arc::get_mut(&mut inner.server_args);
+        // The immutable model config is also held by the generation policy on some builds.
+        if let Some(args) = args {
+            args.bos_token_id = Some(0);
+        }
+        let body = json!({"model":"m", "messages":[{"role":"user","content":"中文 test"}],
+            "rid":"client-17","bootstrap_host":"prefill","bootstrap_port":8998,"bootstrap_room":9007199254740993_i64,
+            "bootstrap_pair_key":"pair-17","decode_tp_size":16,"data_parallel_rank":0,"disagg_prefill_dp_rank":0,
+            "min_tokens":2,"max_tokens":4,"ignore_eos":true});
+        let response = post_json(
+            routes().with_state(state.clone()),
+            "/v1/tokenize",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let counted = body_json(response).await;
+        let (requests, _) = prepare_chat(&state, body.clone()).unwrap();
+        let req = &requests[0];
+        assert_eq!(req.rid.client_facing(), "client-17");
+        assert_eq!(json!(req.input_ids), counted["tokens"]);
+        assert_eq!(counted["count"], req.input_ids.as_ref().unwrap().len());
+        assert_eq!(req.bootstrap_pair_key.as_deref(), Some("pair-17"));
+        assert_eq!(
+            (req.decode_tp_size, req.routed_dp_rank, req.bootstrap_room),
+            (Some(16), Some(0), Some(9007199254740993))
+        );
+        assert_eq!(req.sampling_params.min_new_tokens, 2);
+        assert!(req.sampling_params.ignore_eos);
+        // DeepSeek's native body accepts Python tool history shapes and numeric effort.
+        let mut history = body.clone();
+        history["reasoning_effort"] = json!(0.33);
+        history["messages"] = json!([
+            {"role":"user","content":"Hi"},
+            {"role":"assistant","content":"","tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"a","content":[{"type":"text","text":"snow"}]}
+        ]);
+        let counted = post_json(
+            routes().with_state(state.clone()),
+            "/v1/tokenize",
+            history.clone(),
+        )
+        .await;
+        assert_eq!(counted.status(), StatusCode::OK);
+        let (requests, _) = prepare_chat(&state, history).unwrap();
+        assert_eq!(
+            body_json(counted).await["tokens"],
+            json!(requests[0].input_ids)
+        );
+        for (field, value) in [("data_parallel_rank", json!(1)), ("n", json!(2))] {
+            let mut invalid = body.clone();
+            invalid[field] = value;
+            assert!(prepare_chat(&state, invalid).is_err());
+        }
     }
 }

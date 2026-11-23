@@ -91,6 +91,14 @@ pub(super) fn load_chat_formatter(
     let mut config = parse_json(&config_text, config_path, "tokenizer config")?;
 
     let Some(argument) = chat_template_arg else {
+        // Transformers can save the checkpoint template in a sibling Jinja file.
+        let standalone = config_path.with_file_name("chat_template.jinja");
+        if config.get("chat_template").is_none_or(Value::is_null) && standalone.is_file() {
+            set_chat_template(
+                &mut config,
+                read_to_string(&standalone, "chat template")?.into(),
+            )?;
+        }
         return match formatter_from_config(&config) {
             Err(TemplateError::Missing) => native_formatter().ok_or(TemplateError::Missing),
             result => result,

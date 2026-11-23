@@ -28,7 +28,6 @@ use crate::utils::{
 use axum::{
     Json, Router,
     extract::State,
-    extract::rejection::JsonRejection,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{
         IntoResponse, Response,
@@ -177,48 +176,22 @@ async fn health_generate(
 /// The body is extracted as a `Result` so a deserialization failure is answered
 /// with **400** (Python's status for a bad request) carrying serde's field-level
 /// message, instead of axum's default 422.
-async fn generate(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Json<serde_json::Value>, JsonRejection>,
-) -> Response {
-    let mut body = match body {
-        Ok(Json(body)) => body,
-        // A body that fails to parse has no readable `stream` flag, so this one
-        // can only answer unary -- as Python's does (FastAPI rejects before its
-        // handler runs).
-        Err(rejection) => {
-            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
-        }
-    };
-    if state.server_args.enable_request_header_overrides
-        && let Err(error) = apply_header_overrides(&mut body, &headers)
-    {
-        return native_error(StatusCode::BAD_REQUEST, &error, false);
-    }
-    // Launch-time preferred sampling params fill in beneath the request's own
-    // keys before decoding, so an explicit request value (even a default or
-    // null) wins: Python TokenizerManager's precedence.
-    if let Some(preferred) = &state.server_args.preferred_sampling_params
-        && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
-    {
-        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
-    }
-    // The schema (sglang_api_types) is the contract: decode errors carry
-    // serde's field-level text, as Python's 400s do.
-    let body: api::GenerateRequest = match serde_json::from_value(body) {
-        Ok(body) => body,
-        Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
-    };
-    let stream = body.stream.unwrap_or(false);
-    // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
-    // payloads. `is_batch` = list form -> the response is a JSON array.
-    let (payloads, is_batch) = match into_requests(body, &state.generation_policy) {
-        Ok(v) => v,
-        // Request normalization only returns validation failures.
-        Err(e) => {
-            return native_error(StatusCode::BAD_REQUEST, &e.to_string(), stream);
-        }
+async fn generate(State(state): State<Arc<AppState>>, req: axum::extract::Request) -> Response {
+    let worker_state = state.clone();
+    let headers = req.headers().clone();
+    let result = state
+        .workers
+        .generation
+        .run(req, move |bytes, _lease, _| {
+            let body = serde_json::from_slice(&bytes)
+                .map_err(|e| native_error(StatusCode::BAD_REQUEST, &e.to_string(), false))?;
+            prepare_generate(&worker_state, headers, body)
+        })
+        .await;
+    let (payloads, is_batch, stream) = match result {
+        Ok(Ok(v)) => v,
+        Ok(Err(response)) => return response,
+        Err(e) => return native_error(e.0, e.1, false),
     };
     // Python starts APIServerReqTimeStats after request normalization and before
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
@@ -237,6 +210,72 @@ async fn generate(
     } else {
         generate_batch(&state, payloads, stream, timing).await
     }
+}
+
+fn prepare_generate(
+    state: &AppState,
+    headers: HeaderMap,
+    mut body: serde_json::Value,
+) -> Result<(Vec<GenerateRequest>, bool, bool), Response> {
+    if let Some(obj) = body.as_object_mut()
+        && let Some(rank) = obj.remove("data_parallel_rank")
+    {
+        if obj.insert("routed_dp_rank".into(), rank).is_some() {
+            return Err(native_error(
+                StatusCode::BAD_REQUEST,
+                "duplicate routed_dp_rank",
+                false,
+            ));
+        }
+    }
+    if state.server_args.enable_request_header_overrides
+        && let Err(error) = apply_header_overrides(&mut body, &headers)
+    {
+        return Err(native_error(StatusCode::BAD_REQUEST, &error, false));
+    }
+    // Launch-time preferred sampling params fill in beneath the request's own
+    // keys before decoding, so an explicit request value (even a default or
+    // null) wins: Python TokenizerManager's precedence.
+    if let Some(preferred) = &state.server_args.preferred_sampling_params
+        && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
+    {
+        return Err(native_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error,
+            false,
+        ));
+    }
+    // The schema (sglang_api_types) is the contract: decode errors carry
+    // serde's field-level text, as Python's 400s do.
+    let body: api::GenerateRequest = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(error) => {
+            return Err(native_error(
+                StatusCode::BAD_REQUEST,
+                &error.to_string(),
+                false,
+            ));
+        }
+    };
+    state
+        .server_args
+        .check_ingress_rank(body.routed_dp_rank)
+        .map_err(|e| native_error(StatusCode::BAD_REQUEST, &e, false))?;
+    let stream = body.stream.unwrap_or(false);
+    // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
+    // payloads. `is_batch` = list form -> the response is a JSON array.
+    let (payloads, is_batch) = match into_requests(body, &state.generation_policy) {
+        Ok(v) => v,
+        // Request normalization only returns validation failures.
+        Err(e) => {
+            return Err(native_error(
+                StatusCode::BAD_REQUEST,
+                &e.to_string(),
+                stream,
+            ));
+        }
+    };
+    Ok((payloads, is_batch, stream))
 }
 
 /// A single (non-batched) `/generate`: submit one request, then either stream its
@@ -574,6 +613,8 @@ mod tests {
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             generation_policy: GenerationPolicy::default(),
+            workers: Default::default(),
+            codec: None,
             chat_formatter: None,
         });
 
@@ -614,6 +655,8 @@ mod tests {
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
             server_args: Arc::new(server_args),
+            workers: Default::default(),
+            codec: None,
             chat_formatter: None,
         });
         // Each probe that reaches intake counts as scheduler output.
@@ -653,6 +696,8 @@ mod tests {
             core,
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             generation_policy: GenerationPolicy::default(),
+            workers: Default::default(),
+            codec: None,
             chat_formatter: None,
         });
 

@@ -1,7 +1,7 @@
 //! PD KV bootstrap registry — rust port of Python `CommonKVBootstrapServer` (shared by all
 //! transfer backends): prefill ranks PUT `/route`, decode ranks GET routes and the `-1`-sentinel
 //! topology, the PD router tracks per-room dp ranks; the wire format is Python-owned parity.
-//! Mounted on the prefill api listener (bootstrap port = api port) before `init_disaggregation`.
+//! Served on prefill HTTP listeners and the configured rank-zero bootstrap port before `init_disaggregation`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

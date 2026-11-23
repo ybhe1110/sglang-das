@@ -84,7 +84,7 @@ pub(crate) fn render(
 
 /// `chat_encoding.dsv41_tool_payload`: the function fields the client sent,
 /// Pydantic-coerced, in OpenAI order. The encoder renders only `function`.
-fn tool_payload(tool: &Value) -> Result<Value, String> {
+pub fn tool_payload(tool: &Value) -> Result<Value, String> {
     let f = &tool["function"];
     f["name"].as_str().ok_or("tool function requires name")?;
     let mut function: Map<String, Value> = ["name", "description", "parameters"]

@@ -27,7 +27,11 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
-from sglang.srt.rust_server.config import _build_server_args, _partition_cores
+from sglang.srt.rust_server.config import (
+    _build_server_args,
+    _default_server_core_budget,
+    _partition_cores,
+)
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
@@ -121,7 +125,7 @@ class RustServer:
     @staticmethod
     def _server_core_budget(allowed_core_count: int, mm_workers: int) -> int:
         """Maximum cores available to the Rust frontend and MM workers."""
-        return max(8, mm_workers + 4)
+        return _default_server_core_budget(allowed_core_count, mm_workers)
 
     @classmethod
     def _partition_cores(

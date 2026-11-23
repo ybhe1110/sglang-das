@@ -170,6 +170,12 @@ def _build_server_args(
         # Not a `server_args` field: `TokenizerManager` derives it, and the
         # rust ingress needs the same number for its total-token check.
         num_reserved_tokens=compute_num_reserved_tokens(),
+        bos_token_id=getattr(scheduler.tokenizer, "bos_token_id", None),
+        default_chat_template_kwargs=json.dumps(
+            get_serving().default_chat_template_kwargs or {}
+        ),
+        utility_workers=envs.SGLANG_RUST_UTILITY_WORKERS.get(),
+        utility_capacity=envs.SGLANG_RUST_UTILITY_CAPACITY.get(),
         tokenizer_model_max_length=_tokenizer_model_max_length(
             scheduler.tokenizer, mc.context_len
         ),
@@ -229,6 +235,14 @@ def _tokenizer_model_max_length(tokenizer: Any, context_len: int) -> int:
     return context_len
 
 
+def _default_server_core_budget(allowed_core_count: int, mm_workers: int) -> int:
+    # Give each utility lane its own CPU when this rank's affinity allows it.
+    return min(
+        allowed_core_count,
+        max(8, mm_workers + 4) + 2 * envs.SGLANG_RUST_UTILITY_WORKERS.get(),
+    )
+
+
 def _partition_cores(
     mm_workers: int = 0,
     server_core_budget: Optional[Callable[[int, int], int]] = None,
@@ -273,7 +287,7 @@ def _partition_cores(
     pool_budget = (
         server_core_budget(len(allowed), mm_workers)
         if server_core_budget is not None
-        else max(8, mm_workers + 4)
+        else _default_server_core_budget(len(allowed), mm_workers)
     )
     server_cores = allowed[reserve : reserve + pool_budget]
     logger.info(

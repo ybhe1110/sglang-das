@@ -312,6 +312,8 @@ mod tests {
                     server_args.as_ref(),
                 ),
                 server_args,
+                workers: Default::default(),
+                codec: None,
                 chat_formatter: None,
             }),
             intake_rx,

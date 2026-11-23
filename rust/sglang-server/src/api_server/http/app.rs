@@ -27,6 +27,8 @@ pub(super) struct AppState {
     pub(super) core: CoreHandle,
     pub(super) server_args: Arc<ServerArgs>,
     pub(super) generation_policy: GenerationPolicy,
+    pub(super) workers: super::work::HttpWorkers,
+    pub(super) codec: Option<Arc<dyn super::work::Codec>>,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
 }
 
@@ -69,6 +71,9 @@ pub async fn serve(
     // which point `serve` stops accepting and its in-flight handlers are
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
+    workers: super::work::HttpWorkers,
+    codec: Option<Arc<dyn super::work::Codec>>,
+    bootstrap_listener: Option<std::net::TcpListener>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
     let generation_policy = GenerationPolicy::from(server_args.as_ref());
@@ -77,6 +82,8 @@ pub async fn serve(
         server_args: server_args.clone(),
         generation_policy,
         chat_formatter,
+        workers,
+        codec,
     });
     // Cancelled with the api runtime on shutdown.
     tokio::spawn(startup_warmup(state.core.clone(), server_args.clone()));
@@ -95,7 +102,7 @@ pub async fn serve(
     // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
     // a configured `api_key` does NOT protect these routes.
     //
-    // No body limit, matching the Python server.
+    // Utility and generation preparation enforce their limits while streaming the body.
     let mut app = router
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);
@@ -110,7 +117,18 @@ pub async fn serve(
     if server_args.enable_pd_bootstrap() {
         let (routes, sweeper) = pd_bootstrap::router_and_sweeper();
         tokio::spawn(sweeper); // cancelled with the runtime on shutdown
-        app = app.merge(routes);
+        if let Some(listener) = bootstrap_listener {
+            let listener =
+                tokio::net::TcpListener::from_std(listener).expect("adopt bootstrap listener");
+            app = app.merge(routes.clone());
+            tokio::spawn(async move {
+                if let Err(error) = axum::serve(listener, routes).await {
+                    tracing::error!(%error, "PD bootstrap listener exited");
+                }
+            });
+        } else {
+            app = app.merge(routes);
+        }
         tracing::info!("PD KV bootstrap registry mounted on the api listener");
     }
 

@@ -33,6 +33,7 @@ pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 #[derive(Clone)]
 pub enum ChatFormatter {
     HuggingFace(PromptFormatter),
+    DeepSeek(sglang_processor::ChatFormatter),
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -50,6 +51,9 @@ impl ChatFormatter {
                     message: error.to_string(),
                 }),
             ChatFormatter::Legacy(formatter) => formatter.render(request),
+            ChatFormatter::DeepSeek(_) => Err(TemplateError::Renderer {
+                message: "DeepSeek requires the full chat body".into(),
+            }),
         }
     }
 
@@ -59,7 +63,7 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_) => None,
+            ChatFormatter::HuggingFace(_) | ChatFormatter::DeepSeek(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -718,6 +722,19 @@ mod tests {
         let config = dir.join("tokenizer_config.json");
         std::fs::write(&config, contents).unwrap();
         config
+    }
+
+    #[test]
+    fn loads_checkpoint_jinja_next_to_tokenizer_config() {
+        let config = temp_config("{}");
+        std::fs::write(
+            config.with_file_name("chat_template.jinja"),
+            "Hi {{ messages[0].role }}",
+        )
+        .unwrap();
+        let formatter =
+            load_chat_formatter(Some(config.to_str().unwrap()), None, None, None).unwrap();
+        assert_eq!(formatter.render(&request(), None).unwrap(), "Hi system");
     }
 
     #[test]
