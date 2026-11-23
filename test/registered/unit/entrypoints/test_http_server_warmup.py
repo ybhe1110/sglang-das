@@ -248,6 +248,99 @@ class TestHealthProbeCleanup(CustomTestCase):
     def test_failed_probe_drains_other_dp_probe(self):
         self.run_case("failure", is_generation=False)
 
+    def check_cancel_during_aclose(self, dp_size):
+        async def run():
+            baseline_tasks = asyncio.all_tasks()
+            all_closing = asyncio.Event()
+            gates = [asyncio.Event() for _ in range(dp_size)]
+            closing = []
+            closed = []
+            business_state = object()
+            states = {"business-request": business_state}
+
+            async def response(rid, gate):
+                states[rid] = object()
+                try:
+                    yield {}
+                finally:
+                    closing.append(rid)
+                    if len(closing) == dp_size:
+                        all_closing.set()
+                    await gate.wait()
+                    closed.append(rid)
+
+            async def batch_response(rids):
+                yield await http_server.TokenizerManager._collect_batch_responses(
+                    manager, [response(rid, gate) for rid, gate in zip(rids, gates)]
+                )
+
+            def generate_request(gri, request):
+                if dp_size == 1:
+                    self.assertIsInstance(gri.rid, str)
+                    return response(gri.rid, gates[0])
+                self.assertIsInstance(gri.rid, list)
+                self.assertEqual(len(gri.rid), dp_size)
+                return batch_response(gri.rid)
+
+            manager = SimpleNamespace(
+                gracefully_exit=False,
+                server_status=http_server.ServerStatus.Up,
+                elastic_worker_count=dp_size,
+                is_generation=True,
+                last_receive_tstamp=0.0,
+                rid_to_state=states,
+                generate_request=generate_request,
+            )
+            with (
+                get_context().override_server_args(
+                    tp_size=dp_size, attn_dp_size=dp_size, disaggregation_mode="decode"
+                ),
+                patch.object(
+                    http_server,
+                    "_global_state",
+                    SimpleNamespace(tokenizer_manager=manager),
+                ),
+            ):
+                request = http_server.Request(
+                    {"type": "http", "path": "/health_generate"}
+                )
+                endpoint = asyncio.create_task(http_server.health_generate(request))
+                try:
+                    await asyncio.wait_for(all_closing.wait(), timeout=5)
+                    expected_states = states.copy()
+                    self.assertEqual(
+                        set(expected_states), {"business-request", *closing}
+                    )
+                    for gate in gates:
+                        for _ in range(2):
+                            endpoint.cancel()
+                            await asyncio.sleep(0)
+                            await asyncio.sleep(0)
+                            self.assertFalse(endpoint.done())
+                            self.assertEqual(states, expected_states)
+                        gate.set()
+                        await asyncio.sleep(0)
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(endpoint, timeout=5)
+                    self.assertCountEqual(closed, closing)
+                    self.assertEqual(states, {"business-request": business_state})
+                    self.assertEqual(asyncio.all_tasks(), baseline_tasks)
+                finally:
+                    for gate in gates:
+                        gate.set()
+                    endpoint.cancel()
+                    await asyncio.gather(endpoint, return_exceptions=True)
+
+        asyncio.run(run())
+
+    def test_single_probe_aclose_survives_http_cancellation(self):
+        """A probe that yielded must finish closing before its RID is retired."""
+        self.check_cancel_during_aclose(1)
+
+    def test_native_batch_aclose_survives_http_cancellation(self):
+        """Keep every batch RID until the last rank's response generator closes."""
+        self.check_cancel_during_aclose(2)
+
     def test_cancelled_probe_reports_unhealthy(self):
         self.run_case("probe_cancel")
 

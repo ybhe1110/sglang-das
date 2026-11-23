@@ -190,6 +190,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
+from sglang.srt.utils.asyncio_utils import wait_for_cleanup
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
@@ -819,12 +820,18 @@ async def health_generate(request: Request) -> Response:
                     gri.routed_dp_rank = dp_rank
             health_requests.append(gri)
 
+    closing_probes = set()
+
     async def gen(gri):
         async with aclosing(
             tokenizer_manager.generate_request(gri, request)
         ) as responses:
-            async for _ in responses:
-                break
+            try:
+                async for _ in responses:
+                    break
+            finally:
+                # The next await closes the generator in its original task.
+                closing_probes.add(asyncio.current_task())
 
     tasks = [asyncio.create_task(gen(gri)) for gri in health_requests]
     fan_out = asyncio.gather(*tasks)
@@ -897,7 +904,7 @@ async def health_generate(request: Request) -> Response:
             # Own both cancellation and state retirement here: HTTP cancellation
             # must not interrupt a probe's asynchronous generator cleanup.
             for task in tasks:
-                if not task.done():
+                if not task.done() and task not in closing_probes:
                     task.cancel()
             try:
                 # Consume the original gather even when it already failed, and
@@ -909,18 +916,7 @@ async def health_generate(request: Request) -> Response:
                     for rid in rids:
                         tokenizer_manager.rid_to_state.pop(rid, None)
 
-        cleanup = asyncio.create_task(drain_health_requests())
-        cancelled = None
-        # Retain ownership until cleanup finishes. Shielding once is insufficient:
-        # a caller can cancel again while we are already draining the probes.
-        while not cleanup.done():
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError as exc:
-                cancelled = exc
-        cleanup.result()
-        if cancelled is not None:
-            raise cancelled
+        await wait_for_cleanup(drain_health_requests())
 
 
 @app.get("/get_model_info")
