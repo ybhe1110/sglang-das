@@ -252,12 +252,13 @@ class OpenAIServingDetokenize(_OpenAIServingUtility):
             )
 
 
-def check_utility_items(request, limits):
-    if isinstance(request, TokenizeRequest):
-        batch = request.prompt if request.prompt is not None else request.messages
-    else:
+def check_utility_items(request: Union[TokenizeRequest, DetokenizeRequest], limits):
+    if isinstance(request, DetokenizeRequest):
         tokens = request.tokens
         batch = tokens if tokens and isinstance(tokens[0], list) else None
+    else:
+        tokens = None
+        batch = request.prompt if request.prompt is not None else request.messages
     if isinstance(batch, list) and len(batch) > limits.max_batch_size:
         raise UtilityError("Tokenizer utility batch exceeds item limit", 413)
     # Count the complete input, including extra Chat template/schema fields.
@@ -271,8 +272,6 @@ def check_utility_items(request, limits):
             pending.pop()
             continue
         count += 1
-        if count > limits.max_input_items:
-            raise UtilityError("Tokenizer utility input exceeds item limit", 413)
         if isinstance(value, BaseModel):
             pending.append(iter(value.__dict__.values()))
             if value.__pydantic_extra__:
@@ -280,7 +279,16 @@ def check_utility_items(request, limits):
         elif isinstance(value, dict):
             pending.append(iter(value.values()))
         elif isinstance(value, (list, tuple)):
-            pending.append(iter(value))
+            if value is tokens:
+                # Pydantic validated this field as list[int] or list[list[int]].
+                # Its children are either IDs or rows; each row also owns its IDs.
+                count += len(tokens)
+                if batch is not None and count <= limits.max_input_items:
+                    count += sum(map(len, batch))
+            else:
+                pending.append(iter(value))
+        if count > limits.max_input_items:
+            raise UtilityError("Tokenizer utility input exceeds item limit", 413)
 
 
 def copy_tokenizer_for_worker(tokenizer):

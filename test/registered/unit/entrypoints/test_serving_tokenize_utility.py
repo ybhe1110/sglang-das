@@ -29,7 +29,11 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     check_utility_items,
     make_utility_backend_factory,
 )
-from sglang.srt.entrypoints.openai.utility_executor import UtilityLimits, UtilityService
+from sglang.srt.entrypoints.openai.utility_executor import (
+    UtilityError,
+    UtilityLimits,
+    UtilityService,
+)
 from sglang.srt.entrypoints.openai.utility_http import (
     UTILITY_PATHS,
     UtilityHTTPMiddleware,
@@ -683,6 +687,33 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                     worker.apply_chat_template(messages, return_dict=False), chat_ids
                 )
 
+    def test_detokenize_item_limit_uses_lengths_of_validated_id_lists(self):
+        """The item budget must charge every ID without visiting scalar IDs."""
+
+        class CountByLength(list):
+            def __iter__(self):
+                raise AssertionError("Item accounting iterated a validated ID list")
+
+        for tokens, items in (
+            ([], 4),
+            ([67, 68, 69], 7),
+            ([[], []], 6),
+            ([[67], [], [68, 69]], 10),
+        ):
+            with self.subTest(tokens=tokens):
+                request = DetokenizeRequest(tokens=tokens)
+                # Instrument only the ID lists after the real model validates them.
+                if tokens and isinstance(tokens[0], list):
+                    request.tokens = [CountByLength(row) for row in request.tokens]
+                else:
+                    request.tokens = CountByLength(request.tokens)
+                check_utility_items(request, UtilityLimits(max_input_items=items))
+                with self.assertRaises(UtilityError) as rejected:
+                    check_utility_items(
+                        request, UtilityLimits(max_input_items=items - 1)
+                    )
+                self.assertEqual(rejected.exception.status, 413)
+
     async def test_batch_limit_uses_only_the_endpoint_input(self):
         await self.service.aclose()
         self.service = UtilityService(
@@ -695,6 +726,10 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         for request, status in (
             (TokenizeRequest(prompt="hi", tokens=1), 200),
             (TokenizeRequest(prompt="hi", tokens=list(range(32))), 413),
+            (
+                TokenizeRequest(prompt="hi", tokens=[1, {"nested": list(range(32))}]),
+                413,
+            ),
             (TokenizeRequest(prompt=[""] * limit, tokens=[[1]]), 200),
             (TokenizeRequest(prompt=[""] * (limit + 1), tokens=[[1]]), 413),
             (

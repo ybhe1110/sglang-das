@@ -51,7 +51,11 @@ reserves one work slot, a maximum input byte allowance, one response slot, and a
 maximum output byte allowance. It rejects immediately instead of creating an
 unbounded admission-waiter queue. Input bytes are a conservative cost proxy that
 also covers Chat schemas and extra fields; input values/IDs and batch counts have
-additional limits. Total input-item count is bounded by
+additional limits. For a validated detokenize request, the item check counts a
+flat ID list by length. For a batch, it counts each row and adds its length.
+The outer list counts once even when empty. Only a list of rows is subject to
+the detokenize batch limit. Other request fields follow the usual item counting rules.
+Total input-item count is bounded by
 `utility_max_admitted * utility_max_input_items`. These are bounds, not a
 model-calibrated prediction of CPU time or peak Python heap usage.
 
