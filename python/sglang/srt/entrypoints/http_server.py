@@ -892,19 +892,35 @@ async def health_generate(request: Request) -> Response:
         tokenizer_manager.server_status = ServerStatus.UnHealthy
         return Response(status_code=503)
     finally:
-        # Cancelling children alone leaves fan_out's CancelledError unobserved.
-        # Drain the original gather on every exit, including HTTP cancellation,
-        # before releasing the probe states used by generator cleanup.
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        try:
-            await asyncio.gather(fan_out, *tasks, return_exceptions=True)
-        finally:
-            for gri in health_requests:
-                rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
-                for rid in rids:
-                    tokenizer_manager.rid_to_state.pop(rid, None)
+
+        async def drain_health_requests():
+            # Own both cancellation and state retirement here: HTTP cancellation
+            # must not interrupt a probe's asynchronous generator cleanup.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            try:
+                # Consume the original gather even when it already failed, and
+                # wait for every child before releasing their request states.
+                await asyncio.gather(fan_out, *tasks, return_exceptions=True)
+            finally:
+                for gri in health_requests:
+                    rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
+                    for rid in rids:
+                        tokenizer_manager.rid_to_state.pop(rid, None)
+
+        cleanup = asyncio.create_task(drain_health_requests())
+        cancelled = None
+        # Retain ownership until cleanup finishes. Shielding once is insufficient:
+        # a caller can cancel again while we are already draining the probes.
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        cleanup.result()
+        if cancelled is not None:
+            raise cancelled
 
 
 @app.get("/get_model_info")

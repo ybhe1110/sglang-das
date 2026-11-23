@@ -14,7 +14,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 
 class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
@@ -96,10 +96,14 @@ class TestHealthProbeCleanup(CustomTestCase):
     their aggregate, logging an unhandled CancelledError during normal inference.
     """
 
-    def run_case(self, scenario, *, dp_size=2, is_generation=True):
+    def run_case(
+        self, scenario, *, dp_size=2, is_generation=True, cancel_during_cleanup=False
+    ):
         async def run():
             started = asyncio.Event()
             release = asyncio.Event()
+            cleanup_started = asyncio.Event()
+            finish_cleanup = asyncio.Event()
             closed = []
             requests = []
             errors = []
@@ -133,6 +137,9 @@ class TestHealthProbeCleanup(CustomTestCase):
                     await release.wait()
                     yield {}
                 finally:
+                    if cancel_during_cleanup:
+                        cleanup_started.set()
+                        await finish_cleanup.wait()
                     # Make cleanup asynchronous so cancel-without-await fails.
                     await asyncio.sleep(0)
                     closed.extend(rids)
@@ -163,8 +170,21 @@ class TestHealthProbeCleanup(CustomTestCase):
                     if scenario == "cancel":
                         await asyncio.wait_for(started.wait(), timeout=5)
                         endpoint.cancel()
+                    if cancel_during_cleanup:
+                        # The endpoint has already cancelled its probe. A later
+                        # HTTP cancellation must not cancel the probe a second time.
+                        await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+                        for _ in range(2):
+                            endpoint.cancel()
+                            await asyncio.sleep(0)
+                            await asyncio.sleep(0)
+                            self.assertFalse(endpoint.done())
+                            self.assertEqual(closed, [])
+                            self.assertGreater(len(manager.rid_to_state), 1)
+                        finish_cleanup.set()
+                    if scenario == "cancel" or cancel_during_cleanup:
                         with self.assertRaises(asyncio.CancelledError):
-                            await endpoint
+                            await asyncio.wait_for(endpoint, timeout=5)
                     else:
                         response = await asyncio.wait_for(endpoint, timeout=5)
                         self.assertEqual(
@@ -196,6 +216,7 @@ class TestHealthProbeCleanup(CustomTestCase):
                     self.assertEqual(errors, [])
             finally:
                 release.set()
+                finish_cleanup.set()
                 if endpoint is not None:
                     endpoint.cancel()
                     await asyncio.gather(endpoint, return_exceptions=True)
@@ -216,6 +237,13 @@ class TestHealthProbeCleanup(CustomTestCase):
         for dp_size in (1, 2):
             with self.subTest(dp_size=dp_size):
                 self.run_case("cancel", dp_size=dp_size)
+
+    def test_http_cancellation_during_cleanup_preserves_probe_lifetime(self):
+        """Repeated cancellation cannot interrupt cleanup or retire states early."""
+        for dp_size in (1, 2):
+            for scenario in ("busy", "timeout", "cancel"):
+                with self.subTest(dp_size=dp_size, scenario=scenario):
+                    self.run_case(scenario, dp_size=dp_size, cancel_during_cleanup=True)
 
     def test_failed_probe_drains_other_dp_probe(self):
         self.run_case("failure", is_generation=False)
