@@ -124,6 +124,11 @@ from sglang.srt.entrypoints.openai.utility_http import (
     UtilityHTTPMiddleware,
     utility_validation_error_response,
 )
+from sglang.srt.entrypoints.openai.utility_phase import (
+    UtilityPhaseMiddleware,
+    mark_phase,
+    time_probe_handler,
+)
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
@@ -543,7 +548,10 @@ class ORJSONRequest(Request):
 
     async def json(self) -> Any:
         if not hasattr(self, "_json"):
-            self._json = orjson.loads(await self.body())
+            body = await self.body()
+            mark_phase("json_begin")
+            self._json = orjson.loads(body)
+            mark_phase("json_end")
         return self._json
 
 
@@ -574,6 +582,8 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 # Added after decompression so it wraps it, admitting and bounding utility
 # requests before any body buffering. Other routes retain their existing path.
 app.add_middleware(UtilityHTTPMiddleware)
+if envs.SGLANG_ENABLE_UTILITY_PHASE_PROBE.get():
+    app.add_middleware(UtilityPhaseMiddleware)
 
 # CORS also applies to utility admission/timeout responses.
 app.add_middleware(
@@ -2105,6 +2115,7 @@ async def openai_v1_realtime_transcription(ws: WebSocket):
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
+@time_probe_handler
 async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
     served_model_names = [_global_state.tokenizer_manager.served_model_name]

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import tempfile
 import threading
 import unittest
@@ -38,6 +39,7 @@ from sglang.srt.entrypoints.openai.utility_http import (
     UTILITY_PATHS,
     UtilityHTTPMiddleware,
 )
+from sglang.srt.entrypoints.openai.utility_phase import UtilityPhaseMiddleware
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -781,6 +783,73 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
             finally:
                 release.set()
         self.assertEqual(records, ["busy"])
+
+    async def test_phase_header_is_opt_in_and_tracks_the_worker_request(self):
+        import httpx
+
+        from sglang.srt.entrypoints.http_server import app as production_app
+
+        app = FastAPI()
+        app.router.routes.extend(
+            route
+            for route in production_app.routes
+            if getattr(route, "path", None) == "/v1/detokenize"
+        )
+        app.state.utility_service = self.service
+        app.state.openai_serving_detokenize = self.detokenize
+        app.add_middleware(UtilityHTTPMiddleware)
+        app.add_middleware(UtilityPhaseMiddleware)
+        header = "x-sglang-phase-probe"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            plain, first, second = await asyncio.gather(
+                *(
+                    client.post(
+                        "/v1/detokenize", json={"tokens": [token]}, headers=headers
+                    )
+                    for token, headers in (
+                        (67, {}),
+                        (68, {header: "1"}),
+                        (69, {header: "1"}),
+                    )
+                )
+            )
+            self.assertNotIn(header, plain.headers)
+            self.assertEqual(
+                [r.json()["text"] for r in (plain, first, second)], ["A", "B", "C"]
+            )
+            traces = [json.loads(r.headers[header]) for r in (first, second)]
+            self.assertEqual(traces[0]["instance"], traces[1]["instance"])
+            self.assertNotEqual(
+                traces[0]["ns"]["worker_begin"], traces[1]["ns"]["worker_begin"]
+            )
+            stages = (
+                "asgi_enter",
+                "body_read",
+                "json_begin",
+                "json_end",
+                "submitted",
+                "worker_begin",
+                "items_checked",
+                "normalize_begin",
+                "decode_begin",
+                "decode_end",
+                "serialize_begin",
+                "serialize_end",
+                "headers_ready",
+            )
+            for response, trace in zip((first, second), traces):
+                self.assertEqual(trace["pid"], os.getpid())
+                self.assertEqual(response.headers["cache-control"], "no-store")
+                times = [trace["ns"][key] for key in stages]
+                self.assertEqual(times, sorted(times))
+                self.assertEqual(set(trace["ns"]), set(stages))
+            failed = await client.post(
+                "/v1/detokenize", json={"tokens": [-1]}, headers={header: "1"}
+            )
+            self.assertEqual(failed.status_code, 400)
+            self.assertNotIn(header, failed.headers)
 
     async def test_fastapi_validation_aliases_and_budget_policy(self):
         """Production validation errors must fit the utility budget without echoing inputs."""

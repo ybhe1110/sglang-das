@@ -10,6 +10,7 @@ from sglang.srt.entrypoints.openai.utility_executor import (
     ERROR_RESPONSE_BYTES,
     UtilityError,
 )
+from sglang.srt.entrypoints.openai.utility_phase import mark_phase
 
 UTILITY_PATHS = frozenset(
     {"/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize"}
@@ -163,6 +164,7 @@ class UtilityHTTPMiddleware:
             )
             if body is None:
                 return
+            mark_phase("body_read")
             scope = dict(scope, utility_ticket=ticket)
             disconnected = asyncio.Event()
             pending_start = None

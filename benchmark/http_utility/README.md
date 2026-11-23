@@ -202,6 +202,59 @@ No GPU/DCU mixed-load latency or full production model compatibility is claimed
 by the CPU unit tests. Roll back by deploying the parent release version; never
 replay a generation request that has already streamed output.
 
+### Locate GET latency within a long detokenize request
+
+Start the instrumented HTTP workers with `SGLANG_ENABLE_UTILITY_PHASE_PROBE=1`
+in their service environment. Timing headers are emitted only for explicitly
+marked successful requests. The client needs Python 3.10+ and `httpx` (tested
+with 0.28.1). Run from the repository root on 129.13 or a host with a direct
+connection to that Pod. Use the same uncompressed request body as the three-way
+comparison, `current-evidence/detokenize.json` from its replay ZIP (250,000 IDs,
+SHA-256 `69cc82578c6ae01b488fd8901815ccb76251be34f84e9c6925d2c024eabb2940`).
+On 129.1 the corresponding file is under `/tmp/http-retest-20261123-1916/`.
+
+```bash
+python3 benchmark/http_utility/detokenize_phase_probe.py \
+  --base-url http://10.113.129.13:30000 \
+  --body /tmp/http-retest-20261123-1916/detokenize.json \
+  --offsets-ms 0 25 50 75 100 125 150 200 250 --rounds 5 \
+  --output detok-129-13-phase.jsonl
+```
+
+The script uses one warm-up and one long POST per offset per round (45 measured
+POSTs here). It shuffles offsets within each round and sends both GETs over
+separate, prewarmed HTTP/1.1 connections to the POST worker. A second worker
+receives the same GET pair as a control. Each response verifies instance ID,
+PID and client socket port. A missing header, connection change, error response
+or inconsistent clock bounds stops the run. Use `--single-worker` only for a
+one-worker deployment. Set `SGLANG_API_KEY` on the client if required. Each run
+needs a fresh output filename.
+
+Read the last JSONL record for the verdict per route. `trial.stages_ms` breaks
+down body receipt, JSON parsing, dispatch/validation before submission, work
+queue, item accounting, normalization, the tokenizer's flat-list `decode`,
+serialization and return to the HTTP loop. Raw timestamps are in nanoseconds.
+Each `sample` reports the actual client dispatch offset, GET RTT, baseline on
+that connection (median of the idle GETs immediately before and after),
+send-to-ASGI waiting bounds, ASGI-to-handler and handler times, and overlap
+with decode before the handler and across the whole RTT. `/v1/loads` handler
+time includes the awaited load query. The server timestamps headers immediately
+before handing them to ASGI; the client records completion of the full response.
+
+Client and server monotonic clock origins may differ. Each trial bounds their
+offset using dispatch/ASGI entry and header preparation/client completion on
+the pinned worker. The intersection gives the clock uncertainty reported in
+the samples. For GETs at least `--slow-ms` (default 10 ms) above baseline, the
+summary sums the excess RTT and bounds the fraction coincident with decode.
+The lower bound allows the entire baseline to have overlapped decode. A lower
+bound above 50% means `majority_overlaps_decode`; an upper bound below 50%
+means `majority_outside_decode`. At least three distinct rounds with slow
+samples are required, otherwise the verdict is `inconclusive`. These bounds
+express timing uncertainty, not statistical confidence. Compare the per-offset
+medians with the other worker and the GET handler duration when interpreting
+the result. Temporal overlap alone cannot distinguish GIL contention from CPU
+scheduling or native runtime activity.
+
 ### Local validation (2026-11-18)
 
 The initial 22 tests passed in an isolated Windows CPU harness: 17 executor/ASGI lifecycle

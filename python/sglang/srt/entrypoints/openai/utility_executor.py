@@ -18,6 +18,8 @@ from dataclasses import dataclass, fields
 from functools import partial
 from typing import Callable
 
+from sglang.srt.entrypoints.openai.utility_phase import bind_worker_trace, mark_phase
+
 logger = logging.getLogger(__name__)
 ERROR_RESPONSE_BYTES = 256
 
@@ -181,11 +183,13 @@ class UtilityService:
         # No deepcopy/model_dump of a large payload on the HTTP loop.
         ticket.submitted = True
         reply = ticket.reply = self.loop.create_future()
+        mark_phase("submitted")
 
         def invoke(backend):
             if ticket.cancelled.is_set():
                 return None
             ticket.started_at = time.monotonic()
+            mark_phase("worker_begin")
             if self.metrics:
                 self.metrics.queue_seconds.observe(
                     ticket.started_at - ticket.admitted_at
@@ -193,6 +197,7 @@ class UtilityService:
             try:
                 if self.validate_request is not None:
                     self.validate_request(request, self.limits)
+                    mark_phase("items_checked")
                     if ticket.cancelled.is_set():
                         return None
                 if before_run is not None:
@@ -212,7 +217,7 @@ class UtilityService:
                     )
 
         # Every queued item owns an admission slot, including after cancellation.
-        self._waiting.append((ticket, invoke))
+        self._waiting.append((ticket, bind_worker_trace(invoke)))
         self._dispatch()
         try:
             return await asyncio.shield(reply)

@@ -336,6 +336,7 @@ class Envs:
     # ===================================================================
     # Decompress request bodies tagged with `x-body-compressed`.
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
+    SGLANG_ENABLE_UTILITY_PHASE_PROBE = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)

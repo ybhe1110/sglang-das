@@ -26,6 +26,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
+from sglang.srt.entrypoints.openai.utility_phase import time_probe_handler
 from sglang.srt.runtime_context import (
     get_parallel,
 )
@@ -94,6 +95,7 @@ def _format_loads_prometheus(load_results, include=None) -> Response:
 
 
 @router.get("/v1/loads")
+@time_probe_handler
 async def get_loads(
     dp_rank: Optional[int] = None,
     include: Optional[str] = None,

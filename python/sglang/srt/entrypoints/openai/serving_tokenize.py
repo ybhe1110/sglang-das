@@ -21,6 +21,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.utility_executor import UtilityError
 from sglang.srt.entrypoints.openai.utility_http import utility_error_response
+from sglang.srt.entrypoints.openai.utility_phase import mark_phase
 from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 from sglang.srt.utils.request_logger import _extract_whitelisted_headers
 
@@ -203,14 +204,17 @@ class OpenAIServingDetokenize(_OpenAIServingUtility):
                 and request.tokens
                 and isinstance(request.tokens[0], int)
             ):
+                mark_phase("normalize_begin")
                 if not all(isinstance(t, int) for t in request.tokens):
                     return self.create_error_response(
                         "Invalid input: 'tokens' must be a list of integers."
                     )
                 tokens_to_decode = [int(t) for t in request.tokens]
+                mark_phase("decode_begin")
                 text = tokenizer.decode(
                     tokens_to_decode, skip_special_tokens=request.skip_special_tokens
                 )
+                mark_phase("decode_end")
                 text_out: Union[str, List[str]] = text
             elif (
                 isinstance(request.tokens, list)
@@ -383,7 +387,10 @@ def make_utility_backend_factory(manager, template_manager):
             # here too, so FastAPI does not serialize a large token list on-loop.
             if isinstance(result, Response):
                 return result
-            return ORJSONResponse(result.model_dump())
+            mark_phase("serialize_begin")
+            response = ORJSONResponse(result.model_dump())
+            mark_phase("serialize_end")
+            return response
 
         return run
 
