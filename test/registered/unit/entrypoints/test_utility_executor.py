@@ -7,6 +7,8 @@ import unittest
 from dataclasses import fields, replace
 from types import SimpleNamespace
 
+from starlette.responses import Response
+
 from sglang.srt.entrypoints.openai.utility_executor import (
     UtilityError,
     UtilityLimits,
@@ -18,7 +20,6 @@ from sglang.srt.entrypoints.openai.utility_http import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from starlette.responses import Response
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -128,6 +129,39 @@ class TestUtilityExecution(unittest.IsolatedAsyncioTestCase, CustomTestCase):
             service.admit()
         ticket.close()
         ticket.close()
+        self.assert_empty(service)
+
+    async def test_cancel_during_request_logging_skips_backend(self):
+        calls = []
+
+        def backend(kind, request):
+            calls.append(request)
+            return Response(b"ok")
+
+        service = await self.service(backend, max_admitted=1)
+        loop = asyncio.get_running_loop()
+        logging_started, release_log = asyncio.Event(), threading.Event()
+        self.gates.append(release_log)
+
+        def before_run():
+            loop.call_soon_threadsafe(logging_started.set)
+            if not release_log.wait(5):
+                raise TimeoutError("Test did not release request logging")
+
+        ticket = service.admit()
+        task = asyncio.create_task(
+            service.run(ticket, "tokenize", "x", before_run=before_run)
+        )
+        await asyncio.wait_for(logging_started.wait(), 2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        ticket.close()
+        with self.assertRaises(UtilityError):
+            service.admit()
+        release_log.set()
+        await self.settle(service)
+        self.assertEqual(calls, [])
         self.assert_empty(service)
 
     async def test_completion_and_cancellation_in_same_loop_turn(self):

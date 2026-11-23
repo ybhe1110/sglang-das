@@ -29,7 +29,7 @@ PAT_STR_B = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^
 class TiktokenTokenizer:
     def __init__(self, tokenizer_path):
         import tiktoken
-        from jinja2 import Template
+        from jinja2 import Environment
 
         # Read the JSON
         with open(tokenizer_path, "rb") as fin:
@@ -67,10 +67,9 @@ class TiktokenTokenizer:
 
         # Copy from train/xlm/tokenizers/tiktoken_wrapper.py::Encoding::__init__
         default_allowed_special = None
-        control_tokens = DEFAULT_CONTROL_TOKENS
         tokenizer = tiktoken.Encoding(**kwargs)
         tokenizer._default_allowed_special = default_allowed_special or set()
-        tokenizer._control_tokens = control_tokens
+        tokenizer._control_tokens = DEFAULT_CONTROL_TOKENS.copy()
 
         def encode_patched(
             self,
@@ -102,7 +101,7 @@ class TiktokenTokenizer:
         self.eos_token_id = tokenizer._special_tokens[EOS]
         self.vocab_size = tokenizer.n_vocab
         self.chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}{{ 'Human: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'system' %}{{ 'System: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'assistant' %}{{ 'Assistant: '  + message['content'] + '<|separator|>\n\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
-        self.chat_template_jinja = Template(self.chat_template)
+        self.chat_template_jinja = Environment().from_string(self.chat_template)
         # Turn-final markers some checkpoints ship without EOS metadata -- e.g.
         # Inkling's <|content_model_end_sampling|>, whose bundled tokenizer
         # config leaves eos_token unset. get_tokenizer()'s tiktoken load path

@@ -1,15 +1,19 @@
 """Full tool work leaves the loop and preserves tokenize/detokenize semantics."""
 
 import asyncio
+import base64
 import json
 import logging
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+
 from sglang.srt.entrypoints.openai.protocol import DetokenizeRequest, TokenizeRequest
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
@@ -310,6 +314,154 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                     ticket.close()
         finally:
             await service.aclose()
+
+    async def start_private_tokenizers(self, source):
+        service = UtilityService(UtilityLimits(workers=2))
+        self.addAsyncCleanup(service.aclose)
+        # Capture the tokenizer supplied to each worker's chat handler at startup.
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_tokenize.OpenAIServingChat"
+        ) as chat:
+            await service.start(
+                make_utility_backend_factory(_manager(source), object(), service.limits)
+            )
+        return [call.args[0].tokenizer for call in chat.call_args_list]
+
+    async def test_tiktoken_workers_have_independent_encodings_and_templates(self):
+        from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tokenizer.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "word_split": "V1",
+                        "regular_tokens": [
+                            {"bytes": [i], "token": i} for i in range(256)
+                        ],
+                        "special_tokens": [{"bytes": list(b"<|eos|>"), "token": 256}],
+                    }
+                )
+            )
+            source = TiktokenTokenizer(str(path))
+            workers = await self.start_private_tokenizers(source)
+        messages = [{"role": "user", "content": "hello"}]
+        reference = source.apply_chat_template(messages, True, True)
+        self.assertEqual(len({id(t.tokenizer) for t in [source, *workers]}), 3)
+        self.assertEqual(
+            len({id(t.chat_template_jinja.environment) for t in [source, *workers]}), 3
+        )
+        workers[0].tokenizer._control_tokens["pad"] = "worker only"
+        self.assertEqual(workers[1].tokenizer._control_tokens["pad"], "<|pad|>")
+        self.assertEqual(source.tokenizer._control_tokens["pad"], "<|pad|>")
+        with patch.object(source.tokenizer, "_core_bpe", None):
+            for worker in workers:
+                self.assertEqual(worker.encode("hi"), [104, 105])
+                self.assertEqual(worker.decode([104, 105]), "hi")
+                self.assertEqual(
+                    worker.apply_chat_template(messages, True, True), reference
+                )
+
+    async def test_mistral_patched_methods_use_each_workers_own_backend(self):
+        from transformers.tokenization_mistral_common import MistralCommonBackend
+
+        from sglang.srt.utils.hf_transformers.mistral_utils import (
+            patch_mistral_common_tokenizer,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            # A byte-only Tekken vocabulary exercises the real backend offline.
+            path = Path(directory) / "tekken.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "config": {
+                            "version": "v3",
+                            "pattern": r".+",
+                            "num_vocab_tokens": 256,
+                            "default_num_special_tokens": 1000,
+                            "default_vocab_size": 1256,
+                        },
+                        "vocab": [
+                            {
+                                "rank": i,
+                                "token_bytes": base64.b64encode(bytes([i])).decode(
+                                    "ascii"
+                                ),
+                                "token_str": bytes([i]).decode(
+                                    "utf-8", errors="replace"
+                                ),
+                            }
+                            for i in range(256)
+                        ],
+                    }
+                )
+            )
+            source = patch_mistral_common_tokenizer(
+                MistralCommonBackend(path, model_max_length=128)
+            )
+            source.chat_template = "custom template"
+            source.additional_stop_token_ids = {42}
+            workers = await self.start_private_tokenizers(source)
+        messages = [{"role": "user", "content": "hello"}]
+        ids = source.encode("hello")
+        text = source.decode(ids, skip_special_tokens=True)
+        chat_ids = source.apply_chat_template(messages, return_dict=False)
+        self.assertEqual(len({id(t.tokenizer) for t in [source, *workers]}), 3)
+        # A closure still bound to the generation tokenizer would use this
+        # disabled backend or its original chat method.
+        with (
+            patch.object(source, "tokenizer", None),
+            patch.object(
+                source, "_orig_apply_chat_template", side_effect=AssertionError
+            ),
+        ):
+            for worker in workers:
+                self.assertEqual(worker.chat_template, source.chat_template)
+                self.assertEqual(worker.additional_stop_token_ids, {42})
+                self.assertIsNot(
+                    worker.additional_stop_token_ids, source.additional_stop_token_ids
+                )
+                self.assertEqual(worker.model_max_length, 128)
+                self.assertEqual(worker.encode("hello"), ids)
+                self.assertEqual(worker.decode(ids, skip_special_tokens=True), text)
+                self.assertEqual(
+                    worker.apply_chat_template(messages, return_dict=False), chat_ids
+                )
+
+    async def test_batch_limit_uses_only_the_endpoint_input(self):
+        await self.service.aclose()
+        self.service = UtilityService(
+            UtilityLimits(max_batch_size=2, max_input_items=32)
+        )
+        await self.service.start(
+            make_utility_backend_factory(self.manager, None, self.service.limits)
+        )
+        self.tokenize.utility_service = self.detokenize.utility_service = self.service
+        limit = self.service.limits.max_batch_size
+        for request, status in (
+            (TokenizeRequest(prompt="hi", tokens=1), 200),
+            (TokenizeRequest(prompt="hi", tokens=list(range(32))), 413),
+            (TokenizeRequest(prompt=[""] * limit, tokens=[[1]]), 200),
+            (TokenizeRequest(prompt=[""] * (limit + 1), tokens=[[1]]), 413),
+            (
+                TokenizeRequest(
+                    messages=[{"role": "user", "content": "hi"}] * (limit + 1),
+                    tokens=[[1]],
+                ),
+                413,
+            ),
+            (DetokenizeRequest(tokens=[[67]] * (limit + 1)), 413),
+            (DetokenizeRequest(tokens=[67] * (limit + 1)), 200),
+        ):
+            with self.subTest(model=type(request).__name__, status=status):
+                handler = (
+                    self.tokenize
+                    if isinstance(request, TokenizeRequest)
+                    else self.detokenize
+                )
+                actual, _ = await self.call(handler, request)
+                self.assertEqual(actual, status)
 
     async def test_fastapi_validation_aliases_and_budget_policy(self):
         import httpx

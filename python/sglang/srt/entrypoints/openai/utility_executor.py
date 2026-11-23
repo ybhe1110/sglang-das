@@ -193,6 +193,8 @@ class UtilityService:
             try:
                 if before_run is not None:
                     before_run()
+                    if ticket.cancelled.is_set():
+                        return None
                 result = backend(kind, request)
                 if len(result.body) > self.limits.max_output_bytes:
                     raise UtilityError(

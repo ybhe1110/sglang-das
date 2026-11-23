@@ -10,6 +10,7 @@ from typing import List, Optional, Union
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, Response
 from pydantic import BaseModel
+
 from sglang.srt.entrypoints.openai.protocol import (
     DetokenizeRequest,
     DetokenizeResponse,
@@ -20,6 +21,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.utility_executor import UtilityError
 from sglang.srt.entrypoints.openai.utility_http import utility_error_response
+from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 from sglang.srt.utils.request_logger import _extract_whitelisted_headers
 
 logger = logging.getLogger(__name__)
@@ -251,12 +253,11 @@ class OpenAIServingDetokenize(_OpenAIServingUtility):
 
 
 def _check_utility_items(request, limits):
-    batch = getattr(request, "prompt", None)
-    if batch is None:
-        batch = getattr(request, "messages", None)
-    tokens = getattr(request, "tokens", None)
-    if tokens and isinstance(tokens[0], list):
-        batch = tokens
+    if isinstance(request, TokenizeRequest):
+        batch = request.prompt if request.prompt is not None else request.messages
+    else:
+        tokens = request.tokens
+        batch = tokens if tokens and isinstance(tokens[0], list) else None
     if isinstance(batch, list) and len(batch) > limits.max_batch_size:
         raise UtilityError("Tokenizer utility batch exceeds item limit", 413)
     # Count the complete input, including extra Chat template/schema fields.
@@ -282,6 +283,40 @@ def _check_utility_items(request, limits):
             pending.append(iter(value))
 
 
+def _copy_utility_tokenizer(tokenizer):
+    if isinstance(tokenizer, TiktokenTokenizer):
+        # Rebuild the native encoding, its bound encode method and Jinja template.
+        private = type(tokenizer)(tokenizer.tokenizer.name)
+    elif getattr(tokenizer, "_mistral_common_patched", False) is True:
+        from sglang.srt.utils.hf_transformers.mistral_utils import (
+            patch_mistral_common_tokenizer,
+        )
+
+        # The compatibility wrappers close over the original instance. Install
+        # them on a fresh backend loaded from the same resolved local file.
+        private = type(tokenizer)(
+            tokenizer._tokenizer_path,
+            mode=tokenizer.mode,
+            model_max_length=tokenizer.model_max_length,
+            padding_side=tokenizer.padding_side,
+            truncation_side=tokenizer.truncation_side,
+            model_input_names=copy.deepcopy(tokenizer.model_input_names),
+            clean_up_tokenization_spaces=tokenizer.clean_up_tokenization_spaces,
+        )
+        private.pad_token = tokenizer.pad_token
+        patch_mistral_common_tokenizer(private)
+    else:
+        return copy.deepcopy(tokenizer)
+
+    # Template selection and stop tokens can be configured after loading.
+    private.chat_template = copy.deepcopy(tokenizer.chat_template)
+    if hasattr(tokenizer, "additional_stop_token_ids"):
+        private.additional_stop_token_ids = copy.deepcopy(
+            tokenizer.additional_stop_token_ids
+        )
+    return private
+
+
 def make_utility_backend_factory(manager, template_manager, limits):
     """Capture only text-serving inputs, never manager sockets or GPU state.
 
@@ -305,7 +340,7 @@ def make_utility_backend_factory(manager, template_manager, limits):
 
     def factory():
         try:
-            private_tokenizer = copy.deepcopy(tokenizer)
+            private_tokenizer = _copy_utility_tokenizer(tokenizer)
             private_template = copy.deepcopy(template_manager)
         except Exception as exc:
             raise RuntimeError(

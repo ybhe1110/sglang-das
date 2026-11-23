@@ -18,12 +18,14 @@ item, before tokenization. Only whitelisted request headers and a shallow logger
 configuration snapshot are captured on the loop; payload dumping, formatting,
 redaction and sink writes execute on the utility thread. Slow sinks retain the
 same work/input/response reservations and no separate logging queue is created.
-Work cancelled before execution skips logging as well as tokenization. Logging
-for generation endpoints continues through the base handler's existing path.
+Work cancelled before execution skips logging as well as tokenization. If a
+request is cancelled during logging, the worker skips tokenization when the
+log sink returns.
 
-Each utility thread owns a deep-copied tokenizer and template manager plus its
-own Chat handler/cache. Copies are created before the HTTP worker serves traffic;
-generation's mutable padding/truncation state is never used by a utility thread.
+Each utility thread owns its tokenizer, template manager and Chat handler/cache.
+During startup, each thread reloads the built-in Tiktoken or patched Mistral
+tokenizer from its resolved local file so its native backend and bound methods
+belong to that thread. Other tokenizers and the template manager use deep copies.
 A custom tokenizer that cannot be independently copied fails startup explicitly.
 The utility backend captures text-serving metadata, not engine sockets or GPU
 state. Runtime tokenizer/template replacement requires restarting HTTP workers.
