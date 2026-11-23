@@ -15,13 +15,21 @@ bounded JSON request on its event loop. On validation failure the four utility
 routes return HTTP 400 with a flat error body of at most 256 bytes. The summary
 uses the first diagnostic and the error count, omitting input and context objects.
 
-Detailed utility request logging (levels 2/3) also runs in the admitted work
-item, before tokenization. Only whitelisted request headers and a shallow logger
-configuration snapshot are captured on the loop. Payload dumping, formatting
+Detailed utility request logging (levels 2/3) runs in the admitted work
+item after batch and item limits pass and before tokenization. Only whitelisted
+request headers and a shallow logger configuration snapshot are captured on the
+loop. Payload dumping, formatting
 and redaction run on the utility thread. A dedicated writer in each HTTP process
 writes request logs for both generation and utilities to their configured sinks.
-Generation enqueues a formatted record and continues. The utility worker waits
-for an accepted record to finish writing and retains its request reservations.
+Generation checks log capacity before submitting payload formatting to a separate
+single-thread executor. The request awaits formatting so its payload remains
+stable, then continues while the writer handles the sink. For token-ID input,
+the generation tokenizer executor decodes the text before generation resumes,
+even if the log record was dropped. When tokenizer offload is disabled, the HTTP
+worker uses a private decoder for this step. Changes to the file target open it
+off the event loop before publishing the new logging configuration.
+The utility worker waits for an accepted record to finish writing and retains
+its request reservations.
 The FIFO holds up to 128 waiting records and 8 MiB of Python message strings,
 including the active write in the byte limit. On overflow the writer drops the
 new record and counts the loss. Shutdown drains accepted records with a one-second

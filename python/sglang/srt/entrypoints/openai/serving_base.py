@@ -83,7 +83,7 @@ class OpenAIServingBase(ABC):
                 return self.create_error_response(error_msg)
 
             # Log the raw OpenAI request payload before conversion to tokenized form.
-            self._log_received_request(request, raw_request)
+            await self._log_received_request(request, raw_request)
 
             # Convert to internal format
             (
@@ -129,10 +129,10 @@ class OpenAIServingBase(ABC):
                 status_code=500,
             )
 
-    def _log_received_request(self, request, raw_request):
+    async def _log_received_request(self, request, raw_request):
         request_logger = self.tokenizer_manager.request_logger
         if request_logger.log_requests and request_logger.log_requests_level >= 2:
-            request_logger.log_openai_received_request(request, request=raw_request)
+            await request_logger.log_openai_received_request(request, raw_request)
 
     @abstractmethod
     def _request_id_prefix(self) -> str:

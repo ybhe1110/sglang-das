@@ -7,6 +7,8 @@ import logging
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,6 +26,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
+    check_utility_items,
     make_utility_backend_factory,
 )
 from sglang.srt.entrypoints.openai.utility_executor import UtilityLimits, UtilityService
@@ -79,10 +82,10 @@ def _manager(tokenizer):
 class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
     async def asyncSetUp(self):
         self.manager = _manager(_Tokenizer())
-        self.service = UtilityService(UtilityLimits())
-        await self.service.start(
-            make_utility_backend_factory(self.manager, None, self.service.limits)
+        self.service = UtilityService(
+            UtilityLimits(), validate_request=check_utility_items
         )
+        await self.service.start(make_utility_backend_factory(self.manager, None))
         self.tokenize = OpenAIServingTokenize(
             self.manager, utility_service=self.service
         )
@@ -198,13 +201,23 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                 )
                 try:
                     await asyncio.wait_for(entered.wait(), 2)
-                    for text in ("generation-accepted", "generation-dropped"):
-                        request = ChatCompletionRequest(
-                            messages=[{"role": "user", "content": text}]
-                        )
-                        OpenAIServingBase._log_received_request(
-                            self.tokenize, request, None
-                        )
+                    dumps = []
+                    original_dump = ChatCompletionRequest.model_dump
+
+                    def dump(obj, **kwargs):
+                        dumps.append(threading.get_ident())
+                        return original_dump(obj, **kwargs)
+
+                    with patch.object(ChatCompletionRequest, "model_dump", dump):
+                        for text in ("generation-accepted", "generation-dropped"):
+                            request = ChatCompletionRequest(
+                                messages=[{"role": "user", "content": text}]
+                            )
+                            await OpenAIServingBase._log_received_request(
+                                self.tokenize, request, None
+                            )
+                    self.assertEqual(len(dumps), 1)
+                    self.assertNotIn(threading.get_ident(), dumps)
                     self.assertFalse(sink_timed_out.is_set())
                     self.assertEqual(writer.dropped, 1)
                     self.assertFalse(tool.done())
@@ -214,6 +227,163 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         self.assertEqual(len(records), 2)
         self.assertIn("utility", records[0])
         self.assertIn("generation-accepted", records[1])
+
+    async def test_generation_receipt_and_finish_format_off_loop_and_preserve_decoded_text(
+        self,
+    ):
+        """Generation must retain its decoded text even when a log is dropped."""
+        from sglang.srt.utils import request_logger as log_module
+
+        @dataclass
+        class Input:
+            rid: str
+            input_ids: list
+            text: object = None
+
+        original_format = log_module.format_json_log
+        formats = []
+
+        def format_record(event, data):
+            formats.append((event, threading.get_ident()))
+            return original_format(event, data)
+
+        for private in (False, True):
+            with self.subTest(private=private), ThreadPoolExecutor(
+                max_workers=1
+            ) as owner:
+                source, decoder = _Tokenizer(), _Tokenizer()
+                logger = RequestLogger(True, 2, "json", None)
+                target = logging.Logger("generation")
+                logger.targets = [target]
+                obj = Input("first", [[1, 67], [68]])
+                with self.assertLogs(target, level="INFO") as logs, patch.object(
+                    log_module, "format_json_log", format_record
+                ):
+                    async with logger.background_writes(
+                        tokenizer_executor=None if private else owner,
+                        private_decoder_factory=(lambda: decoder) if private else None,
+                    ) as writer:
+                        await logger.log_received_request(obj, source)
+                        self.assertEqual(obj.text, ["<bos>A", "B"])
+                        await logger.log_finished_request(
+                            obj, {"meta_info": {}, "text": "ok"}
+                        )
+                        with patch.object(writer, "MAX_RECORDS", 0):
+                            dropped = Input("dropped", [67])
+                            await logger.log_received_request(dropped, source)
+                            self.assertEqual(dropped.text, "A")
+                received, finished = [json.loads(r.getMessage()) for r in logs.records]
+                self.assertIsNone(received["obj"]["text"])
+                self.assertEqual(finished["obj"]["text"], obj.text)
+                self.assertEqual(finished["out"]["text"], "ok")
+                self.assertNotIn(threading.get_ident(), [tid for _, tid in formats])
+                actual_decoder, unused = (
+                    (decoder, source) if private else (source, decoder)
+                )
+                self.assertEqual(unused.thread_ids, [])
+                self.assertEqual(len(actual_decoder.thread_ids), 3)
+                self.assertNotIn(threading.get_ident(), actual_decoder.thread_ids)
+                if not private:
+                    owner_tid = await asyncio.get_running_loop().run_in_executor(
+                        owner, threading.get_ident
+                    )
+                    self.assertEqual(set(source.thread_ids), {owner_tid})
+
+    async def test_cancelled_log_preparation_keeps_its_slot_until_dequeued(self):
+        """Cancelled queued payloads cannot create space behind a busy formatter."""
+        loop = asyncio.get_running_loop()
+        started, release = asyncio.Event(), threading.Event()
+        dumps = []
+        logger = RequestLogger(True, 2, "text", None)
+        logger.targets = []
+
+        class Payload:
+            def __init__(self, text):
+                self.text = text
+
+            def model_dump(self, **kwargs):
+                dumps.append(self.text)
+                if self.text == "first":
+                    loop.call_soon_threadsafe(started.set)
+                    if not release.wait(3):
+                        raise TimeoutError("Test did not release formatter")
+                return {"text": self.text}
+
+        async def log(text):
+            await logger.log_openai_received_request(Payload(text), None)
+
+        async with logger.background_writes() as writer:
+            with patch.object(writer, "MAX_RECORDS", 2):
+                first = asyncio.create_task(log("first"))
+                try:
+                    await asyncio.wait_for(started.wait(), 2)
+                    queued = asyncio.create_task(log("cancelled"))
+                    await asyncio.sleep(0)
+                    queued.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await queued
+                    await asyncio.wait_for(log("full"), 1)
+                    self.assertEqual(writer.dropped, 1)
+                finally:
+                    release.set()
+                    await first
+        self.assertEqual(dumps, ["first"])
+
+    async def test_file_target_switch_is_atomic_and_level_changes_do_not_reopen_it(
+        self,
+    ):
+        """Slow or failed opens must leave the current log target usable."""
+        from sglang.srt.utils import log_utils
+
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        entered, release = asyncio.Event(), threading.Event()
+        opens = []
+        original_handler = log_utils.TimedRotatingFileHandler
+
+        def open_file(*args, **kwargs):
+            opens.append(threading.get_ident())
+            loop.call_soon_threadsafe(entered.set)
+            if threading.get_ident() != loop_thread and not release.wait(3):
+                raise TimeoutError("Test did not release file open")
+            return original_handler(*args, **kwargs)
+
+        logger = RequestLogger(True, 2, "text", None)
+        old_target = logging.Logger("previous-target")
+        logger.targets = [old_target]
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            log_utils, "TimedRotatingFileHandler", open_file
+        ):
+            change = asyncio.create_task(
+                logger.configure(log_requests_target=[directory])
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                with self.assertLogs(old_target, level="INFO") as before:
+                    logger._log("during open")
+                self.assertEqual(before.records[0].getMessage(), "during open")
+            finally:
+                release.set()
+                await change
+            target = logger.targets[0]
+            try:
+                await logger.configure(log_requests_level=3)
+                await logger.configure(log_requests_target=[directory])
+                self.assertEqual(len(opens), 1)
+                self.assertNotIn(loop_thread, opens)
+                file = next(Path(directory).glob("*.log"))
+                with self.assertRaises(OSError):
+                    await logger.configure(
+                        log_requests=False, log_requests_target=[str(file)]
+                    )
+                self.assertTrue(logger.log_requests)
+                self.assertEqual(logger.log_requests_target, [directory])
+                logger._log("after switch")
+                self.assertIn("after switch", file.read_text(encoding="utf-8"))
+            finally:
+                for handler in target.handlers[:]:
+                    target.removeHandler(handler)
+                    handler.close()
 
     async def test_blocked_log_write_retains_bytes_and_allows_shutdown(self):
         """A blocked sink stays charged and cannot indefinitely delay HTTP shutdown."""
@@ -364,7 +534,7 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         tokenizer = PreTrainedTokenizerFast(tokenizer_object=native, unk_token="[UNK]")
         manager = _manager(tokenizer)
         service = UtilityService(UtilityLimits(workers=2))
-        await service.start(make_utility_backend_factory(manager, None, service.limits))
+        await service.start(make_utility_backend_factory(manager, None))
         try:
 
             async def check(text):
@@ -407,7 +577,7 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
             "sglang.srt.entrypoints.openai.serving_tokenize.OpenAIServingChat"
         ) as chat:
             await service.start(
-                make_utility_backend_factory(_manager(source), object(), service.limits)
+                make_utility_backend_factory(_manager(source), object())
             )
         return [call.args[0].tokenizer for call in chat.call_args_list]
 
@@ -516,11 +686,10 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
     async def test_batch_limit_uses_only_the_endpoint_input(self):
         await self.service.aclose()
         self.service = UtilityService(
-            UtilityLimits(max_batch_size=2, max_input_items=32)
+            UtilityLimits(max_batch_size=2, max_input_items=32),
+            validate_request=check_utility_items,
         )
-        await self.service.start(
-            make_utility_backend_factory(self.manager, None, self.service.limits)
-        )
+        await self.service.start(make_utility_backend_factory(self.manager, None))
         self.tokenize.utility_service = self.detokenize.utility_service = self.service
         limit = self.service.limits.max_batch_size
         for request, status in (
@@ -546,6 +715,37 @@ class TestServingUtility(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                 )
                 actual, _ = await self.call(handler, request)
                 self.assertEqual(actual, status)
+
+        # Hold the sink with an unrelated record. Both over-limit paths must
+        # still return 413 without submitting their detailed logs.
+        loop = asyncio.get_running_loop()
+        entered, release = asyncio.Event(), threading.Event()
+        records = []
+
+        class Sink(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+                loop.call_soon_threadsafe(entered.set)
+                release.wait(5)
+
+        logger = self.manager.request_logger = RequestLogger(True, 2, "json", None)
+        target = logging.Logger("over-limit")
+        target.addHandler(Sink())
+        logger.targets = [target]
+        async with logger.background_writes():
+            logger._log("busy")
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                for handler, request in (
+                    (self.tokenize, TokenizeRequest(prompt=["a", "b", "c"])),
+                    (self.detokenize, DetokenizeRequest(tokens=[67] * 33)),
+                ):
+                    status, _ = await asyncio.wait_for(self.call(handler, request), 2)
+                    self.assertEqual(status, 413)
+                    self.assertEqual(self.service.work_used, 0)
+            finally:
+                release.set()
+        self.assertEqual(records, ["busy"])
 
     async def test_fastapi_validation_aliases_and_budget_policy(self):
         """Production validation errors must fit the utility budget without echoing inputs."""

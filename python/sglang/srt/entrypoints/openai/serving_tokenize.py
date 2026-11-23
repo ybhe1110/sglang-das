@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 class _OpenAIServingUtility(OpenAIServingBase):
-    def _log_received_request(self, request, raw_request):
+    async def _log_received_request(self, request, raw_request):
         # Log inside the admitted utility work item, before conversion. The base
         # hook must not dump/format the payload or write to a sink on the loop.
         pass
@@ -51,10 +51,9 @@ class _OpenAIServingUtility(OpenAIServingBase):
                 # Snapshot configuration and whitelisted headers, not the body
                 # or ASGI Request. Only this admitted worker waits for its log.
                 before_run = partial(
-                    copy.copy(request_logger).log_openai_received_request,
+                    copy.copy(request_logger).log_utility_request,
                     request,
                     headers=_extract_whitelisted_headers(raw_request),
-                    wait_for_write=True,
                 )
             return await self.utility_service.run(
                 ticket, kind, request, before_run=before_run
@@ -253,7 +252,7 @@ class OpenAIServingDetokenize(_OpenAIServingUtility):
             )
 
 
-def _check_utility_items(request, limits):
+def check_utility_items(request, limits):
     if isinstance(request, TokenizeRequest):
         batch = request.prompt if request.prompt is not None else request.messages
     else:
@@ -284,7 +283,7 @@ def _check_utility_items(request, limits):
             pending.append(iter(value))
 
 
-def _copy_utility_tokenizer(tokenizer):
+def copy_tokenizer_for_worker(tokenizer):
     if isinstance(tokenizer, TiktokenTokenizer):
         # Rebuild the native encoding, its bound encode method and Jinja template.
         private = type(tokenizer)(tokenizer.tokenizer.name)
@@ -307,7 +306,10 @@ def _copy_utility_tokenizer(tokenizer):
         private.pad_token = tokenizer.pad_token
         patch_mistral_common_tokenizer(private)
     else:
-        return copy.deepcopy(tokenizer)
+        private = copy.deepcopy(tokenizer)
+        if tokenizer is not None and private is tokenizer:
+            raise RuntimeError("Utility tokenizer copy must be an independent instance")
+        return private
 
     # Template selection and stop tokens can be configured after loading.
     private.chat_template = copy.deepcopy(tokenizer.chat_template)
@@ -318,7 +320,7 @@ def _copy_utility_tokenizer(tokenizer):
     return private
 
 
-def make_utility_backend_factory(manager, template_manager, limits):
+def make_utility_backend_factory(manager, template_manager):
     """Capture only text-serving inputs, never manager sockets or GPU state.
 
     Copy during startup, before generation can mutate the source tokenizer.
@@ -341,14 +343,12 @@ def make_utility_backend_factory(manager, template_manager, limits):
 
     def factory():
         try:
-            private_tokenizer = _copy_utility_tokenizer(tokenizer)
+            private_tokenizer = copy_tokenizer_for_worker(tokenizer)
             private_template = copy.deepcopy(template_manager)
         except Exception as exc:
             raise RuntimeError(
                 "Cannot create a private utility tokenizer/template"
             ) from exc
-        if tokenizer is not None and private_tokenizer is tokenizer:
-            raise RuntimeError("Utility tokenizer copy must be an independent instance")
         versions = {}
         for package in ("transformers", "tokenizers"):
             try:
@@ -369,7 +369,6 @@ def make_utility_backend_factory(manager, template_manager, limits):
         detokenize = OpenAIServingDetokenize(view)
 
         def run(kind, request):
-            _check_utility_items(request, limits)
             handler = tokenize if kind == "tokenize" else detokenize
             result = handler._run_non_streaming_sync(request)
             # Preserve the existing flat errors; successful models are encoded

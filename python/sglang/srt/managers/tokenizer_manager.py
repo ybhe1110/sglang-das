@@ -947,7 +947,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._handle_epd_disaggregation_encode_request(obj)
 
             # Log the request
-            self.request_logger.log_received_request(obj, self.tokenizer, request)
+            await self.request_logger.log_received_request(obj, self.tokenizer, request)
 
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -2218,7 +2218,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out["meta_info"]["response_sent_to_client_ts"] = (
                         state.time_stats.get_response_sent_to_client_realtime()
                     )
-                self.request_logger.log_finished_request(
+                await self.request_logger.log_finished_request(
                     obj,
                     out,
                     request=request,
@@ -2594,8 +2594,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             all_paused_requests = [r.num_paused_requests for r in result]
             return all_success, all_message, all_paused_requests
 
-    def configure_logging(self, obj: ConfigureLoggingReq):
-        self.request_logger.configure(
+    async def configure_logging(self, obj: ConfigureLoggingReq):
+        await self.request_logger.configure(
             log_requests=obj.log_requests,
             log_requests_level=obj.log_requests_level,
             log_requests_format=obj.log_requests_format,
@@ -2616,7 +2616,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Only legal requests will be sent to scheduler.
             logging.getLogger().setLevel(obj.log_level.upper())
             self._dispatch_to_scheduler(obj)
-        logging.info(f"Config logging: {obj=}")
+        await asyncio.to_thread(logging.info, "Config logging: obj=%r", obj)
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""

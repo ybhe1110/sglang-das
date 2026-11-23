@@ -232,7 +232,7 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tm = _make_tokenizer_manager(self)
         self.tm.incremental_streaming_output = True
-        self.tm.request_logger = Mock()
+        self.tm.request_logger = AsyncMock()
         self.tm.request_metrics_exporter_manager = Mock()
         self.tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
         self.state = _make_req_state("engine_wait")
@@ -876,7 +876,7 @@ def _make_tm_for_generate(case, enable_lora=False) -> TokenizerManager:
     tm.server_args.enable_strict_thinking = False
     tm.auto_create_handle_loop = Mock()
     tm._set_default_priority = Mock()
-    tm.request_logger = Mock()
+    tm.request_logger = AsyncMock()
     tm.tokenizer = None
     tm.is_pause = False
     tm.is_pause_cond = asyncio.Condition()
@@ -1194,7 +1194,7 @@ class TestWaitOneResponseAfterStateFreed(CustomTestCase):
 
     def test_generator_built_before_finish_still_delivers_output(self):
         tm = _make_tokenizer_manager(self)
-        tm.request_logger = Mock()
+        tm.request_logger = AsyncMock()
         tm.request_metrics_exporter_manager = MagicMock()
         tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
         rid = "freed_state_rid"

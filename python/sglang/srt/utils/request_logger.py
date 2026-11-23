@@ -14,12 +14,15 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import logging
 import sys
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
@@ -53,16 +56,60 @@ class _RequestLogWriter:
     MAX_RECORDS = 128
     MAX_BYTES = 8 * 1024 * 1024
 
-    def __init__(self):
+    def __init__(self, tokenizer_executor=None):
         self._ready = threading.Condition()
         self._queue = deque()
         self._bytes = 0
         self._closing = False
+        self._preparer = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sgl-log-prepare"
+        )
+        self.decode_executor = tokenizer_executor or self._preparer
+        self.private_decoder = None
+        self._preparing = 0
         self.dropped = 0
         self._thread = threading.Thread(
             target=self._run, name="sgl-request-log", daemon=True
         )
         self._thread.start()
+
+    async def prepare(self, targets, format_record):
+        # Keep live request objects out of the sink queue. The caller owns its
+        # payload until formatting completes and never waits for the sink.
+        with self._ready:
+            if (
+                self._closing
+                or self._preparing + len(self._queue) >= self.MAX_RECORDS
+                or self._bytes >= self.MAX_BYTES
+            ):
+                self.dropped += 1
+                return
+
+            abandoned = threading.Event()
+
+            def prepare_and_enqueue():
+                if not abandoned.is_set():
+                    message = format_record()
+                    if not abandoned.is_set():
+                        self.write(targets, message, wait=False)
+
+            future = self._preparer.submit(prepare_and_enqueue)
+            self._preparing += 1
+
+        def release_slot(_):
+            with self._ready:
+                self._preparing -= 1
+
+        future.add_done_callback(release_slot)
+        result = asyncio.wrap_future(future)
+        try:
+            # Cancelling a queued executor Future leaves its work item in the
+            # pool. Keep the slot charged until the worker actually dequeues it.
+            await asyncio.shield(result)
+        except asyncio.CancelledError:
+            abandoned.set()
+            result.add_done_callback(lambda f: None if f.cancelled() else f.exception())
+            raise
 
     def write(self, targets, message, wait):
         size = sys.getsizeof(message)
@@ -112,6 +159,7 @@ class _RequestLogWriter:
         with self._ready:
             self._closing = True
             self._ready.notify()
+        self._preparer.shutdown(wait=False, cancel_futures=True)
         self._thread.join(timeout=1.0)
 
 
@@ -133,6 +181,7 @@ class RequestLogger:
         )
         self.targets = self._setup_targets()
         self._writer = None
+        self._configure_lock = asyncio.Lock()
 
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
 
@@ -142,9 +191,17 @@ class RequestLogger:
         )
 
     @asynccontextmanager
-    async def background_writes(self):
-        writer = self._writer = _RequestLogWriter()
+    async def background_writes(
+        self, *, tokenizer_executor=None, private_decoder_factory=None
+    ):
+        writer = self._writer = _RequestLogWriter(tokenizer_executor)
         try:
+            if private_decoder_factory is not None:
+                writer.private_decoder = (
+                    await asyncio.get_running_loop().run_in_executor(
+                        writer.decode_executor, private_decoder_factory
+                    )
+                )
             yield writer
         finally:
             try:
@@ -152,26 +209,37 @@ class RequestLogger:
             finally:
                 self._writer = None
 
-    def configure(
+    async def configure(
         self,
         log_requests: Optional[bool] = None,
         log_requests_level: Optional[int] = None,
         log_requests_format: Optional[str] = None,
         log_requests_target: Optional[List[str]] = None,
     ) -> None:
-        if log_requests is not None:
-            self.log_requests = log_requests
-        if log_requests_level is not None:
-            self.log_requests_level = log_requests_level
-        if log_requests_format is not None:
-            self.log_requests_format = log_requests_format
-        if log_requests_target is not None:
-            self.log_requests_target = log_requests_target
+        async with self._configure_lock:
+            updated = copy.copy(self)
+            if log_requests is not None:
+                updated.log_requests = log_requests
+            if log_requests_level is not None:
+                updated.log_requests_level = log_requests_level
+            if log_requests_format is not None:
+                updated.log_requests_format = log_requests_format
+            metadata = updated._compute_metadata()
+            if (
+                log_requests_target is not None
+                and log_requests_target != self.log_requests_target
+            ):
+                updated.log_requests_target = list(log_requests_target)
+                updated.targets = await asyncio.to_thread(updated._setup_targets)
+            # Publish together on the loop after validation and file I/O succeed.
+            self.log_requests = updated.log_requests
+            self.log_requests_level = updated.log_requests_level
+            self.log_requests_format = updated.log_requests_format
+            self.log_requests_target = updated.log_requests_target
+            self.metadata = metadata
+            self.targets = updated.targets
 
-        self.metadata = self._compute_metadata()
-        self.targets = self._setup_targets()
-
-    def log_received_request(
+    async def log_received_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenizer: Any = None,
@@ -180,53 +248,52 @@ class RequestLogger:
         if not self.log_requests:
             return
 
-        max_length, skip_names, _ = self.metadata
         headers = _extract_whitelisted_headers(request)
-        if self.log_requests_format == "json":
-            log_data = {
-                "rid": obj.rid,
-                "obj": _transform_data_for_logging(obj, max_length, skip_names),
-            }
-            if headers:
-                log_data["headers"] = headers
-            self._log(format_json_log("request.received", log_data))
-        else:
-            headers_str = f", headers={headers}" if headers else ""
-            self._log(
-                f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}{headers_str}"
-            )
+        snapshot = copy.copy(self)
+        await snapshot._prepare_generation(
+            snapshot._format_internal, obj, None, headers
+        )
 
         # FIXME: This is a temporary fix to get the text from the input ids.
         # We should remove this once we have a proper way.
         if (
-            self.log_requests_level >= 2
+            snapshot.log_requests_level >= 2
             and obj.text is None
             and obj.input_ids is not None
             and tokenizer is not None
         ):
-            if obj.input_ids and isinstance(obj.input_ids[0], list):
-                # Prefill node warmup while PD disaggregated.
-                decoded = [
-                    tokenizer.decode(_input_ids, skip_special_tokens=False)
-                    for _input_ids in obj.input_ids
-                ]
+            writer = snapshot._writer
+            if writer is None:
+                decoded = _decode_input_ids(tokenizer, obj.input_ids)
             else:
-                decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
+                decoder = writer.private_decoder
+                decoded = await asyncio.get_running_loop().run_in_executor(
+                    writer.decode_executor,
+                    _decode_input_ids,
+                    decoder if decoder is not None else tokenizer,
+                    obj.input_ids,
+                )
             obj.text = decoded
 
-    def log_openai_received_request(
-        self,
-        obj: Any,
-        request: Optional[fastapi.Request] = None,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        wait_for_write: bool = False,
-    ) -> None:
-        """Log the raw OpenAI request payload before request adaptation/tokenization."""
+    async def _prepare_generation(self, formatter, *args):
+        if self._writer is None:
+            self._log(formatter(*args))
+        else:
+            await self._writer.prepare(self.targets, partial(formatter, *args))
+
+    async def log_openai_received_request(self, obj, request):
+        snapshot = copy.copy(self)
+        await snapshot._prepare_generation(
+            snapshot._format_openai, obj, _extract_whitelisted_headers(request)
+        )
+
+    def log_utility_request(self, obj, headers):
+        # Called on an admitted utility worker after validating its input.
+        self._log(self._format_openai(obj, headers), wait_for_write=True)
+
+    def _format_openai(self, obj, headers):
         max_length, _, _ = self.metadata
         max_length = max_length if max_length is not None else 2048
-        if headers is None:
-            headers = _extract_whitelisted_headers(request)
 
         if hasattr(obj, "model_dump"):
             obj_to_log = obj.model_dump(exclude_none=True)
@@ -243,9 +310,9 @@ class RequestLogger:
         else:
             headers_str = f", headers={headers}" if headers else ""
             message = f"Receive OpenAI: obj={_dataclass_to_string_truncated(obj_to_log, max_length)}{headers_str}"
-        self._log(message, wait_for_write=wait_for_write)
+        return message
 
-    def log_finished_request(
+    async def log_finished_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         out: Any,
@@ -258,8 +325,13 @@ class RequestLogger:
         if self.log_exceeded_ms > 0 and e2e_latency_ms < self.log_exceeded_ms:
             return
 
+        snapshot = copy.copy(self)
+        await snapshot._prepare_generation(
+            snapshot._format_internal, obj, out, _extract_whitelisted_headers(request)
+        )
+
+    def _format_internal(self, obj, out, headers):
         max_length, skip_names, out_skip_names = self.metadata
-        headers = _extract_whitelisted_headers(request)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
@@ -267,17 +339,23 @@ class RequestLogger:
             }
             if headers:
                 log_data["headers"] = headers
+            if out is None:
+                return format_json_log("request.received", log_data)
             log_data["out"] = _transform_data_for_logging(
                 out, max_length, out_skip_names
             )
-            self._log(format_json_log("request.finished", log_data))
+            return format_json_log("request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(
                 obj, max_length, skip_names=skip_names
             )
-            out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
             headers_str = f", headers={headers}" if headers else ""
-            self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
+            if out is None:
+                return f"Receive: obj={obj_str}{headers_str}"
+            out_str = _dataclass_to_string_truncated(
+                out, max_length, skip_names=out_skip_names
+            )
+            return f"Finish: obj={obj_str}{headers_str}, out={out_str}"
 
     def _compute_metadata(
         self,
@@ -328,6 +406,12 @@ class RequestLogger:
         else:
             for target in self.targets:
                 target.info(msg)
+
+
+def _decode_input_ids(tokenizer, input_ids):
+    if input_ids and isinstance(input_ids[0], list):
+        return [tokenizer.decode(ids, skip_special_tokens=False) for ids in input_ids]
+    return tokenizer.decode(input_ids, skip_special_tokens=False)
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough

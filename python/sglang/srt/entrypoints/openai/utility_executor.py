@@ -114,8 +114,9 @@ class UtilityTicket:
 
 
 class UtilityService:
-    def __init__(self, limits: UtilityLimits, metrics=None):
+    def __init__(self, limits: UtilityLimits, metrics=None, *, validate_request=None):
         self.limits = limits
+        self.validate_request = validate_request
         self.loop = asyncio.get_running_loop()
         self.metrics = metrics
         self.accepting = False
@@ -190,6 +191,10 @@ class UtilityService:
                     ticket.started_at - ticket.admitted_at
                 )
             try:
+                if self.validate_request is not None:
+                    self.validate_request(request, self.limits)
+                    if ticket.cancelled.is_set():
+                        return None
                 if before_run is not None:
                     before_run()
                     if ticket.cancelled.is_set():

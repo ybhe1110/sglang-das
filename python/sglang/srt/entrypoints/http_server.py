@@ -112,6 +112,8 @@ from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
+    check_utility_items,
+    copy_tokenizer_for_worker,
     make_utility_backend_factory,
 )
 from sglang.srt.entrypoints.openai.serving_transcription import (
@@ -334,8 +336,19 @@ async def _http_lifespan(fast_api_app: FastAPI, cleanup: AsyncExitStack):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
+    manager = _global_state.tokenizer_manager
+    # With tokenizer offload disabled the live tokenizer belongs to the loop.
+    # A private decoder keeps log-only decoding off that loop in this mode too.
+    private_decoder_factory = (
+        partial(copy_tokenizer_for_worker, manager.tokenizer)
+        if manager.tokenizer is not None and manager.tokenizer_offload_executor is None
+        else None
+    )
     await cleanup.enter_async_context(
-        _global_state.tokenizer_manager.request_logger.background_writes()
+        manager.request_logger.background_writes(
+            tokenizer_executor=manager.tokenizer_offload_executor,
+            private_decoder_factory=private_decoder_factory,
+        )
     )
     _global_state.tokenizer_manager.auto_create_handle_loop()
     wait_for_assignment = getattr(
@@ -376,14 +389,15 @@ async def _http_lifespan(fast_api_app: FastAPI, cleanup: AsyncExitStack):
         from sglang.srt.entrypoints.openai.utility_metrics import UtilityMetrics
 
         utility_metrics = UtilityMetrics()
-    utility = UtilityService(utility_limits, utility_metrics)
+    utility = UtilityService(
+        utility_limits, utility_metrics, validate_request=check_utility_items
+    )
     cleanup.push_async_callback(utility.aclose)
     fast_api_app.state.utility_service = utility
     await utility.start(
         make_utility_backend_factory(
             _global_state.tokenizer_manager,
             _global_state.template_manager,
-            utility_limits,
         )
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
@@ -1846,7 +1860,7 @@ async def configure_logging(
     obj: Annotated[ConfigureLoggingReq, Body()], request: Request
 ):
     """Configure the request logging options."""
-    _global_state.tokenizer_manager.configure_logging(obj)
+    await _global_state.tokenizer_manager.configure_logging(obj)
     return Response(status_code=200)
 
 
