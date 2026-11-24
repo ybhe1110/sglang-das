@@ -130,9 +130,9 @@ class TestAbortDrain(unittest.TestCase):
                 "_external_kv_cleanup_timeout_s",
                 "_mark_external_kv_cleanup_started",
                 "_external_kv_cleanup_expired",
+                "_finish_external_kv_abort",
                 "_quarantine_external_kv_request",
                 "process_external_kv_cleanup_quarantine",
-                "_hold_external_kv_cleanup_until_collective",
                 "handle_bootstrap_failure",
                 "handle_inflight_transfer_failure",
                 "_poll_inflight_transfers",
@@ -294,10 +294,10 @@ class TestAbortDrain(unittest.TestCase):
         self.s.metrics_reporter = SimpleNamespace(enable_metrics=False)
         self.s._pending_chunked_abort_req = self.s.chunked_req = None
         self.s.handle_bootstrap_failure(self.req)
-        self.assertTrue(self.req.external_kv_cleanup_done)
-        self.assertTrue(self.req.external_kv_cleanup_ready)
+        self.assertTrue(self.req.external_kv_source_drained)
+        self.assertFalse(self.req.external_kv_cleanup_done)
         self.assertEqual(self.s.disagg_prefill_inflight_queue, [self.req])
-        self.env["release_kv_cache"].assert_called_once()
+        self.env["release_kv_cache"].assert_not_called()
 
     def test_expired_abort_is_quarantined_without_releasing_kv(self):
         self.s._pending_chunked_abort_req = None

@@ -1244,6 +1244,7 @@ class Req(ReqDllmMixin):
         # pages while the scheduler replaces its native poll with a placeholder.
         self.external_kv_cleanup_started_at = None
         self.external_kv_cleanup_quarantined = False
+        self.external_kv_source_drained = False
         self.external_kv_cleanup_ready = False
         self.external_kv_cleanup_timeout_logged = False
         self.external_kv_cleanup_steps = {}

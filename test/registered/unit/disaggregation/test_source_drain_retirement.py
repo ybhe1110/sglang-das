@@ -190,12 +190,27 @@ class TestSourceDrainRetirement(CustomTestCase):
     def test_tp8_quarantine_retires_together_and_frees_once(self):
         self._check_collective_retirement(quarantined=True)
 
-    def test_first_failed_poll_with_one_active_sender_retires_together(self):
+    def test_tp8_failed_poll_gates_healthy_load_back_until_all_senders_drain(self):
         self._check_collective_retirement(quarantined=False)
 
     def _check_collective_retirement(self, quarantined):
         barrier = threading.Barrier(8, timeout=15)
         flags = [None] * 8
+        calls = [[] for _ in range(8)]
+        admitted = [False] * 8
+        gate = load_methods(
+            ROOT / "python/sglang/srt/mem_cache/prefill_budget.py",
+            ["prepare_load_back"],
+            {},
+            class_name="SharedSWAPrefillBudget",
+        ).prepare_load_back
+
+        def collective(rank, name, rids):
+            calls[rank].append((name, tuple(rids)))
+            barrier.wait()
+            self.assertEqual([trace[-1] for trace in calls], [calls[0][-1]] * 8)
+            barrier.wait()
+
         fixtures = []
         chunks = []
         for rank in range(8):
@@ -205,6 +220,7 @@ class TestSourceDrainRetirement(CustomTestCase):
             fixture.req.disagg_kv_sender = sender
             fixture.req.external_kv_abort_response_via_chunked = False
             fixture.s._pending_chunked_abort_req = None
+            fixture.s.tree_cache = Mock()
             fixture.s.chunked_req = None
             fixture.s.enable_unified_cache_external_linker = False
             fixture.s.attn_cp_cpu_group = object()
@@ -228,6 +244,7 @@ class TestSourceDrainRetirement(CustomTestCase):
                 sender.failure_exception = Mock(side_effect=RuntimeError("aborted"))
 
             def reduce(values, *args, rank=rank, **kwargs):
+                collective(rank, "cleanup", kwargs["request_ids"])
                 flags[rank] = values
                 barrier.wait()
                 self.assertEqual({len(values) for values in flags}, {len(flags[0])})
@@ -235,19 +252,33 @@ class TestSourceDrainRetirement(CustomTestCase):
                 barrier.wait()
                 return result
 
+            def poll(senders, *groups, rank=rank, scheduler=fixture.s):
+                rids = [req.rid for req in scheduler.disagg_prefill_inflight_queue]
+                collective(rank, "poll", rids)
+                return [
+                    KVPoll.Success if rid == "healthy" else KVPoll.Failed
+                    for rid in rids
+                ]
+
             fixture.env.update(
+                FINISH_LENGTH=lambda length: SimpleNamespace(length=length),
+                FAKE_BOOTSTRAP_HOST="fake",
+                CacheRequestOutcome=SimpleNamespace(SUCCESS="success"),
                 all_reduce_min_flags=reduce,
-                poll_and_all_reduce_attn_cp_tp_group=lambda senders, *args: (
-                    [KVPoll.Failed] * len(senders)
-                ),
+                poll_and_all_reduce_attn_cp_tp_group=poll,
                 _QuarantinedKVSender=lambda: None,
                 maybe_release_pd_hidden_rows_on_hidden_done=Mock(),
             )
             queue_cls = load_methods(
-                PREFILL, ["process_disagg_prefill_inflight_queue"], fixture.env
+                PREFILL,
+                ["process_disagg_prefill_inflight_queue", "_retire_aborted_prefill_result"],
+                fixture.env,
             )
             fixture.s.process_disagg_prefill_inflight_queue = (
                 queue_cls.process_disagg_prefill_inflight_queue.__get__(fixture.s)
+            )
+            fixture.s._retire_aborted_prefill_result = (
+                queue_cls._retire_aborted_prefill_result.__get__(fixture.s)
             )
             fixtures.append(fixture)
             chunks.append(chunk)
@@ -255,14 +286,57 @@ class TestSourceDrainRetirement(CustomTestCase):
         def round_trip():
             errors = []
 
-            def run(fixture):
+            def run(rank, fixture):
                 try:
+                    if not admitted[rank]:
+                        # The healthy host hit needs the one page held by the failed RID.
+                        # Only the physical allocator and communication are simulated.
+                        def reclaim(cache, full, swa):
+                            free = 256 * fixture.env["release_kv_cache"].call_count
+                            return None if full <= free else "insufficient pages"
+
+                        budget = SimpleNamespace(
+                            allocator=SimpleNamespace(reclaim_for_prealloc=reclaim),
+                            tree_cache=fixture.s.tree_cache,
+                            total_offset=0,
+                            swa_offset=0,
+                            ceil_paged_tokens=int,
+                            swa_tokens=lambda *a, **kw: 0,
+                        )
+                        if gate(
+                            budget,
+                            full_tokens=256,
+                            extend_input_len=1,
+                            max_new_tokens=1,
+                            swa_host_hit_length=0,
+                            chunk_limit=None,
+                        ):
+                            collective(rank, "load_back", ["healthy"])
+                            admitted[rank] = True
+                            fixture.s.disagg_prefill_inflight_queue.append(
+                                SimpleNamespace(
+                                    rid="healthy",
+                                    finished_reason=None,
+                                    bootstrap_host="fake",
+                                    pending_bootstrap=False,
+                                    return_logprob=False,
+                                    return_routed_experts=False,
+                                    external_kv_response_sent=False,
+                                    external_kv_metadata_released=False,
+                                    time_stats=Mock(),
+                                    disagg_kv_sender=Mock(),
+                                    cache_request_handle=None,
+                                )
+                            )
                     fixture.s.process_disagg_prefill_inflight_queue()
                 except BaseException as error:
                     errors.append(error)
                     barrier.abort()
 
-            threads = [threading.Thread(target=run, args=(f,)) for f in fixtures]
+            threads = [
+                threading.Thread(target=run, args=(rank, f))
+                for rank, f in enumerate(fixtures)
+            ]
             for thread in threads:
                 thread.start()
             for thread in threads:
@@ -271,21 +345,45 @@ class TestSourceDrainRetirement(CustomTestCase):
             if errors:
                 raise errors[0]
 
-        # Seven ranks finish first; the active eighth rank keeps every queue.
+        # Keep one writer active across two complete admission passes.
+        round_trip()
         round_trip()
         for fixture in fixtures:
             self.assertEqual(fixture.s.disagg_prefill_inflight_queue, [fixture.req])
-        self.assertTrue(fixtures[0].req.external_kv_cleanup_done)
-        self.assertFalse(fixtures[-1].req.external_kv_cleanup_done)
+            fixture.env["release_kv_cache"].assert_not_called()
+            fixture.env["maybe_release_metadata_buffer"].assert_not_called()
+        self.assertFalse(any(admitted))
+        for fixture in fixtures[:-1]:
+            self.assertTrue(fixture.req.external_kv_source_drained)
+        if not quarantined:
+            for fixture in fixtures:
+                fixture.s.output_streamer.stream_output.assert_called_once()
+                self.assertFalse(fixture.s._retire_aborted_prefill_result(fixture.req))
+                fixture.env["release_kv_cache"].assert_not_called()
+                fixture.env["maybe_release_metadata_buffer"].assert_not_called()
+        self.assertFalse(getattr(fixtures[-1].req, "external_kv_source_drained", False))
+
         fixtures[-1].req.disagg_kv_sender.kv_mgr._source_drain.complete(chunks[-1])
-        round_trip()
-        round_trip()  # Empty-queue consensus and repeated cleanup are harmless.
+        for _ in range(5):
+            round_trip()
+        self.assertTrue(all(admitted))
+        self.assertEqual(calls[0].count(("load_back", ("healthy",))), 1)
         for fixture in fixtures:
             self.assertEqual(fixture.s.disagg_prefill_inflight_queue, [])
             self.assertEqual(fixture.s._external_kv_cleanup_quarantine, {})
             self.assertTrue(fixture.req.external_kv_cleanup_done)
-            fixture.env["release_kv_cache"].assert_called_once()
-            fixture.env["maybe_release_metadata_buffer"].assert_called_once()
+            for op in ("release_kv_cache", "maybe_release_metadata_buffer"):
+                self.assertEqual(
+                    [c.args[0].rid for c in fixture.env[op].call_args_list],
+                    ["r", "healthy"],
+                )
+            outputs = [
+                req
+                for c in fixture.s.output_streamer.stream_output.call_args_list
+                for req in c.args[0]
+            ]
+            self.assertEqual([req.rid for req in outputs], ["r", "healthy"])
+            self.assertIsNotNone(outputs[1].finished_reason)
 
     def test_load_snapshot_updates_without_forward_or_full_idle(self):
         clock = [1.0]
