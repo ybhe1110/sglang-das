@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from functools import partial
 from http import HTTPStatus
 from typing import (
@@ -203,6 +203,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
+from sglang.srt.utils.asyncio_utils import wait_for_cleanup
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
@@ -838,9 +839,7 @@ async def health_generate(request: Request) -> Response:
     tokenizer_manager = _global_state.tokenizer_manager
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     health_dp_size = (
-        tokenizer_manager.elastic_worker_count
-        if get_parallel().attn_dp_enabled
-        else 1
+        tokenizer_manager.elastic_worker_count if get_parallel().attn_dp_enabled else 1
     )
     health_requests = []
     if tokenizer_manager.is_generation and health_dp_size > 1:
@@ -890,88 +889,103 @@ async def health_generate(request: Request) -> Response:
                     gri.routed_dp_rank = dp_rank
             health_requests.append(gri)
 
+    closing_probes = set()
+
     async def gen(gri):
-        async for _ in tokenizer_manager.generate_request(gri, request):
-            break
+        async with aclosing(
+            tokenizer_manager.generate_request(gri, request)
+        ) as responses:
+            try:
+                async for _ in responses:
+                    break
+            finally:
+                # The next await closes the generator in its original task.
+                closing_probes.add(asyncio.current_task())
 
     tasks = [asyncio.create_task(gen(gri)) for gri in health_requests]
+    fan_out = asyncio.gather(*tasks)
+    try:
+        # Cross-DP model collectives require every attention-DP rank to enter the
+        # same forward.  Wait for the complete fan-out instead of returning after
+        # the first detokenizer heartbeat and cancelling a peer mid-collective.
+        if health_dp_size > 1:
 
-    # Cross-DP model collectives require every attention-DP rank to enter the
-    # same forward.  Wait for the complete fan-out instead of returning after
-    # the first detokenizer heartbeat and cancelling a peer mid-collective.
-    if health_dp_size > 1:
+            def serving_user_requests():
+                return any(
+                    not rid.startswith(HEALTH_CHECK_RID_PREFIX)
+                    for rid in tokenizer_manager.rid_to_state
+                )
 
-        def drop_health_requests():
-            for task in tasks:
-                task.cancel()
-            for gri in health_requests:
-                rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
-                for rid in rids:
-                    tokenizer_manager.rid_to_state.pop(rid, None)
-
-        def serving_user_requests():
-            return any(
-                not rid.startswith(HEALTH_CHECK_RID_PREFIX)
-                for rid in tokenizer_manager.rid_to_state
-            )
-
-        fan_out = asyncio.gather(*tasks)
-        tic = time.time()
-        while True:
-            done, _ = await asyncio.wait({fan_out}, timeout=1)
-            if done:
-                try:
-                    fan_out.result()
-                except Exception:
+            tic = time.time()
+            while True:
+                done, _ = await asyncio.wait({fan_out}, timeout=1)
+                if done:
+                    try:
+                        fan_out.result()
+                    except (Exception, asyncio.CancelledError):
+                        break
+                    tokenizer_manager.server_status = ServerStatus.Up
+                    return Response(status_code=200)
+                # A loaded server may hold every DP rank at max_running_requests for
+                # longer than the timeout (long reasoning outputs), so the probes
+                # cannot be admitted.  As in the single-rank check below, output for
+                # user requests since the probe started proves the scheduler is
+                # stepping; only an idle server needs the full fan-out.
+                if (
+                    serving_user_requests()
+                    and tokenizer_manager.last_receive_tstamp > tic
+                ):
+                    tokenizer_manager.server_status = ServerStatus.Up
+                    return Response(status_code=200)
+                if time.time() >= tic + HEALTH_CHECK_TIMEOUT:
                     break
+            tokenizer_manager.server_status = ServerStatus.UnHealthy
+            logger.error(
+                "DP-attention health check failed for %s ranks: no response within %ss",
+                health_dp_size,
+                HEALTH_CHECK_TIMEOUT,
+            )
+            return Response(status_code=503)
+
+        # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
+        tic = time.time()
+        while time.time() < tic + HEALTH_CHECK_TIMEOUT:
+            await asyncio.sleep(1)
+            if tokenizer_manager.last_receive_tstamp > tic:
                 tokenizer_manager.server_status = ServerStatus.Up
                 return Response(status_code=200)
-            # A loaded server may hold every DP rank at max_running_requests for
-            # longer than the timeout (long reasoning outputs), so the probes
-            # cannot be admitted.  As in the single-rank check below, output for
-            # user requests since the probe started proves the scheduler is
-            # stepping; only an idle server needs the full fan-out.
-            if (
-                serving_user_requests()
-                and tokenizer_manager.last_receive_tstamp > tic
-            ):
-                drop_health_requests()
-                tokenizer_manager.server_status = ServerStatus.Up
-                return Response(status_code=200)
-            if time.time() >= tic + HEALTH_CHECK_TIMEOUT:
-                break
-        drop_health_requests()
-        tokenizer_manager.server_status = ServerStatus.UnHealthy
-        logger.error(
-            "DP-attention health check failed for %s ranks: no response within %ss",
-            health_dp_size,
-            HEALTH_CHECK_TIMEOUT,
+
+        tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
+        last_receive_time = time.strftime(
+            "%H:%M:%S",
+            time.localtime(_global_state.tokenizer_manager.last_receive_tstamp),
         )
+        logger.error(
+            f"Health check failed. Server couldn't get a response from detokenizer for last "
+            f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
+            f"last_heartbeat time: {last_receive_time}"
+        )
+        tokenizer_manager.server_status = ServerStatus.UnHealthy
         return Response(status_code=503)
+    finally:
 
-    # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
-    tic = time.time()
-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-        await asyncio.sleep(1)
-        if tokenizer_manager.last_receive_tstamp > tic:
-            tasks[0].cancel()
-            tokenizer_manager.rid_to_state.pop(health_requests[0].rid, None)
-            tokenizer_manager.server_status = ServerStatus.Up
-            return Response(status_code=200)
+        async def drain_health_requests():
+            # Own both cancellation and state retirement here: HTTP cancellation
+            # must not interrupt a probe's asynchronous generator cleanup.
+            for task in tasks:
+                if not task.done() and task not in closing_probes:
+                    task.cancel()
+            try:
+                # Consume the original gather even when it already failed, and
+                # wait for every child before releasing their request states.
+                await asyncio.gather(fan_out, *tasks, return_exceptions=True)
+            finally:
+                for gri in health_requests:
+                    rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
+                    for rid in rids:
+                        tokenizer_manager.rid_to_state.pop(rid, None)
 
-    tasks[0].cancel()
-    tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
-    last_receive_time = time.strftime(
-        "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
-    )
-    logger.error(
-        f"Health check failed. Server couldn't get a response from detokenizer for last "
-        f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
-        f"last_heartbeat time: {last_receive_time}"
-    )
-    tokenizer_manager.rid_to_state.pop(health_requests[0].rid, None)
-    tokenizer_manager.server_status = ServerStatus.UnHealthy
-    return Response(status_code=503)
+        await wait_for_cleanup(drain_health_requests())
 
 
 @app.get("/get_model_info")

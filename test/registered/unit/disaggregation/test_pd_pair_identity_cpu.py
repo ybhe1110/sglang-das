@@ -5,6 +5,7 @@ import asyncio
 import copy
 import hashlib
 import importlib.util
+import runpy
 import threading
 import unittest
 import uuid
@@ -260,6 +261,9 @@ class TestParallelPairIdentity(protocol.CustomTestCase):
             copy=copy,
             logger=Mock(),
             nullcontext=nullcontext,
+            wait_for_cleanup=runpy.run_path(
+                str(ROOT / "python/sglang/srt/utils/asyncio_utils.py")
+            )["wait_for_cleanup"],
             get_bool_env_var=lambda name: False,
             assign_parallel_sample_bootstrap=parallel_sampling.assign_parallel_sample_bootstrap,
         )

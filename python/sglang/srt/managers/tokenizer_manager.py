@@ -185,6 +185,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.srt.utils.asyncio_utils import wait_for_cleanup
 from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmFeatureTransport
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     CHILD_CLEANUP_SECONDS,
@@ -2397,17 +2398,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def _collect_batch_responses(self, generators):
         tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
-        try:
-            return await asyncio.gather(*tasks)
-        finally:
+        responses = asyncio.gather(*tasks)
+
+        async def close_generators():
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(responses, *tasks, return_exceptions=True)
             await asyncio.gather(
                 *(gen.aclose() for gen in generators),
                 return_exceptions=True,
             )
+
+        try:
+            # Only close_generators cancels readers, including after a peer fails.
+            return await asyncio.shield(responses)
+        finally:
+            await wait_for_cleanup(close_generators())
 
     async def _stream_batch_responses(self, generators, rids):
         rid_to_index = {rid: i for i, rid in enumerate(rids)}
