@@ -31,9 +31,10 @@ def extract_class(path, name, names, bases, env):
         for n in ast.parse(path.read_text(encoding="utf-8")).body
         if isinstance(n, ast.ClassDef) and n.name == name
     )
-    original.body = [
-        n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in names
-    ]
+    if names is not None:
+        original.body = [
+            n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in names
+        ]
     original.bases = [ast.Name(id=b, ctx=ast.Load()) for b in bases]
     tree = ast.Module(
         body=[
@@ -188,6 +189,23 @@ class TestSourceDrainRetirement(CustomTestCase):
         sender.clear()
         self.assertTrue(sender.is_transfer_terminal())
 
+    def test_common_budget_caps_continuation_at_immediate_capacity(self):
+        budget_file = ROOT / "python/sglang/srt/mem_cache/prefill_budget.py"
+        fixed = extract_class(budget_file, "PrefillBudget", None, [], {})
+        common = extract_class(budget_file, "CommonPrefillBudget", None, [], {})
+        allocator = Mock(page_size=1)
+        cache = Mock()
+        cache.supports_mamba.return_value = False
+        cache.evictable_size.return_value = 0
+        local = fixed(allocator, cache)
+        local.total_offset = 1024
+        budget = common(local, minimum=lambda value: value)
+        args = dict(extend_input_len=256, max_new_tokens=1, chunk_limit=256)
+        allocator.available_size.return_value = 0
+        self.assertIsNone(budget.fit_chunk(**args))
+        allocator.available_size.return_value = 128
+        self.assertEqual(budget.fit_chunk(**args), 128)
+
     def test_tp8_quarantine_retires_together_and_frees_once(self):
         self._check_collective_retirement(quarantined=True)
 
@@ -195,7 +213,7 @@ class TestSourceDrainRetirement(CustomTestCase):
         self._check_collective_retirement(quarantined=False)
 
     def test_tp8_chunked_abort_and_late_result_share_one_owner(self):
-        """One active writer retains every rank's buffers and the chunked reply."""
+        """One active writer retains buffers while the chunked reply can finish."""
         self._check_collective_retirement(quarantined=False, entry="chunked")
 
     def test_tp8_client_cancels_partially_sent_chunk(self):
@@ -207,27 +225,55 @@ class TestSourceDrainRetirement(CustomTestCase):
         self._check_collective_retirement(quarantined=False, entry="late result")
 
     def test_tp8_single_rank_release_retry(self):
-        """A transient metadata error must not split admission at a one-page host hit."""
+        """A persistent local release error permits admission from shared headroom."""
         self._check_collective_retirement(quarantined=False, retry_release=True)
 
+    def test_tp4_cp2_single_rank_release_retry(self):
+        self._check_collective_retirement(
+            quarantined=False, retry_release=True, tp_size=4
+        )
+
     def _check_collective_retirement(
-        self, quarantined, entry="inflight", retry_release=False
+        self, quarantined, entry="inflight", retry_release=False, tp_size=8
     ):
         barrier = threading.Barrier(8, timeout=15)
         via_chunked = entry in ("chunked", "client cancel")
         flags = [None] * 8
         calls = [[] for _ in range(8)]
         admitted = [False] * 8
-        gate = load_methods(
+        spare_pages = 0
+        rows_on_last_rank = 1
+        allow_release = False
+        allow_reclaim = True
+        budget_file = ROOT / "python/sglang/srt/mem_cache/prefill_budget.py"
+        common_budget = extract_class(budget_file, "CommonPrefillBudget", None, [], {})
+        use_common = load_methods(
+            ROOT / "python/sglang/srt/managers/schedule_policy.py",
+            ["use_common_capacity"],
+            {"CommonPrefillBudget": common_budget},
+        ).use_common_capacity
+
+        def parallel():
+            return SimpleNamespace(tp_rank=0, pp_size=1, pp_max_micro_batch_size=16)
+
+        gates = load_methods(
             ROOT / "python/sglang/srt/mem_cache/prefill_budget.py",
-            ["prepare_load_back"],
+            ["prepare_load_back", "check_prefill"],
             {},
             class_name="SharedSWAPrefillBudget",
-        ).prepare_load_back
+        )
 
-        plan = load_methods(
-            SCHED, ["get_new_batch_prefill"], {"NextBatchPlan": SimpleNamespace}
-        ).get_new_batch_prefill
+        scheduler_methods = load_methods(
+            SCHED,
+            ["get_new_batch_prefill", "get_num_allocatable_reqs", "abort_request"],
+            dict(
+                get_parallel=parallel,
+                NextBatchPlan=SimpleNamespace,
+                logger=Mock(),
+                DisaggregationMode=SimpleNamespace(PREFILL="prefill"),
+            ),
+        )
+        plan = scheduler_methods.get_new_batch_prefill
 
         def collective(rank, name, rids):
             calls[rank].append((name, tuple(rids)))
@@ -235,12 +281,23 @@ class TestSourceDrainRetirement(CustomTestCase):
             self.assertEqual([trace[-1] for trace in calls], [calls[0][-1]] * 8)
             barrier.wait()
 
+        wire_send = Mock()
+        sender_wrapper = load_methods(
+            ROOT / "python/sglang/srt/managers/scheduler_components/output_sender.py",
+            ["__init__", "send_output"],
+            {"BaseReq": SimpleNamespace, "sock_send": wire_send},
+        )
         fixtures = []
         chunks = []
         for rank in range(8):
             fixture = abort_drain_tests.TestAbortDrain()
             fixture.setUp()
             sender = make_sender()
+            if via_chunked:
+                socket = object() if rank == 0 else None
+                fixture.s.ipc_channels.send_to_tokenizer = Mock(
+                    wraps=sender_wrapper(socket)
+                )
             fixture.req.disagg_kv_sender = sender
             fixture.req.external_kv_abort_response_via_chunked = False
             fixture.s._pending_chunked_abort_req = None
@@ -254,10 +311,10 @@ class TestSourceDrainRetirement(CustomTestCase):
             if rank == 7:
                 sender.kv_mgr._source_drain.publish(chunk, Mock(), lambda: True)
                 sender.kv_mgr._source_drain.begin(chunk)
-            if entry == "late result" and rank == 7:
+            if entry in ("late result", "client cancel") and rank == 7:
                 # The first abort times out before marking this sender Failed.
                 real_abort = sender.abort
-                attempts = iter((False, True))
+                attempts = iter((False, False, True) if via_chunked else (False, True))
 
                 def retry_abort():
                     if not next(attempts):
@@ -302,7 +359,48 @@ class TestSourceDrainRetirement(CustomTestCase):
                     for rid in rids
                 ]
 
+            def capacity_reduce(tensor, *, op, group, rank=rank):
+                # Reduce within each attention TP group, then across its CP peers.
+                collective(rank, "capacity_" + group, ())
+                flags[rank] = tensor.item()
+                barrier.wait()
+                start = rank // tp_size * tp_size
+                peers = (
+                    range(start, start + tp_size)
+                    if group == "tp"
+                    else range(rank % tp_size, 8, tp_size)
+                )
+                value = min(flags[i] for i in peers)
+                barrier.wait()
+                tensor.item = lambda: value
+
+            fixture.s.attn_tp_cpu_group = "tp"
+            fixture.s.attn_cp_cpu_group = "cp"
+            fixture.s.req_to_token_pool = SimpleNamespace(
+                available_size=lambda rank=rank: rows_on_last_rank if rank == 7 else 2
+            )
+            fixture.s.beam_coordinator = Mock()
+            fixture.s.beam_coordinator.pending_member_rows.return_value = 0
+            fixture.s.running_batch = object()
+            fixture.s.disaggregation_mode = "prefill"
+            fixture.s.waiting_queue = []
+            fixture.s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+            fixture.s.dllm_config = fixture.s.mm_receiver = None
+            fixture.s.grammar_manager = Mock()
+            fixture.s.collect_inflight_reqs = lambda: []
             fixture.env.update(
+                get_parallel=parallel,
+                torch=SimpleNamespace(
+                    float64=float,
+                    tensor=lambda values, **kw: SimpleNamespace(item=lambda: values[0]),
+                    distributed=SimpleNamespace(
+                        ReduceOp=SimpleNamespace(MIN="min"),
+                        get_world_size=lambda group: (
+                            tp_size if group == "tp" else 8 // tp_size
+                        ),
+                    ),
+                ),
+                all_reduce_with_timeout=capacity_reduce,
                 FINISH_LENGTH=lambda length: SimpleNamespace(length=length),
                 FAKE_BOOTSTRAP_HOST="fake",
                 CacheRequestOutcome=SimpleNamespace(SUCCESS="success", ABORT="abort"),
@@ -314,6 +412,7 @@ class TestSourceDrainRetirement(CustomTestCase):
             queue_cls = load_methods(
                 PREFILL,
                 [
+                    "_min_prefill_capacity",
                     "prepare_disagg_prefill_transfer",
                     "process_disagg_prefill_inflight_queue",
                     "_retire_aborted_prefill_result",
@@ -325,6 +424,9 @@ class TestSourceDrainRetirement(CustomTestCase):
             )
             fixture.s._retire_aborted_prefill_result = (
                 queue_cls._retire_aborted_prefill_result.__get__(fixture.s)
+            )
+            fixture.s._min_prefill_capacity = queue_cls._min_prefill_capacity.__get__(
+                fixture.s
             )
             fixture.s.prefill_delayer = None
             if entry != "inflight":
@@ -356,11 +458,12 @@ class TestSourceDrainRetirement(CustomTestCase):
                 self.assertFalse(fixture.s._retire_aborted_prefill_result(req))
                 self.assertEqual(fixture.s.disagg_prefill_inflight_queue, [req])
             if retry_release and rank == 7:
-                fixture.env["maybe_release_metadata_buffer"].side_effect = [
-                    RuntimeError("retry before returning metadata"),
-                    None,
-                    None,
-                ]
+
+                def try_release(req, *args):
+                    if req.rid == "r" and not allow_release:
+                        raise RuntimeError("metadata remains unavailable")
+
+                fixture.env["maybe_release_metadata_buffer"].side_effect = try_release
             fixtures.append(fixture)
             chunks.append(chunk)
 
@@ -375,8 +478,16 @@ class TestSourceDrainRetirement(CustomTestCase):
                             return None, running_batch
                         # The healthy host hit needs the one page held by the failed RID.
                         # Only the physical allocator and communication are simulated.
+                        if not scheduler_methods.get_num_allocatable_reqs(fixture.s, 0):
+                            return None, running_batch
+
+                        free = 256 * (
+                            spare_pages + fixture.env["release_kv_cache"].call_count
+                        )
+
                         def reclaim(cache, full, swa):
-                            free = 256 * fixture.env["release_kv_cache"].call_count
+                            if rank == 7 and not allow_reclaim:
+                                return "pinned page"
                             return None if full <= free else "insufficient pages"
 
                         budget = SimpleNamespace(
@@ -387,8 +498,27 @@ class TestSourceDrainRetirement(CustomTestCase):
                             ceil_paged_tokens=int,
                             swa_tokens=lambda *a, **kw: 0,
                         )
-                        if gate(
-                            budget,
+                        budget.load_back_needs_full_tokens = True
+                        budget._fits = lambda full, swa: full <= free
+                        budget.check_prefill = gates.check_prefill.__get__(budget)
+                        budget.prepare_load_back = gates.prepare_load_back.__get__(
+                            budget
+                        )
+                        adder = SimpleNamespace(
+                            memory_budget=budget, rem_mamba_slots=None
+                        )
+                        if minimum := getattr(fixture.s, "_prefill_capacity_min", None):
+                            use_common(adder, minimum)
+                        fits, cap = adder.memory_budget.check_prefill(
+                            extend_input_len=256,
+                            total_tokens=256,
+                            max_new_tokens=0,
+                            input_tokens=256,
+                            swa_host_hit_length=0,
+                            chunk_limit=None,
+                        )
+                        self.assertIsNone(cap)
+                        if fits and adder.memory_budget.prepare_load_back(
                             full_tokens=256,
                             extend_input_len=1,
                             max_new_tokens=1,
@@ -416,6 +546,14 @@ class TestSourceDrainRetirement(CustomTestCase):
 
                     fixture.s._get_new_batch_prefill_raw = try_admit
                     plan(fixture.s, None)
+                    if entry == "client cancel":
+                        for _ in range(2):
+                            scheduler_methods.abort_request(
+                                fixture.s,
+                                SimpleNamespace(
+                                    abort_all=False, rid="r", abort_message=None
+                                ),
+                            )
                     if via_chunked:
                         fixture.s.process_pending_chunked_abort()
                     fixture.s.process_disagg_prefill_inflight_queue()
@@ -443,6 +581,17 @@ class TestSourceDrainRetirement(CustomTestCase):
             fixture.env["release_kv_cache"].assert_not_called()
             fixture.env["maybe_release_metadata_buffer"].assert_not_called()
         self.assertFalse(any(admitted))
+        if via_chunked:
+            wire_send.assert_called_once()
+            self.assertEqual(wire_send.call_args.args[1].rid, "r")
+            for f in fixtures:
+                f.s.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+                self.assertFalse(f.req.external_kv_cleanup_done)
+        if entry == "client cancel":
+            self.assertTrue(fixtures[-1].req.external_kv_cleanup_quarantined)
+            self.assertEqual(fixtures[-1].req.disagg_kv_sender.abort.call_count, 2)
+            round_trip()
+            self.assertEqual(fixtures[-1].req.disagg_kv_sender.abort.call_count, 3)
         if entry == "late result":
             self.assertTrue(fixtures[-1].req.external_kv_cleanup_quarantined)
             self.assertEqual(fixtures[-1].req.disagg_kv_sender.abort.call_count, 2)
@@ -463,10 +612,33 @@ class TestSourceDrainRetirement(CustomTestCase):
             self.assertEqual(
                 [f.env["release_kv_cache"].call_count for f in fixtures], [1] * 7 + [0]
             )
+            for _ in range(3):
+                round_trip()
             self.assertFalse(any(admitted))
+            # A spare page now fits everywhere but the weakest rank has no row.
+            spare_pages, rows_on_last_rank = 1, 0
+            round_trip()
+            self.assertFalse(any(admitted))
+            rows_on_last_rank = 1
+            allow_reclaim = False
+            round_trip()
+            self.assertFalse(any(admitted))
+            allow_reclaim = True
+            round_trip()
+            self.assertTrue(all(admitted))
+            self.assertFalse(fixtures[-1].req.external_kv_cleanup_done)
+            for f in fixtures:
+                self.assertEqual(f.s.disagg_prefill_inflight_queue, [f.req])
+                self.assertEqual(
+                    f.s.output_streamer.stream_output.call_args.args[0][0].rid,
+                    "healthy",
+                )
+            allow_release = True
         for _ in range(4):
             round_trip()
         self.assertTrue(all(admitted))
+        if via_chunked:
+            wire_send.assert_called_once()
         self.assertEqual(calls[0].count(("load_back", ("healthy",))), 1)
         for rank, fixture in enumerate(fixtures):
             self.assertEqual(fixture.s.disagg_prefill_inflight_queue, [])
@@ -478,10 +650,14 @@ class TestSourceDrainRetirement(CustomTestCase):
                     and rank == 7
                     and op == "maybe_release_metadata_buffer"
                 )
-                self.assertEqual(
-                    [c.args[0].rid for c in fixture.env[op].call_args_list],
-                    ["r", "r", "healthy"] if retry else ["r", "healthy"],
-                )
+                rids = [c.args[0].rid for c in fixture.env[op].call_args_list]
+                if retry:
+                    self.assertGreaterEqual(rids.count("r"), 7)
+                    self.assertEqual(rids, ["r"] * (len(rids) - 2) + ["healthy", "r"])
+                elif retry_release and rank == 7:
+                    self.assertEqual(rids, ["healthy", "r"])
+                else:
+                    self.assertEqual(rids, ["r", "healthy"])
             outputs = [
                 req
                 for c in fixture.s.output_streamer.stream_output.call_args_list

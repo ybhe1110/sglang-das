@@ -2656,6 +2656,17 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self.maybe_send_health_check_signal()
 
+    def _min_prefill_capacity(self, value):
+        # Unlike poll flags, capacities can exceed 255 and include fractional
+        # decode reservations. Both groups must see the same ordered votes.
+        capacity = torch.tensor([value], dtype=torch.float64, device="cpu")
+        for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
+            if torch.distributed.get_world_size(group) > 1:
+                all_reduce_with_timeout(
+                    capacity, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+        return type(value)(capacity.item())
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
         self: Scheduler,
@@ -2718,9 +2729,18 @@ class SchedulerDisaggregationPrefillMixin:
                 self.attn_tp_cpu_group,
                 request_ids=[req.rid for req in releasing],
             )
-            self._prefill_release_pending = not all(released)
+            partial_release = not all(released)
         else:
-            self._prefill_release_pending = False
+            partial_release = False
+
+        self._pp_prefill_release_pending = (
+            partial_release and get_parallel().pp_size > 1
+        )
+        self._prefill_capacity_min = (
+            self._min_prefill_capacity
+            if partial_release and not self._pp_prefill_release_pending
+            else None
+        )
 
         # The fixed-length preflight above also synchronizes the empty-queue
         # case. Once it returns, all ranks are known to have no requests and
@@ -2811,7 +2831,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
-                if self._prefill_release_pending and poll != KVPoll.Failed:
+                if self._pp_prefill_release_pending and poll != KVPoll.Failed:
                     undone_reqs.append(req)
                     continue
                 if self.handle_pending_bootstrap(req, poll):
@@ -2823,15 +2843,7 @@ class SchedulerDisaggregationPrefillMixin:
                     poll == KVPoll.Bootstrapping
                     and get_disagg().disaggregation_decode_allocation_policy
                     != "prefill_complete"
-                    and self.req_to_token_pool.available_size() == 0
-                    and (
-                        self.waiting_queue
-                        or (
-                            self.disagg_prefill_bootstrap_queue.queue
-                            and self.req_to_metadata_buffer_idx_allocator.available_size()
-                            == 0
-                        )
-                    )
+                    and self._parked_prefill_needs_slot()
                 ):
                     # Decode may have admitted different requests. Yield one
                     # slot so they can prefill, including peers still waiting
@@ -2996,6 +3008,25 @@ class SchedulerDisaggregationPrefillMixin:
 
         return success_rids, failed_rids
 
+    def cancel_inflight_prefill(
+        self: Scheduler, req: Req, abort_message: Optional[str]
+    ) -> None:
+        # Only the existing cleanup owner retries the native abort. The pending
+        # chunked owner also preserves the original client cancellation envelope.
+        if (
+            req.rid in self._external_kv_abort_rids
+            or req.external_kv_cleanup_done
+            or self._pending_chunked_abort_req is req
+        ):
+            return
+        if req.to_finish is None and req.finished_reason is None:
+            req.to_finish = (
+                FINISH_ABORT(abort_message, HTTPStatus.SERVICE_UNAVAILABLE)
+                if abort_message
+                else FINISH_ABORT()
+            )
+        self._queue_prefill_abort(req)
+
     def _queue_prefill_abort(self: Scheduler, req: Req) -> None:
         """Transfer cleanup ownership before any local writer or buffer is retired."""
         if req.external_kv_cleanup_done:
@@ -3092,6 +3123,18 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
 
+    def _parked_prefill_needs_slot(self: Scheduler) -> bool:
+        minimum = getattr(self, "_prefill_capacity_min", None)
+        rows = self.req_to_token_pool.available_size()
+        if (minimum(rows) if minimum is not None else rows) > 0:
+            return False
+        if self.waiting_queue:
+            return True
+        if not self.disagg_prefill_bootstrap_queue.queue:
+            return False
+        metadata = self.req_to_metadata_buffer_idx_allocator.available_size()
+        return (minimum(metadata) if minimum is not None else metadata) == 0
+
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
         if poll == KVPoll.Failed:
@@ -3102,7 +3145,11 @@ class SchedulerDisaggregationPrefillMixin:
         elif poll == KVPoll.WaitingForInput:
             if should_force_retry(req):  # test hook
                 return False
-            if self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req):
+            queue = self.disagg_prefill_bootstrap_queue
+            if getattr(self, "_prefill_capacity_min", None) is not None:
+                if not queue._get_consensus_bootstrap_resource_ready([req], [poll])[0]:
+                    return False
+            if queue.finalize_bootstrap(req):
                 self.checkpoint_disagg_prefill(req)
                 return True
             if is_aborted(req):

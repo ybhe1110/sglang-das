@@ -68,6 +68,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.prefill_budget import CommonPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
@@ -752,6 +753,11 @@ class PrefillAdder:
             if dllm_config.requires_separate_context_encoding
             else max_running_reqs * self.dllm_block_size
         )
+
+    def use_common_capacity(self, minimum):
+        self.memory_budget = CommonPrefillBudget(self.memory_budget, minimum)
+        if self.rem_mamba_slots is not None:
+            self.rem_mamba_slots = minimum(self.rem_mamba_slots)
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         # Fixed-length requests cannot benefit from the early-EOS estimate.

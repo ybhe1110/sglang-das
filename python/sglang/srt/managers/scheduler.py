@@ -4706,23 +4706,27 @@ class Scheduler(
         if self.chunked_req is req:
             self.chunked_req = None
         req.external_kv_abort_response_via_chunked = True
-        sender_terminal = self.prefill_abort_sender_terminal(req)
-        cleanup_done = self.abort_external_kv_request(
-            req,
-            forward_drained=self.prefill_abort_forward_drained(req),
-            sender_terminal=sender_terminal,
-            abort_message=getattr(
-                req.to_finish or req.finished_reason,
-                "message",
-                "External KV load failed",
-            ),
-            is_insert=False,
-            emit_response=False,
+        message = getattr(
+            req.to_finish or req.finished_reason, "message", "External KV load failed"
         )
-        if not cleanup_done:
+        pipeline_parallel = get_parallel().pp_size > 1
+        if pipeline_parallel or req not in getattr(
+            self, "disagg_prefill_inflight_queue", ()
+        ):
+            # With PP=1, inflight requests already have a scheduler/quarantine retry owner.
+            self.abort_external_kv_request(
+                req,
+                forward_drained=self.prefill_abort_forward_drained(req),
+                sender_terminal=self.prefill_abort_sender_terminal(req),
+                abort_message=message,
+                is_insert=False,
+                emit_response=False,
+            )
+        if pipeline_parallel and not req.external_kv_cleanup_done:
             return
         if not req.external_kv_response_sent:
             try:
+                self._finish_external_kv_abort(req, message, False)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     getattr(req, "prefill_client_abort_output", None)
                     or AbortReq(
@@ -4736,6 +4740,8 @@ class Scheduler(
                 )
                 return
             req.external_kv_response_sent = True
+        if not req.external_kv_cleanup_done:
+            return
         self._external_kv_chunked_abort_reqs.pop(req.rid, None)
         if self._pending_chunked_abort_req is req:
             self._pending_chunked_abort_req = None
@@ -4983,7 +4989,8 @@ class Scheduler(
             # A beam candidate owns beam_width rows once decoding.
             res = min(res, row_budget // beam_width)
 
-        return res
+        minimum = getattr(self, "_prefill_capacity_min", None)
+        return minimum(res) if minimum is not None else res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
@@ -4996,7 +5003,7 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
-        if getattr(self, "_prefill_release_pending", False):
+        if getattr(self, "_pp_prefill_release_pending", False):
             ret = None
         else:
             ret, running_batch = self._get_new_batch_prefill_raw(
@@ -5126,6 +5133,9 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
         )
+        minimum = getattr(self, "_prefill_capacity_min", None)
+        if minimum is not None:
+            adder.use_common_capacity(minimum)
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -6799,7 +6809,9 @@ class Scheduler(
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
+                    if get_parallel().pp_size == 1:
+                        self.cancel_inflight_prefill(req, recv_req.abort_message)
+                    elif hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -6852,6 +6864,12 @@ class Scheduler(
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and req.rid in getattr(self, "_external_kv_abort_rids", ())
+                and get_parallel().pp_size == 1
+            ):
+                continue
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):

@@ -120,7 +120,7 @@ class TestAbortDrain(unittest.TestCase):
             release_kv_cache=Mock(),
             prepare_abort=Mock(),
             AbortReq=SimpleNamespace,
-            get_parallel=lambda: SimpleNamespace(tp_rank=0),
+            get_parallel=lambda: SimpleNamespace(tp_rank=0, pp_size=1),
         )
         prefill_cls = load_methods(
             PREFILL,
@@ -133,6 +133,7 @@ class TestAbortDrain(unittest.TestCase):
                 "_finish_external_kv_abort",
                 "_quarantine_external_kv_request",
                 "process_external_kv_cleanup_quarantine",
+                "cancel_inflight_prefill",
                 "_queue_prefill_abort",
                 "handle_bootstrap_failure",
                 "handle_inflight_transfer_failure",
@@ -217,6 +218,32 @@ class TestAbortDrain(unittest.TestCase):
         self.s.process_pending_chunked_abort()
         self.env["release_kv_cache"].assert_called_once()
         self.assertTrue(self.req.external_kv_response_sent)
+
+    def test_inflight_cancel_preserves_first_reason_and_retry_owner(self):
+        self.s.chunked_req = self.s._pending_chunked_abort_req = None
+        self.s.disagg_prefill_inflight_queue = [self.req]
+        self.s._external_kv_abort_rids.clear()
+        self.req.to_finish = None
+        self.s.cancel_inflight_prefill(self.req, "request deadline")
+        self.s.cancel_inflight_prefill(self.req, None)
+        self.assertEqual(self.req.to_finish.message, "request deadline")
+        self.assertEqual(self.req.to_finish.status_code, HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(self.s.disagg_prefill_inflight_queue, [self.req])
+        self.req.disagg_kv_sender.abort.assert_not_called()
+        self.assertFalse(self.finalize(sender_terminal=False))
+        self.req.disagg_kv_sender.abort.assert_called_once()
+        self.s.output_streamer.stream_output.assert_called_once()
+        self.env["release_kv_cache"].assert_not_called()
+        self.env["maybe_release_metadata_buffer"].assert_not_called()
+
+    def test_pipeline_chunked_abort_keeps_existing_response_timing(self):
+        self.env["get_parallel"] = lambda: SimpleNamespace(pp_size=2)
+        self.s.result_queue = [(SimpleNamespace(reqs=[self.req]), object())]
+        self.s.process_pending_chunked_abort()
+        self.s.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        self.s.result_queue.clear()
+        self.s.process_pending_chunked_abort()
+        self.s.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
 
     def test_chunked_send_failure_retains_retry_owner(self):
         send = self.s.ipc_channels.send_to_tokenizer.send_output
