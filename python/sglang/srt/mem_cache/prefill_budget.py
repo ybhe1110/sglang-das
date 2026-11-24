@@ -168,6 +168,78 @@ class PrefillBudget:
         self.current_offset += immediate
 
 
+class CommonPrefillBudget:
+    """Intersect local admission decisions during a partial TP/CP release.
+
+    Each allocator evaluates its own FULL/SWA constraints (including any
+    shared-byte or chunk search). Vote once on its result, before the caller
+    branches or starts a host transfer.
+    """
+
+    def __init__(self, local, minimum):
+        self.local = local
+        self.minimum = minimum
+        self.load_back_needs_full_tokens = local.load_back_needs_full_tokens
+
+    @property
+    def total_offset(self):
+        return self.local.total_offset
+
+    @total_offset.setter
+    def total_offset(self, value):
+        self.local.total_offset = value
+
+    @property
+    def remaining_total(self):
+        return self.minimum(self.local.remaining_total)
+
+    @property
+    def remaining_current(self):
+        return self.minimum(self.local.remaining_current)
+
+    @property
+    def remaining_swa(self):
+        return self.minimum(self.local.remaining_swa)
+
+    def reserve(self, *args, **kwargs):
+        self.local.reserve(*args, **kwargs)
+
+    def has_capacity(self):
+        return self.minimum(self.local.has_capacity())
+
+    def can_allocate_prefill(self, **kwargs):
+        return self.minimum(self.local.can_allocate_prefill(**kwargs))
+
+    def prepare_load_back(self, **kwargs):
+        return self.minimum(self.local.prepare_load_back(**kwargs))
+
+    def check_prefill(self, **kwargs):
+        fits, cap = self.local.check_prefill(**kwargs)
+        if not fits:
+            cap = -1
+        elif cap is None:
+            cap = float("inf")  # No local chunk limit.
+        cap = self.minimum(cap)
+        if cap < 0:
+            return False, None
+        return True, None if cap == float("inf") else int(cap)
+
+    def _common_chunk(self, local_cap):
+        cap = self.minimum(-1 if local_cap is None else local_cap)
+        return None if cap < 0 else cap
+
+    def available_chunk_tokens(self, chunk_limit):
+        return self._common_chunk(self.local.available_chunk_tokens(chunk_limit))
+
+    def fit_chunk(self, **kwargs):
+        cap = self.local.fit_chunk(**kwargs)
+        # A continuing fixed-pool chunk can borrow future decode headroom.
+        # It cannot borrow a page that only a different rank has freed.
+        if cap is not None:
+            cap = min(cap, int(self.local.remaining_current))
+        return self._common_chunk(cap if cap is not None and cap > 0 else None)
+
+
 class SWAPrefillBudget(PrefillBudget):
     """Separate FULL/SWA partitions, including per-request SWA rings."""
 

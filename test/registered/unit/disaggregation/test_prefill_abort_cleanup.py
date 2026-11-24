@@ -61,6 +61,7 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             "original Mooncake failure"
         )
         s = self.scheduler
+        s._external_kv_cleanup_quarantine = {}
         s._external_kv_abort_rids = set()
         s._external_kv_cleanup_rids = set()
         s._pending_chunked_abort_req = None
@@ -89,6 +90,16 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         s.attn_tp_cpu_group = object()
 
         self.stack = ExitStack()
+        self.stack.enter_context(
+            patch.object(
+                prefill,
+                "all_reduce_min_flags",
+                side_effect=lambda flags, *a, **kw: flags,
+            )
+        )
+        self.stack.enter_context(
+            patch.object(prefill, "get_parallel", return_value=s.ps)
+        )
         self.addCleanup(self.stack.close)
         self.metadata = self.stack.enter_context(
             patch.object(prefill, "maybe_release_metadata_buffer")
@@ -123,7 +134,7 @@ class TestPrefillAbortCleanup(unittest.TestCase):
                 self.assertIn(self.req.rid, self.scheduler._external_kv_abort_rids)
         self.assertTrue(self.finalize())
         self.req.disagg_kv_sender.abort.assert_called_once()
-        self.scheduler._release_aborted_request.assert_called_once_with(self.req.rid)
+        self.scheduler._release_aborted_request.assert_called_once_with(self.req)
 
     def test_stage_failures_retry_without_repeating_completed_actions(self):
         # Each injected failure happens before the action succeeds. The contract
@@ -200,7 +211,7 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             ["pending", "linker", "sender", "finish", "metadata", "cache", "response"],
         )
         self.cache.assert_called_once_with(
-            self.req, self.scheduler.tree_cache, is_insert=False
+            self.req, self.scheduler.tree_cache, checkpoint=False
         )
         self.assertEqual(self.req.finished_reason.err_type, EXTERNAL_KV_LOAD_ERR_TYPE)
 
@@ -230,6 +241,10 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             "poll_and_all_reduce_attn_cp_tp_group",
             return_value=[KVPoll.Failed],
         ):
+            for _ in range(2):
+                self.assertEqual(
+                    self.scheduler.process_disagg_prefill_inflight_queue(), []
+                )
             self.assertEqual(
                 self.scheduler.process_disagg_prefill_inflight_queue(), [self.req]
             )
@@ -254,7 +269,8 @@ class TestPrefillAbortCleanup(unittest.TestCase):
     def test_bootstrap_before_kv_allocation_does_not_free_unallocated_cache(self):
         self.req.kv.holds_kv = False
         self.scheduler.handle_bootstrap_failure(self.req)
-        self.assertTrue(self.req.external_kv_cleanup_done)
+        self.assertTrue(self.req.external_kv_source_drained)
+        self.assertFalse(self.req.external_kv_cleanup_done)
         self.cache.assert_not_called()
         self.assertIn("original Mooncake failure", self.req.finished_reason.message)
         self.assertIsNone(self.req.finished_reason.err_type)
@@ -270,6 +286,10 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             "poll_and_all_reduce_attn_cp_tp_group",
             return_value=[KVPoll.Failed],
         ):
+            for _ in range(2):
+                self.assertEqual(
+                    self.scheduler.process_disagg_prefill_inflight_queue(), []
+                )
             self.assertEqual(
                 self.scheduler.process_disagg_prefill_inflight_queue(), [self.req]
             )
@@ -305,9 +325,9 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         self.req.inflight_middle_chunks = 1
 
         with patch.object(
-            s,
-            "prefill_abort_sender_terminal",
-            side_effect=[False, True, True],
+            prefill,
+            "poll_and_all_reduce_attn_cp_tp_group",
+            return_value=[KVPoll.Failed],
         ):
             _, done = s.handle_inflight_transfer_failure(
                 self.req,
@@ -332,15 +352,17 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             self.assertIn(self.req.rid, s._external_kv_chunked_abort_reqs)
             self.cache.assert_not_called()
 
-            # Once both the forward and sender are terminal, cleanup completes
-            # and the retry owner is removed exactly once.
             self.req.inflight_middle_chunks = 0
             s.process_pending_chunked_abort()
+            self.cache.assert_not_called()
+            s.process_disagg_prefill_inflight_queue()
+            s.process_pending_chunked_abort()
+            s.process_disagg_prefill_inflight_queue()
 
         self.cache.assert_called_once_with(
             self.req,
             s.tree_cache,
-            is_insert=False,
+            checkpoint=False,
         )
         self.assertTrue(self.req.external_kv_cleanup_done)
         self.assertTrue(self.req.external_kv_response_sent)
@@ -357,6 +379,11 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         ):
             self.assertEqual(self.scheduler.process_disagg_prefill_inflight_queue(), [])
             self.assertEqual(self.scheduler.disagg_prefill_inflight_queue, [self.req])
+            # First agreed release retries a cache error; retirement waits for completion.
+            for _ in range(2):
+                self.assertEqual(
+                    self.scheduler.process_disagg_prefill_inflight_queue(), []
+                )
             self.assertEqual(
                 self.scheduler.process_disagg_prefill_inflight_queue(), [self.req]
             )
@@ -386,6 +413,10 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             self.metadata.assert_not_called()
             self.req.disagg_kv_sender.abort.assert_called_once()
             self.req.disagg_kv_sender.poll.return_value = KVPoll.Failed
+            for _ in range(2):
+                self.assertEqual(
+                    self.scheduler.process_disagg_prefill_inflight_queue(([], [])), []
+                )
             self.assertEqual(
                 self.scheduler.process_disagg_prefill_inflight_queue(([], [])),
                 [self.req],
