@@ -4642,6 +4642,20 @@ class Scheduler(
         if pending is None:
             pending = self._external_kv_chunked_abort_reqs = {}
         req = self._pending_chunked_abort_req
+        if (
+            req is not None
+            and getattr(req, "prefill_transfer_may_be_active", False)
+            and not req.external_kv_abort_requested
+            and req.rid not in self._external_kv_abort_rids
+        ):
+            # Keep the client-cancel envelope (including weight versions) when
+            # handing a partially sent request to the chunked response owner.
+            reason = req.discard_output_reason
+            req.prefill_client_abort_output = _make_abort_req(
+                req, finished_reason=reason.to_json() if reason else None
+            )
+            req.to_finish = req.to_finish or reason or FINISH_ABORT("Aborted")
+            self._queue_prefill_abort(req)
         if req is not None and (
             req.external_kv_abort_requested or req.rid in self._external_kv_abort_rids
         ):
@@ -4710,9 +4724,9 @@ class Scheduler(
         if not req.external_kv_response_sent:
             try:
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(
-                        rid=req.rid,
-                        finished_reason=req.finished_reason.to_json(),
+                    getattr(req, "prefill_client_abort_output", None)
+                    or AbortReq(
+                        rid=req.rid, finished_reason=req.finished_reason.to_json()
                     ),
                     req,
                 )
@@ -4982,10 +4996,13 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
-        ret, running_batch = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass,
-            running_batch=running_batch,
-        )
+        if getattr(self, "_prefill_release_pending", False):
+            ret = None
+        else:
+            ret, running_batch = self._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+                running_batch=running_batch,
+            )
 
         if self.prefill_delayer:
             observed_prefill_bs = prefill_delayer_single_pass.finalize(
@@ -5716,8 +5733,7 @@ class Scheduler(
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
-                self.prefetch_disagg_page_indices(req)
-                self.maybe_send_cached_prefix_chunk(req)
+                self.prepare_disagg_prefill_transfer(req)
 
         forward_generation = self.model_worker.forward_batch_generation
         # Run forward

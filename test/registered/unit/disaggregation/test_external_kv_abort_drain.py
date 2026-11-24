@@ -133,6 +133,7 @@ class TestAbortDrain(unittest.TestCase):
                 "_finish_external_kv_abort",
                 "_quarantine_external_kv_request",
                 "process_external_kv_cleanup_quarantine",
+                "_queue_prefill_abort",
                 "handle_bootstrap_failure",
                 "handle_inflight_transfer_failure",
                 "_poll_inflight_transfers",
@@ -313,10 +314,22 @@ class TestAbortDrain(unittest.TestCase):
     def test_expired_sender_abort_exception_is_quarantined(self):
         self.s._pending_chunked_abort_req = None
         self.req.external_kv_cleanup_started_at = time.monotonic() - 2.0
-        self.req.disagg_kv_sender.abort.side_effect = RuntimeError("transport")
+        sender = self.req.disagg_kv_sender
+        sender.poll.return_value = KVPoll.Transferring
+
+        def recover():
+            sender.poll.return_value = KVPoll.Failed
+
+        sender.abort.side_effect = RuntimeError("transport")
         self.assertFalse(self.finalize())
         self.assertIn(self.req.rid, self.s._external_kv_cleanup_quarantine)
         self.env["release_kv_cache"].assert_not_called()
+        sender.abort.side_effect = recover
+        self.s.process_external_kv_cleanup_quarantine()
+        self.assertEqual(sender.abort.call_count, 2)
+        self.s.process_external_kv_cleanup_quarantine()
+        self.assertTrue(self.req.external_kv_cleanup_done)
+        self.env["release_kv_cache"].assert_called_once()
 
     def test_quarantine_retries_cleanup_without_collective_poll(self):
         self.s._pending_chunked_abort_req = None

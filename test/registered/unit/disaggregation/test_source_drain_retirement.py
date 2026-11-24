@@ -3,6 +3,7 @@
 import ast
 from collections import OrderedDict
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -21,7 +22,7 @@ from test_external_kv_abort_drain import (
 register_cpu_ci = abort_drain_tests.register_cpu_ci
 CustomTestCase = unittest.TestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
 
 def extract_class(path, name, names, bases, env):
@@ -193,8 +194,27 @@ class TestSourceDrainRetirement(CustomTestCase):
     def test_tp8_failed_poll_gates_healthy_load_back_until_all_senders_drain(self):
         self._check_collective_retirement(quarantined=False)
 
-    def _check_collective_retirement(self, quarantined):
+    def test_tp8_chunked_abort_and_late_result_share_one_owner(self):
+        """One active writer retains every rank's buffers and the chunked reply."""
+        self._check_collective_retirement(quarantined=False, entry="chunked")
+
+    def test_tp8_client_cancels_partially_sent_chunk(self):
+        """Client cancellation retains the original abort envelope while ranks drain."""
+        self._check_collective_retirement(quarantined=False, entry="client cancel")
+
+    def test_tp8_late_result_retries_abort_after_quarantine(self):
+        """Late results keep the RID reachable when abort fails before publication."""
+        self._check_collective_retirement(quarantined=False, entry="late result")
+
+    def test_tp8_single_rank_release_retry(self):
+        """A transient metadata error must not split admission at a one-page host hit."""
+        self._check_collective_retirement(quarantined=False, retry_release=True)
+
+    def _check_collective_retirement(
+        self, quarantined, entry="inflight", retry_release=False
+    ):
         barrier = threading.Barrier(8, timeout=15)
+        via_chunked = entry in ("chunked", "client cancel")
         flags = [None] * 8
         calls = [[] for _ in range(8)]
         admitted = [False] * 8
@@ -204,6 +224,10 @@ class TestSourceDrainRetirement(CustomTestCase):
             {},
             class_name="SharedSWAPrefillBudget",
         ).prepare_load_back
+
+        plan = load_methods(
+            SCHED, ["get_new_batch_prefill"], {"NextBatchPlan": SimpleNamespace}
+        ).get_new_batch_prefill
 
         def collective(rank, name, rids):
             calls[rank].append((name, tuple(rids)))
@@ -230,8 +254,26 @@ class TestSourceDrainRetirement(CustomTestCase):
             if rank == 7:
                 sender.kv_mgr._source_drain.publish(chunk, Mock(), lambda: True)
                 sender.kv_mgr._source_drain.begin(chunk)
-            sender.abort()
-            sender.clear()
+            if entry == "late result" and rank == 7:
+                # The first abort times out before marking this sender Failed.
+                real_abort = sender.abort
+                attempts = iter((False, True))
+
+                def retry_abort():
+                    if not next(attempts):
+                        raise RuntimeError("abort was not published")
+                    real_abort()
+
+                sender.abort = Mock(side_effect=retry_abort)
+                sender.poll = lambda: (
+                    KVPoll.Transferring
+                    if sender.conclude_state is None
+                    else sender.conclude_state
+                )
+                fixture.req.external_kv_cleanup_started_at = time.monotonic() - 2.0
+            else:
+                sender.abort()
+                sender.clear()
             if quarantined:
                 fixture.s._quarantine_external_kv_request(
                     fixture.req, abort_message="cancelled", emit_response=False
@@ -263,7 +305,7 @@ class TestSourceDrainRetirement(CustomTestCase):
             fixture.env.update(
                 FINISH_LENGTH=lambda length: SimpleNamespace(length=length),
                 FAKE_BOOTSTRAP_HOST="fake",
-                CacheRequestOutcome=SimpleNamespace(SUCCESS="success"),
+                CacheRequestOutcome=SimpleNamespace(SUCCESS="success", ABORT="abort"),
                 all_reduce_min_flags=reduce,
                 poll_and_all_reduce_attn_cp_tp_group=poll,
                 _QuarantinedKVSender=lambda: None,
@@ -271,7 +313,11 @@ class TestSourceDrainRetirement(CustomTestCase):
             )
             queue_cls = load_methods(
                 PREFILL,
-                ["process_disagg_prefill_inflight_queue", "_retire_aborted_prefill_result"],
+                [
+                    "prepare_disagg_prefill_transfer",
+                    "process_disagg_prefill_inflight_queue",
+                    "_retire_aborted_prefill_result",
+                ],
                 fixture.env,
             )
             fixture.s.process_disagg_prefill_inflight_queue = (
@@ -280,6 +326,41 @@ class TestSourceDrainRetirement(CustomTestCase):
             fixture.s._retire_aborted_prefill_result = (
                 queue_cls._retire_aborted_prefill_result.__get__(fixture.s)
             )
+            fixture.s.prefill_delayer = None
+            if entry != "inflight":
+                req = fixture.req
+                fixture.s.disagg_prefill_inflight_queue.clear()
+                fixture.s.prefetch_disagg_page_indices = Mock()
+                fixture.s.maybe_send_cached_prefix_chunk = Mock()
+                queue_cls.prepare_disagg_prefill_transfer(fixture.s, req)
+                req.finished = lambda req=req: req.finished_reason is not None
+                req.cache_request_handle = None
+                if via_chunked:
+                    fixture.s.chunked_req = fixture.s._pending_chunked_abort_req = req
+                    fixture.s.result_queue = [(SimpleNamespace(reqs=[req]), object())]
+                    if entry == "chunked":
+                        fixture.finalize(
+                            forward_drained=False,
+                            sender_terminal=False,
+                            emit_response=False,
+                        )
+                    else:
+                        req.to_finish = req.discard_output_reason = None
+                        fixture.env["_make_abort_req"] = Mock(
+                            return_value=SimpleNamespace(
+                                rid=req.rid, weight_versions=["v1"]
+                            )
+                        )
+                    fixture.s.process_pending_chunked_abort()
+                    fixture.s.result_queue.clear()
+                self.assertFalse(fixture.s._retire_aborted_prefill_result(req))
+                self.assertEqual(fixture.s.disagg_prefill_inflight_queue, [req])
+            if retry_release and rank == 7:
+                fixture.env["maybe_release_metadata_buffer"].side_effect = [
+                    RuntimeError("retry before returning metadata"),
+                    None,
+                    None,
+                ]
             fixtures.append(fixture)
             chunks.append(chunk)
 
@@ -288,7 +369,10 @@ class TestSourceDrainRetirement(CustomTestCase):
 
             def run(rank, fixture):
                 try:
-                    if not admitted[rank]:
+
+                    def try_admit(*, running_batch, **kwargs):
+                        if admitted[rank]:
+                            return None, running_batch
                         # The healthy host hit needs the one page held by the failed RID.
                         # Only the physical allocator and communication are simulated.
                         def reclaim(cache, full, swa):
@@ -328,6 +412,12 @@ class TestSourceDrainRetirement(CustomTestCase):
                                     cache_request_handle=None,
                                 )
                             )
+                        return None, running_batch
+
+                    fixture.s._get_new_batch_prefill_raw = try_admit
+                    plan(fixture.s, None)
+                    if via_chunked:
+                        fixture.s.process_pending_chunked_abort()
                     fixture.s.process_disagg_prefill_inflight_queue()
                 except BaseException as error:
                     errors.append(error)
@@ -353,9 +443,12 @@ class TestSourceDrainRetirement(CustomTestCase):
             fixture.env["release_kv_cache"].assert_not_called()
             fixture.env["maybe_release_metadata_buffer"].assert_not_called()
         self.assertFalse(any(admitted))
+        if entry == "late result":
+            self.assertTrue(fixtures[-1].req.external_kv_cleanup_quarantined)
+            self.assertEqual(fixtures[-1].req.disagg_kv_sender.abort.call_count, 2)
         for fixture in fixtures[:-1]:
             self.assertTrue(fixture.req.external_kv_source_drained)
-        if not quarantined:
+        if not quarantined and not via_chunked:
             for fixture in fixtures:
                 fixture.s.output_streamer.stream_output.assert_called_once()
                 self.assertFalse(fixture.s._retire_aborted_prefill_result(fixture.req))
@@ -364,26 +457,50 @@ class TestSourceDrainRetirement(CustomTestCase):
         self.assertFalse(getattr(fixtures[-1].req, "external_kv_source_drained", False))
 
         fixtures[-1].req.disagg_kv_sender.kv_mgr._source_drain.complete(chunks[-1])
-        for _ in range(5):
+        round_trip()  # Last sender becomes locally drained.
+        round_trip()  # The first agreed release runs on all ranks.
+        if retry_release:
+            self.assertEqual(
+                [f.env["release_kv_cache"].call_count for f in fixtures], [1] * 7 + [0]
+            )
+            self.assertFalse(any(admitted))
+        for _ in range(4):
             round_trip()
         self.assertTrue(all(admitted))
         self.assertEqual(calls[0].count(("load_back", ("healthy",))), 1)
-        for fixture in fixtures:
+        for rank, fixture in enumerate(fixtures):
             self.assertEqual(fixture.s.disagg_prefill_inflight_queue, [])
             self.assertEqual(fixture.s._external_kv_cleanup_quarantine, {})
             self.assertTrue(fixture.req.external_kv_cleanup_done)
             for op in ("release_kv_cache", "maybe_release_metadata_buffer"):
+                retry = (
+                    retry_release
+                    and rank == 7
+                    and op == "maybe_release_metadata_buffer"
+                )
                 self.assertEqual(
                     [c.args[0].rid for c in fixture.env[op].call_args_list],
-                    ["r", "healthy"],
+                    ["r", "r", "healthy"] if retry else ["r", "healthy"],
                 )
             outputs = [
                 req
                 for c in fixture.s.output_streamer.stream_output.call_args_list
                 for req in c.args[0]
             ]
-            self.assertEqual([req.rid for req in outputs], ["r", "healthy"])
-            self.assertIsNotNone(outputs[1].finished_reason)
+            aborts = fixture.s.ipc_channels.send_to_tokenizer.send_output
+            if via_chunked:
+                aborts.assert_called_once()
+                if entry == "client cancel":
+                    factory = fixture.env["_make_abort_req"]
+                    factory.assert_called_once_with(fixture.req, finished_reason=None)
+                    self.assertIs(aborts.call_args.args[0], factory.return_value)
+                self.assertEqual(aborts.call_args.args[0].rid, "r")
+                self.assertEqual([req.rid for req in outputs], ["healthy"])
+                self.assertFalse(fixture.s._external_kv_chunked_abort_reqs)
+            else:
+                aborts.assert_not_called()
+                self.assertEqual([req.rid for req in outputs], ["r", "healthy"])
+            self.assertIsNotNone(outputs[-1].finished_reason)
 
     def test_load_snapshot_updates_without_forward_or_full_idle(self):
         clock = [1.0]

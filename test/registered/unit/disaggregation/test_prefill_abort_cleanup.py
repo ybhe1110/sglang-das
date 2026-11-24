@@ -325,9 +325,9 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         self.req.inflight_middle_chunks = 1
 
         with patch.object(
-            s,
-            "prefill_abort_sender_terminal",
-            side_effect=[False, True, True],
+            prefill,
+            "poll_and_all_reduce_attn_cp_tp_group",
+            return_value=[KVPoll.Failed],
         ):
             _, done = s.handle_inflight_transfer_failure(
                 self.req,
@@ -352,10 +352,12 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             self.assertIn(self.req.rid, s._external_kv_chunked_abort_reqs)
             self.cache.assert_not_called()
 
-            # Once both the forward and sender are terminal, cleanup completes
-            # and the retry owner is removed exactly once.
             self.req.inflight_middle_chunks = 0
             s.process_pending_chunked_abort()
+            self.cache.assert_not_called()
+            s.process_disagg_prefill_inflight_queue()
+            s.process_pending_chunked_abort()
+            s.process_disagg_prefill_inflight_queue()
 
         self.cache.assert_called_once_with(
             self.req,

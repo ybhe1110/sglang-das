@@ -2155,19 +2155,22 @@ class SchedulerDisaggregationPrefillMixin:
             ):
                 continue  # Only the next collective can retire this placeholder.
             try:
-                if not getattr(req, "external_kv_source_drained", False) and not (
-                    self.prefill_abort_forward_drained(req)
-                    and self.prefill_abort_sender_terminal(req)
+                forward_drained = self.prefill_abort_forward_drained(req)
+                sender_terminal = self.prefill_abort_sender_terminal(req)
+                # abort() itself may have failed before publishing Failed. Retry
+                # the notification even if the sender cannot yet become terminal.
+                if (
+                    req.external_kv_sender_abort_requested
+                    and not getattr(req, "external_kv_source_drained", False)
+                    and not (forward_drained and sender_terminal)
                 ):
                     continue
                 reason = req.to_finish or req.finished_reason
                 if self.abort_external_kv_request(
                     req,
-                    forward_drained=True,
-                    sender_terminal=True,
-                    abort_message=getattr(
-                        reason, "message", "External KV load failed"
-                    ),
+                    forward_drained=forward_drained,
+                    sender_terminal=sender_terminal,
+                    abort_message=getattr(reason, "message", "External KV load failed"),
                     is_insert=False,
                     emit_response=False,
                 ):
@@ -2197,6 +2200,8 @@ class SchedulerDisaggregationPrefillMixin:
         owns response delivery and must track external_kv_response_sent.
         """
         try:
+            if getattr(req, "prefill_transfer_may_be_active", False):
+                self._queue_prefill_abort(req)
             if getattr(self, "_pending_chunked_abort_req", None) is req:
                 req.external_kv_abort_response_via_chunked = True
             if getattr(req, "external_kv_abort_response_via_chunked", False):
@@ -2451,8 +2456,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # request for KV transfer instead of retiring it.
                 if req.external_kv_abort_requested or is_external_kv_load_failure(req):
                     sender_terminal = self.prefill_abort_sender_terminal(req)
-                    if req not in self.disagg_prefill_inflight_queue:
-                        self.disagg_prefill_inflight_queue.append(req)
+                    self._queue_prefill_abort(req)
                     self.abort_external_kv_request(
                         req,
                         forward_drained=True,
@@ -2572,11 +2576,7 @@ class SchedulerDisaggregationPrefillMixin:
                     and req.extend_end >= len(req.origin_input_ids)
                 )
                 if req.external_kv_abort_requested or is_external_kv_load_failure(req):
-                    if (
-                        self._pending_chunked_abort_req is not req
-                        and req not in self.disagg_prefill_inflight_queue
-                    ):
-                        self.disagg_prefill_inflight_queue.append(req)
+                    self._queue_prefill_abort(req)
                     self.abort_external_kv_request(
                         req,
                         forward_drained=False,
@@ -2689,6 +2689,39 @@ class SchedulerDisaggregationPrefillMixin:
             request_ids=[req.rid for req in self.disagg_prefill_inflight_queue],
         )
 
+        # Try every agreed release before evaluating any capacity-dependent
+        # path (including optimistic requeue below). On a partial release the
+        # allocators already disagree, even though the queue still agrees.
+        releasing = [
+            req
+            for req, progress in zip(
+                self.disagg_prefill_inflight_queue, cleanup_progress
+            )
+            if progress == 1
+        ]
+        if releasing:
+            released = []
+            for req in releasing:
+                reason = req.to_finish or req.finished_reason
+                done = self.abort_external_kv_request(
+                    req,
+                    forward_drained=True,
+                    sender_terminal=True,
+                    inflight_drain_agreed=True,
+                    abort_message=getattr(reason, "message", "Prefill transfer failed"),
+                    emit_response=True,
+                )
+                released.append(int(done))
+            released = all_reduce_min_flags(
+                released,
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+                request_ids=[req.rid for req in releasing],
+            )
+            self._prefill_release_pending = not all(released)
+        else:
+            self._prefill_release_pending = False
+
         # The fixed-length preflight above also synchronizes the empty-queue
         # case. Once it returns, all ranks are known to have no requests and
         # must avoid a zero-length poll collective.
@@ -2707,18 +2740,6 @@ class SchedulerDisaggregationPrefillMixin:
                 req.external_kv_cleanup_quarantined = False
                 req.external_kv_cleanup_ready = False
                 done_reqs.append(req)
-                continue
-            if cleanup_progress[index] == 1:
-                reason = req.to_finish or req.finished_reason
-                self.abort_external_kv_request(
-                    req,
-                    forward_drained=True,
-                    sender_terminal=True,
-                    inflight_drain_agreed=True,
-                    abort_message=getattr(reason, "message", "Prefill transfer failed"),
-                    emit_response=True,
-                )
-                undone_reqs.append(req)
                 continue
             if (
                 getattr(req, "external_kv_cleanup_quarantined", False)
@@ -2790,6 +2811,9 @@ class SchedulerDisaggregationPrefillMixin:
 
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
+                if self._prefill_release_pending and poll != KVPoll.Failed:
+                    undone_reqs.append(req)
+                    continue
                 if self.handle_pending_bootstrap(req, poll):
                     self.send_kv_chunk(req, last_chunk=True)
                     undone_reqs.append(req)
@@ -2832,6 +2856,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
+                req.prefill_transfer_may_be_active = False
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
@@ -2922,18 +2947,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.to_finish = FINISH_ABORT(
                 error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        # A transfer can fail while the request is still the live chunked
-        # request.  Keep a strong retry owner and clear ``chunked_req`` only
-        # from ``process_pending_chunked_abort`` after the current forward has
-        # drained; otherwise the next scheduler step can either launch a new
-        # chunk for a failed request or release its resources too early.
-        if req is getattr(self, "chunked_req", None):
-            req.external_kv_abort_response_via_chunked = True
-            pending = getattr(self, "_external_kv_chunked_abort_reqs", None)
-            if pending is None:
-                pending = self._external_kv_chunked_abort_reqs = {}
-            pending[req.rid] = req
-            self._pending_chunked_abort_req = req
+        self._queue_prefill_abort(req)
         cleanup_done = self.abort_external_kv_request(
             req,
             forward_drained=self.prefill_abort_forward_drained(req),
@@ -2942,8 +2956,6 @@ class SchedulerDisaggregationPrefillMixin:
             is_insert=False,
             emit_response=True,
         )
-        if not cleanup_done:
-            self._external_kv_abort_rids.add(req.rid)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc, cleanup_done
@@ -2984,6 +2996,21 @@ class SchedulerDisaggregationPrefillMixin:
 
         return success_rids, failed_rids
 
+    def _queue_prefill_abort(self: Scheduler, req: Req) -> None:
+        """Transfer cleanup ownership before any local writer or buffer is retired."""
+        if req.external_kv_cleanup_done:
+            return
+        self._external_kv_abort_rids.add(req.rid)
+        if req not in self.disagg_prefill_inflight_queue:
+            self.disagg_prefill_inflight_queue.append(req)
+        if req is getattr(self, "chunked_req", None):
+            req.external_kv_abort_response_via_chunked = True
+            pending = getattr(self, "_external_kv_chunked_abort_reqs", None)
+            if pending is None:
+                pending = self._external_kv_chunked_abort_reqs = {}
+            pending[req.rid] = req
+            self._pending_chunked_abort_req = req
+
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
         """Drop `req` from the sent-but-unconcluded chunk set.
 
@@ -2995,10 +3022,14 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
-        if getattr(req, "external_kv_abort_requested", False) and req in getattr(
-            self, "disagg_prefill_inflight_queue", ()
+        if getattr(req, "external_kv_cleanup_done", False):
+            return False
+        if getattr(req, "prefill_transfer_may_be_active", False) or getattr(
+            req, "external_kv_abort_requested", False
         ):
-            # The failed transfer still owns these pages, even for a late result.
+            # Result completion covers the forward, but older chunks can still
+            # reference its buffers. Leave both release and output to the owner.
+            self._queue_prefill_abort(req)
             return False
         self.clear_pending_chunk_send(req)
         owns_resources = (
@@ -3048,10 +3079,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.to_finish = FINISH_ABORT(
                 error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        if req not in self.disagg_prefill_inflight_queue:
-            # Bootstrap removes the request on all ranks. Keep the same ordered
-            # inflight owner before any rank starts cleanup.
-            self.disagg_prefill_inflight_queue.append(req)
+        self._queue_prefill_abort(req)
         self.abort_external_kv_request(
             req,
             forward_drained=self.prefill_abort_forward_drained(req),
@@ -3150,6 +3178,13 @@ class SchedulerDisaggregationPrefillMixin:
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
+
+    def prepare_disagg_prefill_transfer(self: Scheduler, req: Req) -> None:
+        # A prefix or intermediate chunk can be sent before the final result.
+        # Enroll even ranks that skip the optional transfer on local readiness.
+        req.prefill_transfer_may_be_active = True
+        self.prefetch_disagg_page_indices(req)
+        self.maybe_send_cached_prefix_chunk(req)
 
     def prefetch_disagg_page_indices(self: Scheduler, req: Req) -> None:
         # Snapshot allocation metadata before the forward/WAR barrier. The KV
@@ -3656,6 +3691,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
+        req.prefill_transfer_may_be_active = False
         self.clear_pending_chunk_send(req)  # re-sends from scratch
         req.tmp_end_idx = -1
         req.disagg_decode_prefix_len = None

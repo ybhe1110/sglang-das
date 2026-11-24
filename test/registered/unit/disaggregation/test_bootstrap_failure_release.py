@@ -51,8 +51,12 @@ def _req(rid="r"):
         "response_sent",
         "abort_response_via_chunked",
         "cleanup_done",
+        "source_drained",
+        "cleanup_quarantined",
     ):
         setattr(req, "external_kv_" + name, False)
+    req.prefill_transfer_may_be_active = False
+    req.external_kv_cleanup_started_at = None
     req.external_kv_cleanup_steps = {}
     req.mamba_pool_idx = None
     req.disagg_kv_sender.failure_exception.side_effect = RuntimeError("boom")
@@ -60,24 +64,23 @@ def _req(rid="r"):
 
 
 def _scheduler(*, hicache, external_linker, tree_cache):
-    s = types.SimpleNamespace(
-        enable_hicache_storage=hicache,
-        enable_unified_cache_external_linker=external_linker,
-        tree_cache=tree_cache,
-        ps=types.SimpleNamespace(tp_rank=0),
-        clear_pending_chunk_send=MagicMock(),
-        req_to_metadata_buffer_idx_allocator=MagicMock(),
-        disagg_metadata_buffers=None,
-        output_streamer=MagicMock(),
-        metrics_reporter=types.SimpleNamespace(enable_metrics=False),
-    )
+    s = SchedulerDisaggregationPrefillMixin()
+    s.enable_hicache_storage = hicache
+    s.enable_unified_cache_external_linker = external_linker
+    s.tree_cache = tree_cache
+    s.chunked_req = None
+    s.clear_pending_chunk_send = MagicMock()
+    s.req_to_metadata_buffer_idx_allocator = MagicMock()
+    s.disagg_metadata_buffers = None
+    s.output_streamer = MagicMock()
+    s.metrics_reporter = types.SimpleNamespace(enable_metrics=False)
     s._external_kv_abort_rids = set()
+    s._external_kv_cleanup_rids = set()
+    s._external_kv_cleanup_quarantine = {}
     s.disagg_prefill_inflight_queue = []
+    s.attn_tp_cpu_group = s.attn_cp_cpu_group = None
     s.prefill_abort_forward_drained = lambda req: True
     s.prefill_abort_sender_terminal = lambda req: True
-    s.abort_external_kv_request = lambda req, **kwargs: (
-        SchedulerDisaggregationPrefillMixin.abort_external_kv_request(s, req, **kwargs)
-    )
     s._release_aborted_request = lambda req: Scheduler._release_aborted_request(s, req)
     return s
 
@@ -86,12 +89,20 @@ def _fail(s, req):
     with (
         patch("sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"),
         patch("sglang.srt.disaggregation.prefill.prepare_abort"),
+        patch.object(s, "_poll_inflight_transfers", return_value=[None]),
+        patch(
+            "sglang.srt.disaggregation.prefill.all_reduce_min_flags",
+            side_effect=lambda flags, *args, **kwargs: flags,
+        ),
         patch(
             "sglang.srt.disaggregation.prefill.get_parallel",
             return_value=types.SimpleNamespace(tp_rank=0),
         ),
     ):
-        SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure(s, req)
+        s.handle_bootstrap_failure(req)
+        assert req.external_kv_source_drained and not req.external_kv_cleanup_done
+        s.process_disagg_prefill_inflight_queue()
+        assert req.external_kv_cleanup_done
 
 
 class TestBootstrapFailureRelease(CustomTestCase):
