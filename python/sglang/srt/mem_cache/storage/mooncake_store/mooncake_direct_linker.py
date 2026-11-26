@@ -177,8 +177,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
         storage_layout_tag = getattr(self.pool_group, "storage_layout_tag", "")
-        # The tree wrapper owns collective ordering, including exception paths.
-        self.requires_load_revalidation_consensus = bool(storage_layout_tag)
 
         tp_rank = 0
         tp_size = get_parallel().tp_size

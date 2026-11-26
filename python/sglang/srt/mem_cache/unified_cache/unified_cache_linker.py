@@ -958,26 +958,19 @@ class UnifiedCacheLinkerWrapper:
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
         locally_valid = True
         if not prepared_from_host_prefetch and revalidate is not None:
-            if (
-                getattr(
-                    self.cache_linker, "requires_load_revalidation_consensus", False
-                )
-                is True
-            ):
-                try:
-                    locally_valid = revalidate(
-                        [transfer for _, transfer in component_transfers]
-                    )
-                except Exception:
-                    logger.exception("External linker revalidation failed on this rank")
-                    locally_valid = False
-                verdict = torch.tensor(int(locally_valid), dtype=torch.int)
-                cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
-                locally_valid = bool(verdict.item())
-            else:
+            try:
                 locally_valid = revalidate(
                     [transfer for _, transfer in component_transfers]
                 )
+            except Exception:
+                logger.exception("External linker revalidation failed on this rank")
+                locally_valid = False
+            # Existence is rank-local even without a storage layout tag. Vote
+            # before ABORT or PREPARE so a single missing key cannot leave peers
+            # with different inflight RIDs and collective sequences.
+            verdict = torch.tensor(int(locally_valid), dtype=torch.int)
+            cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+            locally_valid = bool(verdict.item())
         if not locally_valid:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
