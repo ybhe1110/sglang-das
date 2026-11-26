@@ -19,7 +19,7 @@ import dataclasses
 import logging
 import os
 import signal
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
@@ -36,6 +36,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ConfigureLoggingReq,
     FreezeGCReq,
+    HealthCheckOutput,
     sock_recv,
     sock_send,
 )
@@ -163,6 +164,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (FreezeGCReq, self.handle_freeze_gc_req),
                 (ConfigureLoggingReq, self.handle_configure_logging_req),
+                (HealthCheckOutput, lambda obj: obj),
             ]
         )
 
@@ -292,6 +294,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
+        if len(set(recv_obj.rids)) != bs:
+            duplicates = [
+                rid for rid, count in Counter(recv_obj.rids).items() if count > 1
+            ]
+            raise RuntimeError(
+                f"Duplicate request IDs in detokenizer batch: {duplicates[:8]}"
+            )
         vocab_size = self.vocab_size
 
         # Initialize decode status
@@ -367,11 +376,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             except KeyError:
                 raise RuntimeError(
                     f"Decode status not found for request {rid}. "
-                    "It may be due to the request being evicted from the decode status due to memory pressure. "
-                    "Please increase the maximum number of requests by setting "
-                    "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
-                    f"The current value is {DETOKENIZER_MAX_STATES}. "
-                    "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+                    f"batch_size={bs}, active_states={len(self.decode_status)}, "
+                    f"state_capacity={DETOKENIZER_MAX_STATES}. "
+                    "Check request identity and state eviction before changing capacity."
                 )
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
@@ -533,9 +540,14 @@ def run_detokenizer_process(
             manager.event_loop()
         else:
             manager.multi_http_worker_event_loop()
+        raise RuntimeError("Detokenizer event loop returned unexpectedly")
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
-        if manager is not None:
-            manager.maybe_clear_socket_mapping()
-        parent_process.send_signal(signal.SIGQUIT)
+        try:
+            if manager is not None:
+                manager.maybe_clear_socket_mapping()
+            parent_process.send_signal(signal.SIGQUIT)
+        except Exception:
+            logger.exception("Failed to clean up or notify detokenizer parent")
+        raise

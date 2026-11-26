@@ -164,12 +164,14 @@ class WatchdogRaw:
 
 
 class SubprocessWatchdog:
-    """Monitors subprocess liveness and triggers SIGQUIT when a crash is detected.
+    """Monitor subprocesses, with fail-stop policy for critical engine workers.
 
     When a subprocess crashes (e.g., NCCL timeout causing C++ std::terminate()),
     Python exception handlers never run, leaving the main process as a zombie
     service. This watchdog polls subprocess liveness in a daemon thread and
-    sends SIGQUIT to trigger proper cleanup.
+    invokes the owner's failure callback (or the legacy SIGQUIT notification).
+    Critical long-lived workers also treat unexpected exitcode=0 as failure;
+    stop the monitor before requesting normal engine shutdown.
 
     See: https://github.com/sgl-project/sglang/issues/18421
     """
@@ -179,12 +181,19 @@ class SubprocessWatchdog:
         processes: List[Process],
         process_names: Optional[List[str]] = None,
         interval: float = 1.0,
+        *,
+        unexpected_exit_is_fatal: bool = False,
+        on_failure: Optional[Callable[[str, int, int], None]] = None,
     ):
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
         self._interval = interval
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._unexpected_exit_is_fatal = unexpected_exit_is_fatal
+        self._on_failure = on_failure
+        self._state_lock = threading.Lock()
+        self._failed = False
 
     def start(self) -> None:
         if self._thread is not None or not self._processes:
@@ -195,8 +204,12 @@ class SubprocessWatchdog:
         self._thread.start()
 
     def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
+        with self._state_lock:
+            self._stop_event.set()
+        if (
+            self._thread is not None
+            and self._thread is not threading.current_thread()
+        ):
             self._thread.join(timeout=self._interval * 2)
             self._thread = None
 
@@ -210,14 +223,25 @@ class SubprocessWatchdog:
 
     def _check_processes(self) -> bool:
         for proc, name in zip(self._processes, self._names):
-            if proc.is_alive() or proc.exitcode == 0:
+            if proc.is_alive() or proc.pid is None:
+                continue
+            if proc.exitcode == 0 and not self._unexpected_exit_is_fatal:
                 continue
 
-            logger.error(
-                f"Subprocess {name} (pid={proc.pid}) crashed "
-                f"with exit code {proc.exitcode}. "
-                f"Triggering SIGQUIT for cleanup..."
-            )
-            os.kill(os.getpid(), signal.SIGQUIT)
+            with self._state_lock:
+                if self._stop_event.is_set() or self._failed:
+                    return False
+                self._failed = True
+
+            if self._on_failure is not None:
+                # The fail-stop callback starts its deadline before logging.
+                self._on_failure(name, proc.pid, proc.exitcode)
+            else:
+                logger.error(
+                    f"Subprocess {name} (pid={proc.pid}) crashed "
+                    f"with exit code {proc.exitcode}. "
+                    f"Triggering SIGQUIT for cleanup..."
+                )
+                os.kill(os.getpid(), signal.SIGQUIT)
             return True
         return False

@@ -48,6 +48,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
+    ShutdownReq,
     TokenizerWorkerRegistrationReq,
     async_sock_recv,
     async_sock_send,
@@ -508,6 +509,11 @@ class MultiTokenizerRouter:
         while True:
             recv_obj = await async_sock_recv(self.receive_from_worker)
 
+            if isinstance(recv_obj, ShutdownReq):
+                watchdog = getattr(self, "_subprocess_watchdog", None)
+                if watchdog is not None:
+                    watchdog.stop()
+
             if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
                     self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
@@ -639,12 +645,17 @@ def run_multi_detokenizer_router_process(
     try:
         router = MultiDetokenizerRouter(ipc_name_list, port_args)
         router.event_loop()
+        raise RuntimeError("Detokenizer router event loop returned unexpectedly")
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"MultiDetokenizerRouter hit an exception: {traceback}")
-        if router is not None:
-            router.socket_mapping.clear_all_sockets()
-        parent_process.send_signal(signal.SIGQUIT)
+        try:
+            if router is not None:
+                router.socket_mapping.clear_all_sockets()
+            parent_process.send_signal(signal.SIGQUIT)
+        except Exception:
+            logger.exception("Failed to clean up or notify detokenizer router parent")
+        raise
 
 
 class TokenizerWorker(TokenizerManager):

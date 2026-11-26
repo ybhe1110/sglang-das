@@ -696,34 +696,30 @@ async def health_generate(request: Request) -> Response:
         )
 
     async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
-            break
+        generator = _global_state.tokenizer_manager.generate_request(gri, request)
+        try:
+            async for _ in generator:
+                return
+            raise RuntimeError("Health probe ended without a response")
+        finally:
+            await generator.aclose()
 
     task = asyncio.create_task(gen())
 
-    # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
-    tic = time.time()
-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-        await asyncio.sleep(1)
-        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
-            task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            return Response(status_code=200)
-
-    task.cancel()
-    tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
-    last_receive_time = time.strftime(
-        "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
-    )
-    logger.error(
-        f"Health check failed. Server couldn't get a response from detokenizer for last "
-        f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
-        f"last_heartbeat time: {last_receive_time}"
-    )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
-    return Response(status_code=503)
+    try:
+        await asyncio.wait_for(task, timeout=HEALTH_CHECK_TIMEOUT)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Health check failed for rid=%s", rid)
+        _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+        return Response(status_code=503)
+    else:
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        return Response(status_code=200)
+    finally:
+        # Closing the generator cancels only this probe's internal attempt.
+        _global_state.tokenizer_manager._discard_pending_req_states(gri)
 
 
 @app.get("/get_model_info")
@@ -2731,6 +2727,8 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
                 )
     finally:
+        if subprocess_watchdog is not None:
+            subprocess_watchdog.stop()
         if server_args.tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
                 multi_tokenizer_args_shm.unlink()

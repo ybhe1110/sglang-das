@@ -1207,7 +1207,7 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
-        self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        self.return_health_check_ipcs: Deque[tuple[str, Optional[str]]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
@@ -2123,7 +2123,7 @@ class Scheduler(
                 for_health_check=True
             ):
                 self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
+                    (recv_req.rid, getattr(recv_req, "http_worker_ipc", None))
                 )
                 self.dp_budget_source.complete()
                 continue
@@ -4622,13 +4622,10 @@ class Scheduler(
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
-            # Return some signal for the health check.
-            # This is used to prevent the health check signal being blocked by long context prefill.
-            # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                HealthCheckOutput(
-                    http_worker_ipc=self.return_health_check_ipcs.popleft()
-                )
+            # Avoid a model forward while still checking the output process.
+            rid, http_worker_ipc = self.return_health_check_ipcs.popleft()
+            self.ipc_channels.send_to_detokenizer.send_output(
+                HealthCheckOutput(rid=rid, http_worker_ipc=http_worker_ipc)
             )
 
     def add_external_corpus(

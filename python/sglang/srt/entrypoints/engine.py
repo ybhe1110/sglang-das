@@ -133,6 +133,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     is_port_available,
 )
+from sglang.srt.utils.process_supervision import fatal_subprocess_exit
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -1219,7 +1220,10 @@ class Engine(EngineScoreMixin, EngineBase):
             processes.extend(detoken_procs)
             names.extend(detoken_names)
             subprocess_watchdog = SubprocessWatchdog(
-                processes=processes, process_names=names
+                processes=processes,
+                process_names=names,
+                unexpected_exit_is_fatal=True,
+                on_failure=fatal_subprocess_exit,
             )
             subprocess_watchdog.start()
             startup_complete = True

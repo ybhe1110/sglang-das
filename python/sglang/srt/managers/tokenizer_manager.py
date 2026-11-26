@@ -752,8 +752,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._handle_update_weights_from_disk_req_output,
                 ),
                 (FreezeGCReq, lambda x: None),
-                # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
-                (HealthCheckOutput, lambda x: None),
+                (HealthCheckOutput, self._handle_health_check_output),
                 # Same skip-detokenizer forwarding case as above.
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
@@ -796,7 +795,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
-        self._init_req_state(obj, request)
+        owned_states = self._init_req_state(obj, request)
         try:
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -820,17 +819,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
-                    async for response in self._handle_batch_request(obj, request):
+                    async for response in self._handle_batch_request(
+                        obj, request, owned_states=owned_states
+                    ):
                         yield response
         except BaseException:
-            # _init_req_state created a rid_to_state entry per (sub-)request up
-            # front. The normal remover is the scheduler-response path
-            # (_handle_batch_output), so a failure *before* a request reaches the
-            # scheduler -- e.g. input-length validation rejecting an over-context
-            # request -- would otherwise leak those entries forever. Drop any that
-            # are still pending; entries already removed on the normal completion
-            # path are left untouched (pop is a no-op).
-            self._discard_pending_req_states(obj)
+            # Never cancel or remove a later owner's state when the gateway
+            # violates the unique-per-attempt RID contract.
+            self._discard_pending_req_states(obj, owned_states=owned_states)
             raise
 
     def _detect_input_format(
@@ -1688,7 +1684,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
-            if state.obj.rid in self.rid_to_state:
+            if self.rid_to_state.get(state.obj.rid) is state:
                 del self.rid_to_state[state.obj.rid]
 
             # Mark ongoing LoRA request as finished.
@@ -1724,7 +1720,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    self.abort_request(obj.rid)
+                    if self.rid_to_state.get(obj.rid) is state:
+                        self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
@@ -1805,7 +1802,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
+                    if self.rid_to_state.get(obj.rid) is state:
+                        self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
@@ -1815,6 +1813,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        *,
+        owned_states=None,
     ):
         batch_size = obj.batch_size
 
@@ -1883,7 +1883,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 assign_parallel_sample_bootstrap(
                     tmp_obj, tokenized_obj, prompt_index=i, sample_index=-1
                 )
-                self._init_req_state(tmp_obj)
+                sample_states = self._init_req_state(tmp_obj)
+                if owned_states is not None:
+                    owned_states.extend(sample_states or ())
                 self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
@@ -1902,7 +1904,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     assign_parallel_sample_bootstrap(
                         tmp_obj, tokenized_obj, prompt_index=i, sample_index=sample_index
                     )
-                    self._init_req_state(tmp_obj)
+                    sample_states = self._init_req_state(tmp_obj)
+                    if owned_states is not None:
+                        owned_states.extend(sample_states or ())
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
@@ -2139,11 +2143,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
+            requests = [obj] if obj.is_single else [obj[i] for i in range(len(obj.rid))]
+            owned_states = [
+                (req.rid, state)
+                for req in requests
+                if (state := self.rid_to_state.get(req.rid)) is not None
+                and state.obj is req
+            ]
             await asyncio.sleep(2)
-            if obj.is_single:
-                self.abort_request(obj.rid)
-            else:
-                for rid in obj.rid:
+            for rid, state in owned_states:
+                if self.rid_to_state.get(rid) is state:
                     self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
@@ -3172,6 +3181,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Put some custom force exit logic here."""
         pass
 
+    def _handle_health_check_output(self, recv_obj: HealthCheckOutput):
+        if not is_health_check_generate_req(recv_obj):
+            return
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            return
+        state.finished = True
+        state.time_stats.set_first_token_time()
+        state.time_stats.set_finished_time()
+        state.out_list.append(
+            {
+                "text": "",
+                "output_ids": [],
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": {"type": "length", "length": 0},
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "e2e_latency": state.time_stats.get_e2e_latency(),
+                },
+            }
+        )
+        del self.rid_to_state[recv_obj.rid]
+        state.event.set()
+
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
@@ -3385,6 +3419,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        """Admit gateway-owned RIDs without rewriting their per-attempt identity."""
         created_time = obj.received_time
 
         external_trace_header = None
@@ -3415,29 +3450,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        seen = set()
+        for rid, _, _ in items:
+            if rid in self.rid_to_state or rid in seen:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            seen.add(rid)
+
+        pending = []
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
-            self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            pending.append((rid, state))
+        self.rid_to_state.update(pending)
+        return pending
 
-    def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
-
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
-        """
-        if not hasattr(obj, "is_single") or obj.is_single:
-            rids = [obj.rid]
-        else:
-            rids = obj.rid
-        for rid in rids:
-            self.rid_to_state.pop(rid, None)
+    def _discard_pending_req_states(self, obj, *, owned_states=None):
+        """Cancel failed work and remove only the captured invocation's states."""
+        cancel = owned_states is not None
+        if owned_states is None:
+            rids = [obj.rid] if not hasattr(obj, "is_single") or obj.is_single else obj.rid
+            owned_states = [(rid, self.rid_to_state.get(rid)) for rid in rids]
+        for rid, state in owned_states:
+            if state is None or self.rid_to_state.get(rid) is not state:
+                continue
+            try:
+                if cancel:
+                    self.abort_request(rid)
+            except Exception:
+                logger.exception("Failed to cancel request rid=%s", rid)
+            finally:
+                if self.rid_to_state.get(rid) is state:
+                    del self.rid_to_state[rid]
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
