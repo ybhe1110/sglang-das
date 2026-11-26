@@ -91,8 +91,8 @@ class _PoolRangePlan:
     entries_per_page: int
 
 
-# One queued offload: the pools it resolved to, and the event guarding its KV.
-_OffloadTask = tuple[list[PoolTransfer], object]
+# One queued offload: the pools it resolved to, and the events gating the read.
+_OffloadTask = tuple[list[PoolTransfer], list[object]]
 
 
 def _offload_task_pages(expanded: list[PoolTransfer]) -> int:
@@ -152,7 +152,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         *,
         components,
         _storage=None,
+        forward_stream=None,
     ):
+        self.forward_stream = forward_stream
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
@@ -359,7 +361,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._load_queue: Queue[tuple[int, list[_PoolRangePlan], object] | None] = (
             Queue()
         )
-        self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
+        self._offload_queue: Queue[_OffloadTask | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._stats = {
             "lookup": 0,
@@ -854,9 +856,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self._freeze_gc_once()
-        ready_event = device_module.Event()
-        ready_event.record()
-        self._offload_queue.put((expanded, ready_event))
+        ready_events = self.record_offload_ready()
+        self._offload_queue.put((expanded, ready_events))
         return True
 
     def _take_offload_batch(self) -> tuple[list[_OffloadTask], bool]:
@@ -910,8 +911,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 self._offload_results.put(success)
 
     def _run_offload(self, tasks: list[_OffloadTask]) -> bool:
-        for _, ready_event in tasks:
-            ready_event.synchronize()
+        for _, ready_events in tasks:
+            for event in ready_events:
+                event.synchronize()
         next_slot = 0
 
         def materialize_indices(indices: torch.Tensor) -> torch.Tensor:

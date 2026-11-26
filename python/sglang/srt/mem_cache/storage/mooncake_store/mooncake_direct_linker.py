@@ -156,7 +156,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         *,
         components,
         storage=None,
+        forward_stream=None,
     ):
+        self.forward_stream = forward_stream
         self.page_size = params.page_size
         self.page_wise_load_threshold = get_memory().mooncake_page_wise_load_threshold
         self.enable_page_wise_load = get_memory().mooncake_enable_page_wise_load
@@ -175,8 +177,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
         storage_layout_tag = getattr(self.pool_group, "storage_layout_tag", "")
-        # The tree wrapper owns collective ordering, including exception paths.
-        self.requires_load_revalidation_consensus = bool(storage_layout_tag)
 
         tp_rank = 0
         tp_size = get_parallel().tp_size
@@ -387,7 +387,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self._session_cleanup_error: str | None = None
         self._uncertain_sessions: list[tuple[str, ...]] = []
         self.offload_queue: Queue[
-            tuple[list[PoolTransfer], int, float, object] | None
+            tuple[list[PoolTransfer], int, float, list[object]] | None
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
@@ -1549,9 +1549,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        ready_event = device_module.Event()
-        ready_event.record()
-        self.offload_queue.put((expanded, tokens, time.perf_counter(), ready_event))
+        ready_events = self.record_offload_ready()
+        self.offload_queue.put((expanded, tokens, time.perf_counter(), ready_events))
         return True
 
     def offload_thread_func(self) -> None:
@@ -1561,8 +1560,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, started, ready_event = task
-                ready_event.synchronize()
+                expanded, tokens, started, ready_events = task
+                for event in ready_events:
+                    event.synchronize()
                 results = self.storage.batch_set_v2(expanded)
                 success = all(all(pool_results) for pool_results in results.values())
                 self._log_l4_backup_metric(

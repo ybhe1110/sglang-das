@@ -15,8 +15,12 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationCollectiveError
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
+)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
+    ExternalLinkerLoadPhase,
     UnifiedCacheLinkerWrapper,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -344,6 +348,107 @@ class TestLinkerMatchCollectives(CustomTestCase):
             self.assertEqual(wrapper.hit_markers["r"].tail_hashes, ["0", "1"])
             wrapper.cache_linker.lookup.assert_called_once()
             wrapper.cache_linker.cancel_host_prefetch.assert_called_once_with("r")
+
+    def test_one_rank_loses_key_before_load_back(self):
+        """A stale L3 hit must free every rank's slots and permit the next load.
+
+        Untagged layouts let the missing-key rank return a miss while peers
+        queued a load, leaving different inflight RIDs on the same group.
+        Exercise real Mooncake revalidation and wrapper rollback on a TP/CP mesh.
+        """
+        for count in (2, 4):
+            for failed_rank in (0, count - 1):
+                for failure in ("missing", "exception", "short_response"):
+                    with self.subTest(
+                        count=count, failed_rank=failed_rank, failure=failure
+                    ):
+                        self._check_load_revalidation(count, failed_rank, failure)
+
+    def _check_load_revalidation(self, count, failed_rank, failure):
+        wrappers, groups = self._ranks(count)
+        components = []
+        backends = []
+        for rank, wrapper in enumerate(wrappers):
+            component = SimpleNamespace(allocated=0)
+
+            def build(phase, node, keys, component=component):
+                component.allocated += 4
+                return SimpleNamespace(
+                    name=PoolName.KV, keys=list(keys), device_indices=torch.arange(4)
+                )
+
+            def update(phase, req, full, transfer, prefix_len, component=component):
+                if phase == ExternalLinkerLoadPhase.ABORT:
+                    component.allocated -= len(transfer.device_indices)
+                return transfer
+
+            component.build_external_linker_transfer = build
+            component.update_external_linker_load = update
+            wrapper._components = (component,)
+            wrapper._skip_swa = False
+            wrapper.private_load_indices = {}
+            wrapper.inflight_load_rids = []
+            wrapper.hit_markers["r"] = ExternalCacheHitMarker(
+                prefix_key=None, tail_hashes=["k0", "k1"], device_hit_len=0
+            )
+            # No layout tag or opt-in flag: all Mooncake layouts need consensus.
+            backend = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+            backend.pool_group = SimpleNamespace(
+                resolve_transfers=lambda transfers, **kwargs: transfers
+            )
+            backend.storage = SimpleNamespace(
+                _get_hybrid_page_component_keys=lambda keys, transfer: (keys, None),
+                _tag_keys=lambda keys: keys,
+                _batch_exist=Mock(return_value=[1, 1]),
+            )
+            if rank == failed_rank:
+                if failure == "exception":
+                    backend.storage._batch_exist.side_effect = OSError(
+                        "store unavailable"
+                    )
+                else:
+                    backend.storage._batch_exist.return_value = (
+                        [1, 0] if failure == "missing" else [1]
+                    )
+            backend.queued = {}
+
+            def load(rid, transfers, backend=backend):
+                backend.queued[rid] = transfers
+                return True
+
+            backend.load = load
+            wrapper.cache_linker = backend
+            components.append(component)
+            backends.append(backend)
+
+        def load_request(rank, wrapper):
+            return wrapper.load_back(
+                SimpleNamespace(rid="r", last_node=0, swa_branching_seqlen=None)
+            )
+
+        self.assertEqual(self._run(wrappers, load_request), [(0, 0)] * count)
+        for wrapper, component, backend in zip(wrappers, components, backends):
+            self.assertEqual(component.allocated, 0)
+            self.assertEqual(backend.queued, {})
+            self.assertEqual(wrapper.inflight_load_rids, [])
+            self.assertEqual(wrapper.private_loads, {})
+            self.assertEqual(wrapper.private_load_indices, {})
+            self.assertEqual(wrapper.cleanup_quarantine, {})
+            backend.storage._batch_exist.side_effect = None
+            backend.storage._batch_exist.return_value = [1, 1]
+            wrapper.hit_markers["r"] = ExternalCacheHitMarker(
+                prefix_key=None, tail_hashes=["k0", "k1"], device_hit_len=0
+            )
+
+        # The same allocators and groups must still accept a healthy load.
+        self.assertEqual(self._run(wrappers, load_request), [(4, 0)] * count)
+        for wrapper, component, backend in zip(wrappers, components, backends):
+            self.assertEqual(component.allocated, 4)
+            self.assertEqual(list(backend.queued), ["r"])
+            self.assertEqual(wrapper.inflight_load_rids, ["r"])
+            self.assertEqual(list(wrapper.private_loads), ["r"])
+        for group in groups:
+            self.assertIsNone(group.error)
 
 
 if __name__ == "__main__":

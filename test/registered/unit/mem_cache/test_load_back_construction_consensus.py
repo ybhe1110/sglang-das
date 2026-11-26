@@ -374,7 +374,7 @@ class TestConstructionConsensus(CustomTestCase):
             "prefetch_fails_with_other_holder": miss_prefetch,
             # Everyone built, a claim failed: free, then the normal path builds
             # again, agrees once more and reaches revalidate_load.
-            "prefetch_claim_fails_one_rank": ("miss", [0, 0], 1, True, 4, 2),
+            "prefetch_claim_fails_one_rank": ("miss", [0, 0], 1, True, 5, 2),
             # A build failure wins: a miss without retrying the normal path.
             "prefetch_build_and_claim_fail": miss_prefetch,
             "prefetch_claim_raises_one_rank": miss_prefetch,
@@ -382,13 +382,13 @@ class TestConstructionConsensus(CustomTestCase):
             # Ranks 2 and 3 needed no DFS read; the agreement is the same.
             "mixed_all_built": ("prepare", [1, 1], 0, None, 3, 2),
             "mixed_one_rank_none": miss_prefetch,
-            "mixed_claim_fails_one_rank": ("miss", [0, 0], 1, True, 4, 2),
+            "mixed_claim_fails_one_rank": ("miss", [0, 0], 1, True, 5, 2),
             "mixed_claim_raises_one_rank": miss_prefetch,
             "mixed_build_raises_on_no_prefetch_rank": miss_prefetch,
             # Three reductions, built once, straight on to PREPARE.
             "prefetch_all_built": ("prepare", [1, 1], 0, None, 3, 2),
             # Agreement passes, revalidate_load runs, then its miss frees all.
-            "all_built": ("miss", [0, 0], 1, None, 1, None),
+            "all_built": ("miss", [0, 0], 1, None, 2, None),
         }
         # The rank whose build or claim raised re-raises after the same
         # agreement and cleanup; nobody retries the normal path.

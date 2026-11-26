@@ -5,7 +5,7 @@ from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
 
-import sglang.srt.mem_cache.storage.umbp.umbp_direct_linker as umbp_direct_linker
+import sglang.srt.mem_cache.unified_cache.unified_cache_linker as unified_cache_linker
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
     _storage_suffix,
@@ -71,7 +71,7 @@ class TestEveryRankWrites(CustomTestCase):
         fake_device = SimpleNamespace(
             Event=lambda: SimpleNamespace(record=lambda: None)
         )
-        with mock.patch.object(umbp_direct_linker, "device_module", fake_device):
+        with mock.patch.object(unified_cache_linker, "device_module", fake_device):
             self.assertTrue(linker.offload(["t"]))
         self.assertEqual(linker._offload_queue.qsize(), 1)
         # The result comes from the offload thread once the write lands, so
@@ -89,6 +89,34 @@ class TestEveryRankWrites(CustomTestCase):
         self.assertFalse(linker.offload([]))
         self.assertEqual(linker._offload_results.qsize(), 0)
         self.assertEqual(linker._offload_queue.qsize(), 0)
+
+
+class TestBatchedOffload(CustomTestCase):
+    def test_waits_for_each_tasks_events_before_preparing_reads(self):
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        order = mock.Mock()
+        linker._build_load_plans = order.build_plans
+        order.build_plans.return_value = []
+        linker._stats = {"offload": 0, "offload_batches": 0}
+
+        self.assertTrue(
+            linker._run_offload(
+                [
+                    (["a"], [order.indices_a, order.kv_a]),
+                    (["b"], [order.indices_b, order.kv_b]),
+                ]
+            )
+        )
+        self.assertEqual(
+            order.mock_calls,
+            [
+                mock.call.indices_a.synchronize(),
+                mock.call.kv_a.synchronize(),
+                mock.call.indices_b.synchronize(),
+                mock.call.kv_b.synchronize(),
+                mock.call.build_plans([["a"], ["b"]], materialize_indices=mock.ANY),
+            ],
+        )
 
 
 if __name__ == "__main__":
